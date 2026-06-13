@@ -1,0 +1,17 @@
+[package]
+name = "venue-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Execution port: the trait every venue adapter implements"
+
+[lints]
+workspace = true
+
+[dependencies]
+core-types = { path = "../core-types" }
+thiserror = { workspace = true }
+# `sync` only: the event stream is a `tokio::sync::mpsc::Receiver` in the
+# public API. No runtime, no I/O — this crate stays a pure port definition.
+tokio = { workspace = true, features = ["sync"] }

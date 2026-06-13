@@ -1,0 +1,39 @@
+[package]
+name = "venue-live"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Live adapter over the official Polymarket Rust SDK"
+
+[lints]
+workspace = true
+
+[features]
+# Exposes the recording/scripted `FakeClobPort` to other crates (its own tests
+# always have it). Off in normal builds.
+fake = []
+# Operator-only live smoke test (places + cancels one real order). Never built
+# by default — mirrors timeutil's `harness` feature gating. The SDK backend
+# (added with this feature's test) is only compiled when this is on.
+live-smoke = []
+
+[dependencies]
+venue-api = { path = "../venue-api" }
+core-types = { path = "../core-types" }
+config = { path = "../config" }
+# `wall_now()` for the GTD floor and the reconcile poll clock (default features
+# only — no `harness`, so no network deps leak in).
+timeutil = { path = "../timeutil" }
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# The official Polymarket SDK + the chrono it needs for GTD expirations. Pulls
+# alloy (signer), reqwest 0.13, tokio-tungstenite transitively — all rustls.
+polymarket_client_sdk_v2 = { workspace = true }
+alloy-signer-local = { workspace = true }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "test-util"] }

@@ -1,0 +1,15 @@
+[package]
+name = "model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Vol estimator, fair-value engine, basis tracker, health states"
+
+[lints]
+workspace = true
+
+[dependencies]
+core-types = { path = "../core-types" }
+rust_decimal = { workspace = true }
+thiserror = { workspace = true }

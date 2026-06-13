@@ -1,0 +1,41 @@
+[package]
+name = "bot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Orchestrator binary: wires all subsystems, supervision, control plane, CLI"
+
+[lints]
+workspace = true
+
+[dependencies]
+core-types = { path = "../core-types" }
+config = { path = "../config" }
+timeutil = { path = "../timeutil", features = ["harness"] }
+discovery = { path = "../discovery" }
+scheduler = { path = "../scheduler" }
+feed-util = { path = "../feed-util" }
+feed-rtds = { path = "../feed-rtds" }
+feed-binance = { path = "../feed-binance" }
+feed-clob = { path = "../feed-clob" }
+model = { path = "../model" }
+venue-api = { path = "../venue-api" }
+venue-live = { path = "../venue-live" }
+venue-paper = { path = "../venue-paper" }
+engine = { path = "../engine" }
+journal = { path = "../journal" }
+analytics = { path = "../analytics" }
+dashboard = { path = "../dashboard" }
+anyhow = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# net + time so the current-thread runtime can enable the IO/timer drivers
+# reqwest needs; sync (channels) + signal (ctrl-c) + macros (select!) for the
+# scheduler smoke loop.
+tokio = { workspace = true, features = ["rt", "net", "time", "sync", "signal", "macros"] }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }

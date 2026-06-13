@@ -1,0 +1,37 @@
+[
+  {
+    "slug": "btc-updown-5m-1781290200",
+    "title": "Bitcoin Up or Down - June 12, 2:50PM-2:55PM ET",
+    "startTime": "2026-06-12T18:50:00Z",
+    "endDate": "2026-06-12T18:55:00Z",
+    "closed": true,
+    "seriesSlug": "btc-up-or-down-5m",
+    "resolutionSource": "https://data.chain.link/streams/btc-usd",
+    "eventMetadata": {
+      "finalPrice": 63757.5793174016,
+      "priceToBeat": 63788.96914518841
+    },
+    "markets": [
+      {
+        "conditionId": "0x5c2b51ed007ab3f06f10d6386ff4aa4900d497bdc2d576adfd27a3bf24afeb9a",
+        "outcomes": "[\"Up\", \"Down\"]",
+        "clobTokenIds": "[\"109524712649921734940988032201394114673758047811255458444899080585122451320244\", \"34761722095986215395346775077303781550629619648217530323585215577417259588746\"]",
+        "outcomePrices": "[\"0\", \"1\"]",
+        "eventStartTime": "2026-06-12T18:50:00Z",
+        "endDate": "2026-06-12T18:55:00Z",
+        "orderPriceMinTickSize": 0.01,
+        "orderMinSize": 5,
+        "negRisk": false,
+        "feesEnabled": true,
+        "feeSchedule": {
+          "exponent": 1,
+          "rate": 0.07,
+          "takerOnly": true,
+          "rebateRate": 0.2
+        },
+        "resolutionSource": "https://data.chain.link/streams/btc-usd",
+        "umaResolutionStatuses": "[]"
+      }
+    ]
+  }
+]

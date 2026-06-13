@@ -1,0 +1,183 @@
+# ============================================================================
+# Committed configuration defaults — Polymarket Up/Down bot
+# ============================================================================
+#
+# Layering, lowest to highest precedence:
+#   1. code defaults (AppConfig::default() — pinned to this file by a test)
+#   2. this file               config/default.toml      (committed, required)
+#   3. local operator override config/bot.local.toml    (gitignored, optional)
+#   4. environment variables   BOT_<SECTION>__<KEY>     (highest)
+#      e.g.  BOT_PAPER__STARTING_CAPITAL=25000
+#            BOT_RISK__DAILY_STOP_LOSS=100
+#
+# SECRETS NEVER GO IN THIS FILE (or any file). They are read only from
+# BOT_SECRET_* environment variables — see .env.example. The loader rejects
+# secret keys found in TOML outright.
+#
+# Per-series overrides are TOML-only (env keys are lowercased and cannot match
+# the case-sensitive series keys). Example:
+#
+#   [engine.series.BTC-1h]
+#   enabled = false
+#
+#   [engine.series.ETH-5m.params]
+#   min_edge = 0.02
+#
+# Money/probability values may be written as numbers (0.07) or strings
+# ("0.07") — both parse to exact decimals. Avoid exponent notation.
+
+[feeds]
+rtds_url = "wss://ws-live-data.polymarket.com"
+clob_market_ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+clob_user_ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+clob_rest_url = "https://clob.polymarket.com"
+gamma_url = "https://gamma-api.polymarket.com"
+# Base URL — feed-binance appends /stream?streams=…; the market-data-only
+# host wss://data-stream.binance.vision is a drop-in override.
+binance_ws_url = "wss://stream.binance.com:9443"
+rtds_ping_interval_ms = 5000   # RTDS requires a PING every 5 s; must be <= 5000
+ws_connect_timeout_ms = 5000
+reconnect_initial_backoff_ms = 250
+reconnect_max_backoff_ms = 10000
+reconnect_backoff_multiplier = 2.0
+rtds_stale_after_ms = 5000       # feed watchdog; RTDS cadence ~1/s per symbol, must be > 1000
+binance_stale_after_ms = 2500       # bookTicker streams are near-continuous on BTC/ETH; >= 500
+binance_trade_stale_after_ms = 30000 # trade prints gap legitimately in quiet markets; >= book threshold
+clob_ping_interval_ms = 5000         # market channel requires a PING every 10 s; we halve it; <= 10000
+clob_book_stale_after_ms = 10000     # active-window book silence past this = desync evidence; >= 2000
+clob_presubscribe_lead_ms = 90000    # connect to the next window this long before its open
+clob_book_publish_interval_ms = 200  # full Event::Book coalescing (top-of-book always immediate); <= 2000
+clob_resolution_linger_ms = 180000   # keep a closed window's connection this long awaiting market_resolved
+
+# Gamma/CLOB market discovery (CLAUDE.md §6).
+[discovery]
+http_timeout_ms = 5000
+lookahead = 2                    # upcoming windows held per series beyond the current one (>= 1)
+
+# Gamma series slugs, verified live 2026-06-11. Override only if Polymarket
+# renames a series.
+[discovery.slugs]
+btc_5m = "btc-up-or-down-5m"
+btc_15m = "btc-up-or-down-15m"
+btc_1h = "btc-up-or-down-hourly"
+eth_5m = "eth-up-or-down-5m"
+eth_15m = "eth-up-or-down-15m"
+eth_1h = "eth-up-or-down-hourly"
+
+# 24/7 window rollover (CLAUDE.md §6). The wall clock rolls windows against
+# discovery-supplied times; market-WS events accelerate refresh/resolution.
+[scheduler]
+refresh_lead_ms = 120000         # verify the next window this long before close
+next_window_lead_ms = 60000      # §6 contract floor: next window known >= 60 s before close
+closing_lead_ms = 30000          # Closing signal before close (engine applies finer §8 cutoffs)
+retry_initial_backoff_ms = 1000  # discovery retry backoff doubles from here...
+retry_max_backoff_ms = 30000     # ...capped here
+resolution_timeout_ms = 120000   # closed window without market_resolved warns after this
+max_refresh_interval_ms = 600000 # heartbeat refresh even when everything is known
+
+# Clock discipline (CLAUDE.md §11): periodic SNTP offset rounds; |offset| at
+# or past trip_bound_ms for trip_after consecutive rounds trips the ClockSkew
+# breaker (the risk manager reacts with cancel-all). NTP failures alone never
+# trip — they warn, escalating while the offset stays stale.
+[clock]
+ntp_servers = ["time.cloudflare.com", "time.google.com", "pool.ntp.org"]
+samples_per_server = 2
+query_timeout_ms = 1500
+query_spacing_ms = 150           # pause between queries (public pools rate-limit)
+check_interval_ms = 60000        # steady-state round cadence (boot runs a fast burst)
+trip_bound_ms = 250              # |local - NTP| >= this counts toward a trip
+clear_bound_ms = 125             # must fall below this to count toward a clear
+trip_after = 2                   # consecutive breaching rounds -> trip
+clear_after = 3                  # consecutive in-bound rounds -> clear
+stale_warn_ms = 300000           # no successful round for this long -> loud warnings
+
+# Latency harness (`bot latency`): REST RTTs to the CLOB host + WS gap
+# distributions, written as a JSON report. Run from every candidate VPS
+# region; the REST percentiles calibrate paper.placement_latency /
+# paper.cancel_latency (§9) and the §8 quoting latency premium — manually.
+[latency]
+rest_samples = 50
+rest_warmup = 3                  # TLS/pool warmup requests, excluded from stats
+rest_spacing_ms = 100
+http_timeout_ms = 5000
+ws_duration_ms = 60000           # per-socket gap-measurement window
+report_dir = "data/latency"
+
+# Strategy parameters every series starts from (CLAUDE.md §8).
+[engine.defaults]
+min_edge = 0.01                  # minimum half-spread; >= one tick (0.01)
+k1_vol_multiplier = 1.0          # half-spread = max(min_edge, k1*sigma*sqrt(hold) + latency premium)
+expected_hold_secs = 30.0
+gamma_inventory_skew = 0.05      # quote-center shift per unit normalized imbalance
+touch_size = 10                  # shares at the touch (venue minimum: 5)
+ladder_levels = 3
+ladder_size_per_level = 10
+ladder_tick_offset = 1
+pair_cost_threshold = 0.98       # only add passively if pair cost stays <= this
+no_atm_final_secs = 25           # no at-the-money quoting in the final 20-30 s
+no_passive_final_secs = 5        # cancel-all; no passive orders in the final ~5 s
+reprice_threshold_theta = 0.005  # p_up move that triggers cancel-first repricing
+cancel_market_theta = 0.02       # larger move -> cancel-market
+ewma_half_life_secs = 60.0       # sigma_1s EWMA half-life
+vol_floor_1s = 0.00002
+vol_cap_1s = 0.005
+taker_momentum_buffer = 0.005    # edge required beyond fee(p) before taking
+late_window_tau_secs = 30
+late_certainty_threshold = 0.97
+late_taker_price_cap = 0.99
+taker_budget_per_window = 10
+taker_cooldown_ms = 5000
+soft_cap_excess_shares = 50      # quote deficit-reducing side only beyond this
+hard_cap_excess_shares = 100     # stop making entirely beyond this
+max_worst_case_loss_per_window = 25  # THE binding sizing constraint (§8)
+
+# Hard-wired risk limits (CLAUDE.md §11).
+[risk]
+feed_staleness_ms = 500          # cancel-all beyond this; §11 ceiling, looser is rejected
+daily_stop_loss = 200            # halt all trading until manual reset
+max_open_notional = 1000         # global cap across all windows
+sanity_bound = 0.10              # stand down when |fair - mid| exceeds this...
+sanity_bound_duration_ms = 3000  # ...for this long
+error_breaker_max_errors = 10    # API errors...
+error_breaker_window_ms = 60000  # ...within this window trip the breaker
+
+# Paper trading (CLAUDE.md §9) — real market data, simulated money.
+[paper]
+starting_capital = 10000         # runtime-adjustable from the dashboard
+default_fee_rate = 0.07          # fallback only; per-market params read at discovery
+maker_rebate_share = 0.20        # crypto category
+
+# Simulated latencies: uniform in [mean_ms, mean_ms + jitter_ms]. Pessimistic
+# placeholders until the latency harness measures real RTTs.
+[paper.placement_latency]
+mean_ms = 150
+jitter_ms = 100
+
+[paper.cancel_latency]
+mean_ms = 150
+jitter_ms = 100
+
+# Live trading: gate 1 of 3 (config flag AND env confirmation phrase AND
+# dashboard arm action). Defaults disarmed. The other gates cannot be granted
+# from any file.
+[live]
+enabled = false
+# funder: the deposit/proxy wallet address (0x + 40 hex) holding collateral and
+# signing POLY_1271 orders. A public address, not a secret. Required when
+# enabled = true; leave unset while disarmed. Example:
+# funder = "0x0000000000000000000000000000000000000000"
+
+[journal]
+sqlite_path = "data/journal.sqlite"
+tick_dir = "data/ticks"
+
+[dashboard]
+bind = "127.0.0.1:8080"          # non-loopback binds require BOT_SECRET_DASHBOARD_TOKEN
+
+[log]
+dir = "data/logs"
+file_prefix = "bot"
+rotation = "daily"               # hourly | daily | never
+max_files = 14
+default_filter = "info"          # used when RUST_LOG is unset; per-target works too,
+                                 # e.g. "info,engine=debug,feed_clob=trace"

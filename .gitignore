@@ -1,0 +1,26 @@
+# Build artifacts
+/target/
+
+# Secrets and local-only config — never commit credentials (CLAUDE.md §11)
+.env
+.env.*
+!.env.example
+*.local.toml
+
+# Runtime data: journals, sqlite ledgers, raw tick captures, logs.
+# Unanchored so it also catches per-crate run dirs (e.g. crates/bot/data/).
+data/
+*.sqlite
+*.sqlite-journal
+*.db
+*.log
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+
+# Claude Code local state (memory, plans, locks, local settings)
+.claude/

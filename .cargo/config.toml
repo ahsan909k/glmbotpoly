@@ -1,0 +1,15 @@
+# Build-performance settings (CLAUDE.md §3). Committed on purpose so every
+# checkout behaves the same.
+
+[build]
+# Cap parallelism at (logical cores - 2) so builds never starve the desktop.
+# The operator's dev PC has 12 logical cores -> 10 jobs.
+# Override per-invocation with `cargo build --jobs N`, or on the VPS with the
+# CARGO_BUILD_JOBS environment variable (see README "VPS notes").
+jobs = 10
+
+# Fast linker on Linux: mold (fallback: lld — see README "Linker setup").
+# Scoped to the Linux target so Windows/macOS development is unaffected.
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

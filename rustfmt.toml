@@ -1,0 +1,4 @@
+# Stable-toolchain rustfmt options only (CLAUDE.md §12: rustfmt enforced).
+style_edition = "2024"
+max_width = 100
+newline_style = "Unix"

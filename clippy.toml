@@ -1,0 +1,5 @@
+# Lint config (CLAUDE.md §12). unwrap/expect/panic are banned on runtime paths
+# via workspace lints; tests are exempt.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

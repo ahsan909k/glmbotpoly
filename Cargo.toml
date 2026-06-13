@@ -1,0 +1,106 @@
+# Workspace root — see CLAUDE.md §3 (build performance) and §4 (architecture).
+# Many small crates: Rust recompiles at crate granularity, so touching one
+# subsystem must never trigger a workspace-wide rebuild.
+
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# §12: no unwrap/expect/panic on runtime paths (tests are exempted via clippy.toml).
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+dbg_macro = "warn"
+print_stdout = "allow" # `bot check-config` prints the effective config to stdout by design
+
+# §3: workspace members unoptimized for fast iteration, with cheap debug info
+# to keep link times short.
+[profile.dev]
+debug = "line-tables-only"
+
+# §3: ALL external dependencies compile at opt-level 2 in dev — built once,
+# cached, fast at runtime even during development.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# §3 dependency allowlist (add nothing outside it without a Decisions Log entry):
+# tokio, tokio-tungstenite, serde + serde_json, reqwest (rustls), rust_decimal,
+# thiserror, anyhow, tracing + tracing-subscriber, axum + tower,
+# rusqlite or sqlx-sqlite, figment or config, chrono or time,
+# official Polymarket Rust SDK. TLS is rustls everywhere — never openssl.
+# Crates pull from this table only when needed.
+[workspace.dependencies]
+# serde feature serializes Decimal as a lossless string — never enable serde-float.
+rust_decimal = { version = "1.42", default-features = false, features = ["std", "serde", "macros"] }
+serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0.150", default-features = false, features = ["std"] }
+thiserror = { version = "2.0", default-features = false }
+# Allowlisted "figment or config": figment chosen — see Decisions Log 2026-06-11.
+figment = { version = "0.10", default-features = false, features = ["toml", "env"] }
+anyhow = { version = "1.0", default-features = false, features = ["std"] }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "registry",
+    "fmt",
+    "env-filter",
+    "ansi",
+    "std",
+    "smallvec",
+] }
+# Official tokio-rs/tracing companion (rolling file appender) — Decisions Log 2026-06-11.
+tracing-appender = { version = "0.2", default-features = false }
+# §3: rustls only, never openssl. No `json` feature: bodies are decoded via
+# serde_json::from_slice so decode errors can carry url/status/body context.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", default-features = false, features = ["rt"] }
+# Allowlisted "chrono or time": time chosen (already transitive via
+# tracing-appender) — see Decisions Log 2026-06-11.
+time = { version = "0.3", default-features = false, features = ["std", "parsing", "formatting"] }
+# The official Polymarket Rust SDK (§3, §7). Pinned exact: the crate is
+# `#[non_exhaustive]`-heavy, so additive drift between patches is possible.
+# Verified at 0.5.1 to be rustls-only (reqwest 0.13 `rustls`, tokio-tungstenite
+# 0.29 `rustls-tls-native-roots`, alloy 1.6 `reqwest-rustls-tls`) — no openssl /
+# native-tls / ethers. `clob` is the only feature we need (order/cancel/balance);
+# NOT `ws` (the user-channel WebSocket is a later task). See Decisions Log.
+polymarket_client_sdk_v2 = { version = "=0.5.1", default-features = false, features = ["clob"] }
+# SDK-transitive: the SDK re-exports only the generic `LocalSigner`, so we name
+# the concrete `PrivateKeySigner` (the stored signer field) via alloy-signer-local
+# directly. Version tracks the SDK's resolved alloy 1.8 line. Rustls/ring; no openssl.
+alloy-signer-local = { version = "1.8", default-features = false }
+# SDK-transitive only: its order builder takes a `chrono::DateTime<Utc>` for the
+# GTD expiration. "time" remains the workspace clock crate (§3); chrono is used
+# nowhere but the venue-live → SDK boundary. Reuses the SDK's chrono 0.4.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# §3: rustls only (webpki roots — same store and rustls 0.23 line as reqwest).
+tokio-tungstenite = { version = "0.29", default-features = false, features = [
+    "connect",
+    "handshake",
+    "stream",
+    "rustls-tls-webpki-roots",
+] }
+# Transitive of tokio-tungstenite either way; needed to drive its Stream/Sink
+# (StreamExt/SinkExt) — see Decisions Log 2026-06-12.
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+# Transitive of tokio-tungstenite/reqwest either way (§3 TLS policy). Declared
+# explicitly so feed transports can pin the process CryptoProvider to ring
+# (the provider reqwest uses) — without it, binaries lacking reqwest panic at
+# the first TLS connect ("Could not automatically determine the process-level
+# CryptoProvider"). See Decisions Log 2026-06-12.
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }

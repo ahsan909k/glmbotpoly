@@ -1,0 +1,13 @@
+[package]
+name = "analytics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Markouts, PnL attribution, per-series aggregates"
+
+[lints]
+workspace = true
+
+[dependencies]
+journal = { path = "../journal" }

@@ -1,0 +1,8 @@
+# Test fixture: deliberately invalid configuration.
+# Two violations: negative starting capital and a half-spread below one tick.
+
+[paper]
+starting_capital = -5
+
+[engine.defaults]
+min_edge = 0.001

@@ -1,0 +1,22 @@
+[package]
+name = "config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Layered configuration and secret handling"
+
+[lints]
+workspace = true
+
+[dependencies]
+core-types = { path = "../core-types" }
+figment = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# `test` enables figment::Jail (isolated env vars + temp dirs for layering tests).
+figment = { workspace = true, features = ["test"] }
+serde_json = { workspace = true }

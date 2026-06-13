@@ -1,0 +1,28 @@
+[package]
+name = "feed-clob"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "CLOB market-channel WebSocket and local L2 book"
+
+[lints]
+workspace = true
+
+[dependencies]
+core-types = { path = "../core-types" }
+feed-util = { path = "../feed-util" }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Unlike feed-rtds/feed-binance (whose driver loop — and therefore logging —
+# lives in feed-util), this crate hand-rolls its per-window connection driver
+# and supervisor, so it logs and spawns tasks itself (Decisions Log 2026-06-12).
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+
+[dev-dependencies]
+feed-util = { path = "../feed-util", features = ["fake"] }
+# test-util enables start_paused deterministic-time driver tests.
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "test-util"] }

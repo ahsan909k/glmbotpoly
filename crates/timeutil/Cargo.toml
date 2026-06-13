@@ -1,0 +1,31 @@
+[package]
+name = "timeutil"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Clock discipline, tau-remaining helpers, latency harness"
+
+[lints]
+workspace = true
+
+[features]
+# Latency harness (REST/WS probes + the JSON report types). Off by default so
+# future consumers of Clock/tau (model, engine) never build reqwest or
+# tokio-tungstenite into their check loop (CLAUDE.md §3 feature-gating).
+harness = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:serde_json"]
+
+[dependencies]
+core-types = { path = "../core-types" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["net", "time", "sync", "macros"] }
+reqwest = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["net", "time", "sync", "macros", "test-util"] }

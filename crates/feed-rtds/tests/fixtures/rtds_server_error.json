@@ -1,0 +1,1 @@
+{"body":{"message":"leger AddSubscriptions error: rpc error: code = Internal desc = ERROR #42P01 relation \"__subscriptions\" does not exist, status: rpc error: code = Internal desc = ERROR #42P01 relation \"__subscriptions\" does not exist, message: ERROR #42P01 relation \"__subscriptions\" does not exist"},"statusCode":500}

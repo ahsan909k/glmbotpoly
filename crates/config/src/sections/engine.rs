@@ -1,0 +1,623 @@
+//! Per-series strategy/engine parameters (CLAUDE.md §8).
+//!
+//! Shape: one full [`EngineParams`] under `engine.defaults`, plus an optional
+//! per-series table of [`SeriesOverride`]s, each carrying an enable flag and a
+//! sparse [`EngineParamsPatch`] (every field optional). [`EngineConfig::resolved`]
+//! merges a patch onto the defaults, so the operator overrides one knob for one
+//! series without copying the other two dozen.
+//!
+//! Per-series overrides are TOML-only: environment keys are lowercased on the
+//! way in, which can never match the case-sensitive series keys (`"BTC-5m"`).
+//!
+//! Type discipline (CLAUDE.md §2.6): money and probability thresholds are
+//! `Decimal`-based newtypes; `f64` appears only for quantities consumed by the
+//! float-space model math (vol, CDF inputs, skew coefficients).
+
+use std::collections::BTreeMap;
+
+use core_types::{Decimal, Dollars, DurationMs, Price, Series, Size, TickSize, WindowDuration};
+use rust_decimal::dec;
+use serde::{Deserialize, Serialize};
+
+use crate::validate::Violations;
+
+/// Builds a [`Size`] from a non-negative integer literal (defaults only).
+#[expect(
+    clippy::unwrap_used,
+    reason = "u32 literals are non-negative; Size::new rejects only negatives"
+)]
+fn shares(n: u32) -> Size {
+    Size::new(Decimal::from(n)).unwrap()
+}
+
+/// The full parameter set one engine instance runs a series with.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EngineParams {
+    /// Minimum half-spread (probability space). Quoting never goes tighter
+    /// than this; must be at least one base tick (0.01).
+    pub min_edge: Decimal,
+    /// `k1` in `half_spread = max(min_edge, k1 · σ_1s · √hold + latency premium)`.
+    pub k1_vol_multiplier: f64,
+    /// Expected passive holding time in seconds (the `√hold` horizon).
+    pub expected_hold_secs: f64,
+    /// `γ`: quote-center shift per unit of normalized inventory imbalance.
+    pub gamma_inventory_skew: f64,
+    /// Shares quoted at the touch (best level).
+    pub touch_size: Size,
+    /// Total ladder levels including the touch.
+    pub ladder_levels: u32,
+    /// Shares per ladder level behind the touch.
+    pub ladder_size_per_level: Size,
+    /// Tick gap between consecutive ladder levels.
+    pub ladder_tick_offset: u32,
+    /// Pair-cost discipline (§8): only add passively to a side if the
+    /// post-trade `avg_up + avg_down` stays at or below this.
+    pub pair_cost_threshold: Decimal,
+    /// No at-the-money quoting once τ drops below this many seconds.
+    pub no_atm_final_secs: u32,
+    /// No passive orders at all (cancel-all) once τ drops below this.
+    pub no_passive_final_secs: u32,
+    /// `θ`: fair-value move (probability space) against a resting quote that
+    /// triggers cancel-first repricing.
+    pub reprice_threshold_theta: f64,
+    /// Larger move that escalates to cancel-market instead of per-order cancels.
+    pub cancel_market_theta: f64,
+    /// Half-life of the EWMA over 1-second log returns (σ_1s estimator).
+    pub ewma_half_life_secs: f64,
+    /// Floor on σ_1s — the model never reports calmer than this.
+    pub vol_floor_1s: f64,
+    /// Cap on σ_1s — and never wilder than this.
+    pub vol_cap_1s: f64,
+    /// Extra model-vs-book edge (beyond the taker fee) required before the
+    /// momentum taker fires, in probability space.
+    pub taker_momentum_buffer: Decimal,
+    /// Late-window taker activates once τ is at or below this many seconds.
+    pub late_window_tau_secs: u32,
+    /// …and `p_up` (Chainlink-anchored) is beyond this certainty.
+    pub late_certainty_threshold: f64,
+    /// Worst price the late-window taker will pay for the near-certain side.
+    pub late_taker_price_cap: Price,
+    /// Taker spend budget per window (both modules combined).
+    pub taker_budget_per_window: Dollars,
+    /// Cooldown between taker executions within one window.
+    pub taker_cooldown_ms: DurationMs,
+    /// Excess (unmatched) shares at which quoting narrows to the
+    /// deficit-reducing side only.
+    pub soft_cap_excess_shares: Size,
+    /// Excess shares at which passive quoting stops entirely.
+    pub hard_cap_excess_shares: Size,
+    /// Maximum worst-case loss per window — the binding constraint on all
+    /// sizing (§8).
+    pub max_worst_case_loss_per_window: Dollars,
+}
+
+impl Default for EngineParams {
+    fn default() -> Self {
+        Self {
+            min_edge: dec!(0.01),
+            k1_vol_multiplier: 1.0,
+            expected_hold_secs: 30.0,
+            gamma_inventory_skew: 0.05,
+            touch_size: shares(10),
+            ladder_levels: 3,
+            ladder_size_per_level: shares(10),
+            ladder_tick_offset: 1,
+            pair_cost_threshold: dec!(0.98),
+            no_atm_final_secs: 25,
+            no_passive_final_secs: 5,
+            reprice_threshold_theta: 0.005,
+            cancel_market_theta: 0.02,
+            ewma_half_life_secs: 60.0,
+            vol_floor_1s: 0.00002,
+            vol_cap_1s: 0.005,
+            taker_momentum_buffer: dec!(0.005),
+            late_window_tau_secs: 30,
+            late_certainty_threshold: 0.97,
+            late_taker_price_cap: default_late_price_cap(),
+            taker_budget_per_window: Dollars::new(Decimal::from(10)),
+            taker_cooldown_ms: DurationMs::from_millis(5_000),
+            soft_cap_excess_shares: shares(50),
+            hard_cap_excess_shares: shares(100),
+            max_worst_case_loss_per_window: Dollars::new(Decimal::from(25)),
+        }
+    }
+}
+
+#[expect(
+    clippy::unwrap_used,
+    reason = "0.99 lies in (0,1) with scale 2; pinned by defaults_resolve_valid test"
+)]
+fn default_late_price_cap() -> Price {
+    Price::try_from(dec!(0.99)).unwrap()
+}
+
+impl EngineParams {
+    /// Appends every §8 range/cross-field violation for these params, keyed
+    /// under `prefix` (e.g. `"engine.series.BTC-5m"`), checked against the
+    /// series' own window length.
+    pub(crate) fn validate_into(&self, prefix: &str, window: WindowDuration, v: &mut Violations) {
+        let key = |field: &str| format!("{prefix}.{field}");
+        let window_secs = window.as_duration().as_millis() / 1_000;
+
+        v.require(
+            self.min_edge >= TickSize::T001.as_decimal() && self.min_edge < dec!(0.5),
+            key("min_edge"),
+            "must be in [0.01, 0.5) — a half-spread below one tick (0.01) is unquotable",
+        );
+        v.require(
+            self.k1_vol_multiplier.is_finite() && self.k1_vol_multiplier >= 0.0,
+            key("k1_vol_multiplier"),
+            "must be finite and >= 0",
+        );
+        v.require(
+            self.expected_hold_secs.is_finite() && self.expected_hold_secs > 0.0,
+            key("expected_hold_secs"),
+            "must be finite and > 0",
+        );
+        v.require(
+            self.gamma_inventory_skew.is_finite() && self.gamma_inventory_skew >= 0.0,
+            key("gamma_inventory_skew"),
+            "must be finite and >= 0",
+        );
+        let min_shares = Decimal::from(5);
+        v.require(
+            self.touch_size.as_decimal() >= min_shares,
+            key("touch_size"),
+            "must be >= 5 shares (venue minimum resting order, §7)",
+        );
+        v.require(
+            self.ladder_levels >= 1,
+            key("ladder_levels"),
+            "must be >= 1",
+        );
+        v.require(
+            self.ladder_size_per_level.as_decimal() >= min_shares,
+            key("ladder_size_per_level"),
+            "must be >= 5 shares (venue minimum resting order, §7)",
+        );
+        v.require(
+            self.ladder_tick_offset >= 1,
+            key("ladder_tick_offset"),
+            "must be >= 1",
+        );
+        v.require(
+            self.pair_cost_threshold > Decimal::ZERO && self.pair_cost_threshold < Decimal::ONE,
+            key("pair_cost_threshold"),
+            "must be in (0, 1) — at 1.00 a matched pair can never lock in profit",
+        );
+        v.require(
+            self.no_passive_final_secs <= self.no_atm_final_secs,
+            key("no_passive_final_secs"),
+            "must be <= no_atm_final_secs (the cancel-all window nests inside the no-ATM window)",
+        );
+        v.require(
+            i64::from(self.no_atm_final_secs) <= window_secs,
+            key("no_atm_final_secs"),
+            "must not exceed the window length",
+        );
+        v.require(
+            self.reprice_threshold_theta.is_finite() && self.reprice_threshold_theta > 0.0,
+            key("reprice_threshold_theta"),
+            "must be finite and > 0",
+        );
+        v.require(
+            self.cancel_market_theta.is_finite()
+                && self.cancel_market_theta >= self.reprice_threshold_theta,
+            key("cancel_market_theta"),
+            "must be finite and >= reprice_threshold_theta",
+        );
+        v.require(
+            self.ewma_half_life_secs.is_finite() && self.ewma_half_life_secs > 0.0,
+            key("ewma_half_life_secs"),
+            "must be finite and > 0",
+        );
+        v.require(
+            self.vol_floor_1s.is_finite() && self.vol_floor_1s > 0.0,
+            key("vol_floor_1s"),
+            "must be finite and > 0",
+        );
+        v.require(
+            self.vol_cap_1s.is_finite() && self.vol_cap_1s > self.vol_floor_1s,
+            key("vol_cap_1s"),
+            "must be finite and > vol_floor_1s",
+        );
+        v.require(
+            self.taker_momentum_buffer >= Decimal::ZERO,
+            key("taker_momentum_buffer"),
+            "must be >= 0",
+        );
+        let tau = i64::from(self.late_window_tau_secs);
+        v.require(
+            tau > 0 && tau < window_secs,
+            key("late_window_tau_secs"),
+            "must be in (0, window length)",
+        );
+        v.require(
+            self.late_certainty_threshold.is_finite()
+                && self.late_certainty_threshold > 0.5
+                && self.late_certainty_threshold < 1.0,
+            key("late_certainty_threshold"),
+            "must be in (0.5, 1)",
+        );
+        v.require(
+            self.late_taker_price_cap.as_decimal() > dec!(0.5),
+            key("late_taker_price_cap"),
+            "must be > 0.5 — the late taker buys the near-certain side",
+        );
+        v.require(
+            self.taker_budget_per_window.as_decimal() >= Decimal::ZERO,
+            key("taker_budget_per_window"),
+            "must be >= 0",
+        );
+        v.require(
+            self.taker_cooldown_ms.as_millis() >= 0,
+            key("taker_cooldown_ms"),
+            "must be >= 0",
+        );
+        v.require(
+            !self.hard_cap_excess_shares.is_zero(),
+            key("hard_cap_excess_shares"),
+            "must be > 0",
+        );
+        v.require(
+            self.soft_cap_excess_shares.as_decimal() <= self.hard_cap_excess_shares.as_decimal(),
+            key("soft_cap_excess_shares"),
+            "must be <= hard_cap_excess_shares",
+        );
+        v.require(
+            self.max_worst_case_loss_per_window.as_decimal() > Decimal::ZERO,
+            key("max_worst_case_loss_per_window"),
+            "must be > 0 — this is the binding constraint on all sizing (§8)",
+        );
+    }
+}
+
+/// A sparse override of [`EngineParams`]: only the set fields replace the
+/// defaults. Field meanings and units are identical to [`EngineParams`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[expect(
+    missing_docs,
+    reason = "each field mirrors the EngineParams field of the same name"
+)]
+pub struct EngineParamsPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_edge: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub k1_vol_multiplier: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_hold_secs: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gamma_inventory_skew: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub touch_size: Option<Size>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ladder_levels: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ladder_size_per_level: Option<Size>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ladder_tick_offset: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pair_cost_threshold: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_atm_final_secs: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_passive_final_secs: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reprice_threshold_theta: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancel_market_theta: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ewma_half_life_secs: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vol_floor_1s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vol_cap_1s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub taker_momentum_buffer: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub late_window_tau_secs: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub late_certainty_threshold: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub late_taker_price_cap: Option<Price>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub taker_budget_per_window: Option<Dollars>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub taker_cooldown_ms: Option<DurationMs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub soft_cap_excess_shares: Option<Size>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hard_cap_excess_shares: Option<Size>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_worst_case_loss_per_window: Option<Dollars>,
+}
+
+impl EngineParamsPatch {
+    /// Merges this patch onto `base`: set fields win, unset fields keep the
+    /// base value.
+    #[must_use]
+    pub fn apply(&self, base: &EngineParams) -> EngineParams {
+        EngineParams {
+            min_edge: self.min_edge.unwrap_or(base.min_edge),
+            k1_vol_multiplier: self.k1_vol_multiplier.unwrap_or(base.k1_vol_multiplier),
+            expected_hold_secs: self.expected_hold_secs.unwrap_or(base.expected_hold_secs),
+            gamma_inventory_skew: self
+                .gamma_inventory_skew
+                .unwrap_or(base.gamma_inventory_skew),
+            touch_size: self.touch_size.unwrap_or(base.touch_size),
+            ladder_levels: self.ladder_levels.unwrap_or(base.ladder_levels),
+            ladder_size_per_level: self
+                .ladder_size_per_level
+                .unwrap_or(base.ladder_size_per_level),
+            ladder_tick_offset: self.ladder_tick_offset.unwrap_or(base.ladder_tick_offset),
+            pair_cost_threshold: self.pair_cost_threshold.unwrap_or(base.pair_cost_threshold),
+            no_atm_final_secs: self.no_atm_final_secs.unwrap_or(base.no_atm_final_secs),
+            no_passive_final_secs: self
+                .no_passive_final_secs
+                .unwrap_or(base.no_passive_final_secs),
+            reprice_threshold_theta: self
+                .reprice_threshold_theta
+                .unwrap_or(base.reprice_threshold_theta),
+            cancel_market_theta: self.cancel_market_theta.unwrap_or(base.cancel_market_theta),
+            ewma_half_life_secs: self.ewma_half_life_secs.unwrap_or(base.ewma_half_life_secs),
+            vol_floor_1s: self.vol_floor_1s.unwrap_or(base.vol_floor_1s),
+            vol_cap_1s: self.vol_cap_1s.unwrap_or(base.vol_cap_1s),
+            taker_momentum_buffer: self
+                .taker_momentum_buffer
+                .unwrap_or(base.taker_momentum_buffer),
+            late_window_tau_secs: self
+                .late_window_tau_secs
+                .unwrap_or(base.late_window_tau_secs),
+            late_certainty_threshold: self
+                .late_certainty_threshold
+                .unwrap_or(base.late_certainty_threshold),
+            late_taker_price_cap: self
+                .late_taker_price_cap
+                .unwrap_or(base.late_taker_price_cap),
+            taker_budget_per_window: self
+                .taker_budget_per_window
+                .unwrap_or(base.taker_budget_per_window),
+            taker_cooldown_ms: self.taker_cooldown_ms.unwrap_or(base.taker_cooldown_ms),
+            soft_cap_excess_shares: self
+                .soft_cap_excess_shares
+                .unwrap_or(base.soft_cap_excess_shares),
+            hard_cap_excess_shares: self
+                .hard_cap_excess_shares
+                .unwrap_or(base.hard_cap_excess_shares),
+            max_worst_case_loss_per_window: self
+                .max_worst_case_loss_per_window
+                .unwrap_or(base.max_worst_case_loss_per_window),
+        }
+    }
+}
+
+/// One series' entry in the override table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SeriesOverride {
+    /// Whether this series trades at all. Series absent from the table are
+    /// enabled with defaults.
+    pub enabled: bool,
+    /// Sparse parameter overrides for this series.
+    pub params: EngineParamsPatch,
+}
+
+impl Default for SeriesOverride {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            params: EngineParamsPatch::default(),
+        }
+    }
+}
+
+/// The full engine section: shared defaults plus per-series overrides.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EngineConfig {
+    /// Parameters every series starts from.
+    pub defaults: EngineParams,
+    /// Per-series enable flags and sparse overrides, keyed by series key
+    /// (e.g. `[engine.series.BTC-5m]`). Empty means: all six series enabled
+    /// with defaults.
+    pub series: BTreeMap<Series, SeriesOverride>,
+}
+
+impl EngineConfig {
+    /// The effective parameters for `series`: the per-series patch (if any)
+    /// applied onto the defaults.
+    #[must_use]
+    pub fn resolved(&self, series: Series) -> EngineParams {
+        match self.series.get(&series) {
+            Some(over) => over.params.apply(&self.defaults),
+            None => self.defaults.clone(),
+        }
+    }
+
+    /// True unless the series is explicitly disabled in the override table.
+    #[must_use]
+    pub fn is_enabled(&self, series: Series) -> bool {
+        self.series.get(&series).is_none_or(|over| over.enabled)
+    }
+
+    /// All enabled series in stable dashboard order.
+    #[must_use]
+    pub fn enabled_series(&self) -> Vec<Series> {
+        Series::ALL
+            .into_iter()
+            .filter(|s| self.is_enabled(*s))
+            .collect()
+    }
+
+    /// Validates the **resolved** params of all six series — disabled ones
+    /// too, so a broken override can never lurk until someone re-enables it.
+    pub(crate) fn validate_into(&self, v: &mut Violations) {
+        for series in Series::ALL {
+            let prefix = format!("engine.series.{}", series.key());
+            self.resolved(series)
+                .validate_into(&prefix, series.duration, v);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core_types::Asset;
+    use serde_json::json;
+
+    use super::*;
+
+    fn series(key: &str) -> Series {
+        key.parse().unwrap()
+    }
+
+    #[test]
+    fn defaults_resolve_valid_for_all_six_series() {
+        let mut v = Violations::default();
+        EngineConfig::default().validate_into(&mut v);
+        assert_eq!(v.into_result(), Ok(()));
+    }
+
+    #[test]
+    fn patch_overrides_only_named_fields() {
+        let patch = EngineParamsPatch {
+            min_edge: Some(dec!(0.02)),
+            ..EngineParamsPatch::default()
+        };
+        let base = EngineParams::default();
+        let merged = patch.apply(&base);
+        assert_eq!(merged.min_edge, dec!(0.02));
+        assert_eq!(
+            EngineParams {
+                min_edge: dec!(0.02),
+                ..base
+            },
+            merged
+        );
+    }
+
+    #[test]
+    fn resolved_and_enabled_series() {
+        let mut cfg = EngineConfig::default();
+        cfg.series.insert(
+            series("BTC-5m"),
+            SeriesOverride {
+                enabled: false,
+                ..SeriesOverride::default()
+            },
+        );
+        cfg.series.insert(
+            series("ETH-1h"),
+            SeriesOverride {
+                params: EngineParamsPatch {
+                    min_edge: Some(dec!(0.03)),
+                    ..EngineParamsPatch::default()
+                },
+                ..SeriesOverride::default()
+            },
+        );
+
+        assert_eq!(cfg.resolved(series("ETH-1h")).min_edge, dec!(0.03));
+        assert_eq!(cfg.resolved(series("BTC-15m")), EngineParams::default());
+
+        let enabled = cfg.enabled_series();
+        assert_eq!(enabled.len(), 5);
+        assert!(!enabled.contains(&series("BTC-5m")));
+        assert!(enabled.contains(&series("ETH-1h")));
+    }
+
+    #[test]
+    fn gate_ordering_and_window_length_rules() {
+        // no_passive > no_atm: nesting violated.
+        let mut cfg = EngineConfig::default();
+        cfg.defaults.no_atm_final_secs = 25;
+        cfg.defaults.no_passive_final_secs = 30;
+        let mut v = Violations::default();
+        cfg.validate_into(&mut v);
+        let violations = v.into_result().unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|x| x.key.ends_with("no_passive_final_secs"))
+        );
+
+        // no_atm 400s exceeds the 5m (300s) windows but fits 15m/1h: exactly
+        // the two 5-minute series must flag it.
+        let mut cfg = EngineConfig::default();
+        cfg.defaults.no_atm_final_secs = 400;
+        let mut v = Violations::default();
+        cfg.validate_into(&mut v);
+        let violations = v.into_result().unwrap_err();
+        let atm: Vec<&str> = violations
+            .iter()
+            .filter(|x| x.key.ends_with("no_atm_final_secs"))
+            .map(|x| x.key.as_str())
+            .collect();
+        assert_eq!(
+            atm,
+            vec![
+                "engine.series.BTC-5m.no_atm_final_secs",
+                "engine.series.ETH-5m.no_atm_final_secs"
+            ]
+        );
+    }
+
+    #[test]
+    fn range_rules_reject_nonsense() {
+        let mut cfg = EngineConfig::default();
+        cfg.defaults.min_edge = dec!(0.005); // below one tick
+        cfg.defaults.vol_floor_1s = 0.01;
+        cfg.defaults.vol_cap_1s = 0.005; // cap below floor
+        cfg.defaults.touch_size = shares(3); // below venue minimum
+        cfg.defaults.soft_cap_excess_shares = shares(200); // above hard cap
+        let mut v = Violations::default();
+        cfg.validate_into(&mut v);
+        let violations = v.into_result().unwrap_err();
+        for field in [
+            "min_edge",
+            "vol_cap_1s",
+            "touch_size",
+            "soft_cap_excess_shares",
+        ] {
+            assert!(
+                violations
+                    .iter()
+                    .any(|x| x.key == format!("engine.series.BTC-5m.{field}")),
+                "expected a BTC-5m violation for {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn patch_covers_every_params_field() {
+        // Anti-drift: deserializing a full EngineParams JSON into the patch
+        // must succeed (deny_unknown_fields ⇒ Params ⊆ Patch) and populate
+        // every key (⇒ Patch ⊇ Params, since None fields are skipped).
+        let params_json = serde_json::to_value(EngineParams::default()).unwrap();
+        let full_patch: EngineParamsPatch = serde_json::from_value(params_json.clone()).unwrap();
+        let patch_json = serde_json::to_value(&full_patch).unwrap();
+        let params_keys: Vec<&String> = params_json.as_object().unwrap().keys().collect();
+        let patch_keys: Vec<&String> = patch_json.as_object().unwrap().keys().collect();
+        assert_eq!(params_keys, patch_keys);
+    }
+
+    #[test]
+    fn series_table_accepts_known_keys_and_rejects_unknown() {
+        let cfg: EngineConfig = serde_json::from_value(json!({
+            "series": { "BTC-5m": { "enabled": false } }
+        }))
+        .unwrap();
+        assert!(!cfg.is_enabled(Series {
+            asset: Asset::Btc,
+            duration: WindowDuration::M5,
+        }));
+
+        let err = serde_json::from_value::<EngineConfig>(json!({
+            "series": { "XRP-5m": { "enabled": false } }
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("XRP-5m"));
+    }
+}

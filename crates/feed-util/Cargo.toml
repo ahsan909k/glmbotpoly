@@ -1,0 +1,28 @@
+[package]
+name = "feed-util"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Shared price-feed plumbing: WS transport seam, generic reconnect/staleness driver, backoff"
+
+[lints]
+workspace = true
+
+[features]
+# Scripted fake transport for the feed crates' paused-time driver tests
+# (dev-dependency feature; adds nothing to production builds).
+fake = []
+
+[dependencies]
+core-types = { path = "../core-types" }
+futures-util = { workspace = true }
+rustls = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "net"] }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rust_decimal = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "test-util"] }
