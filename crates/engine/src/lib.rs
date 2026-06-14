@@ -27,6 +27,7 @@ pub mod inventory;
 pub mod normalize;
 pub mod quote_manager;
 pub mod quoting;
+pub mod taker;
 
 pub use inventory::{
     ExcessConstraint, InventoryEffect, InventoryManager, InventoryParams, MergeIntent,
@@ -43,4 +44,8 @@ pub use quote_manager::{
 pub use quoting::{
     NoQuoteReason, QuoteDecision, QuoteLevel, QuoteParams, QuoteSet, SuppressReason, Suppressed,
     calculate_quotes,
+};
+pub use taker::{
+    ConfirmedMove, MomentumTaker, MomentumTakerParams, NoTakeReason, SignalWindow, TakePlan,
+    plan_take,
 };
