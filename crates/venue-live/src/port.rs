@@ -8,7 +8,7 @@
 
 use std::future::Future;
 
-use core_types::{ConditionId, OrderId, Size};
+use core_types::{ConditionId, Decimal, OrderId, Side, Size, TokenId};
 use venue_api::Wallet;
 
 use crate::convert::BuiltOrder;
@@ -42,6 +42,10 @@ pub struct RawCancel {
 }
 
 /// One open order as the venue reports it (REST `GET /orders`).
+///
+/// Carries enough context (token/side/price/market) to **adopt** an order the
+/// store never tracked — a prior-process survivor — when a
+/// [`WindowIndex`](crate::WindowIndex) can resolve its token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawOpenOrder {
     /// Venue order id.
@@ -52,6 +56,14 @@ pub struct RawOpenOrder {
     pub original_size: Size,
     /// Cumulative matched size in shares.
     pub size_matched: Size,
+    /// Outcome token the order trades.
+    pub token_id: TokenId,
+    /// Order side.
+    pub side: Side,
+    /// Limit price (wire value; adoption quantizes it onto the market tick).
+    pub price: Decimal,
+    /// Market (condition id) the order trades.
+    pub condition_id: ConditionId,
 }
 
 /// The network layer. Every method returns the venue's raw (but venue-live-

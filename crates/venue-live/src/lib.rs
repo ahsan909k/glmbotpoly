@@ -19,15 +19,25 @@
 //! through [`FakeClobPort`] — which is exactly how the request-construction
 //! tests prove every port method without touching the network.
 //!
+//! # Order feedback
+//!
+//! The canonical [`OrderStore`] is the single source of truth about our live
+//! orders. The authenticated `/ws/user` task ([`mod@user_ws`]) streams order/fill
+//! events into it and, on every (re)connect, reconciles it against the REST
+//! open-orders endpoint — emitting corrections behind the same [`VenueEvent`]
+//! channel. Event application is idempotent: duplicate and out-of-order delivery
+//! are harmless.
+//!
 //! # Deferred to follow-up tasks
 //!
-//! - The real-time authenticated `/ws/user` WebSocket order/fill stream: this
-//!   task ships an interim REST open-orders-poll reconciler ([`reconcile`]);
-//!   the low-latency push replaces it behind the same [`VenueEvent`] channel.
 //! - One-time on-chain ERC-20/CTF token approvals (the gasless relayer WALLET
 //!   batch): a missing allowance surfaces here as
 //!   [`RejectReason::InsufficientFunds`]; the approval flow belongs to the
 //!   gasless/CTF task.
+//! - Wiring the scheduler/discovery into [`LiveVenue::set_window_index`] /
+//!   [`LiveVenue::set_markets`] (the store ships the [`WindowIndex`] seam and
+//!   orphan-order adoption; the orchestrator wiring + live tick-quantize path is
+//!   a follow-up).
 //!
 //! [`VenueEvent`]: venue_api::VenueEvent
 //! [`RejectReason::InsufficientFunds`]: venue_api::RejectReason::InsufficientFunds
@@ -36,9 +46,10 @@ mod arming;
 mod convert;
 mod error;
 mod port;
-mod reconcile;
 mod sdk;
 mod store;
+mod user_wire;
+mod user_ws;
 mod venue;
 
 #[cfg(any(test, feature = "fake"))]
@@ -49,12 +60,13 @@ mod params;
 pub use convert::{BuiltOrder, OrderClass, build};
 pub use error::{Gate, VenueLiveError};
 pub use params::{
-    DEFAULT_CLOB_HOST, DEFAULT_EVENT_CHANNEL_CAPACITY, LiveParams, POLYGON_CHAIN_ID, SigType,
+    DEFAULT_CLOB_HOST, DEFAULT_EVENT_CHANNEL_CAPACITY, DEFAULT_USER_WS_URL, DEFAULT_WS_BACKOFF,
+    DEFAULT_WS_PING_INTERVAL, LiveParams, POLYGON_CHAIN_ID, SigType,
 };
 pub use port::{ClobPort, RawAck, RawCancel, RawOpenOrder};
-pub use reconcile::reconcile_loop;
 pub use sdk::SdkClobPort;
-pub use store::{OrderStore, TrackedOrder};
+pub use store::{OrderStore, TrackedOrder, WindowCtx, WindowIndex};
+pub use user_ws::UserWsCreds;
 pub use venue::LiveVenue;
 
 #[cfg(any(test, feature = "fake"))]

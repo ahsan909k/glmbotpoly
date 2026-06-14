@@ -11,3 +11,21 @@ workspace = true
 
 [dependencies]
 core-types = { path = "../core-types" }
+# The serde projection of the bus `Event` (which is deliberately not serde) and
+# the JSONL segment encoding. All §3-allowlisted.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Bounded channel between the bus consumer and the off-path writer thread.
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+# Segment-filename timestamp (`YYYYMMDD-HHMMSS`).
+time = { workspace = true }
+# gzip the rotated segments (operator-mandated; pure-Rust backend) — see the
+# workspace allowlist note and Decisions Log 2026-06-14.
+flate2 = { workspace = true }
+
+[dev-dependencies]
+# `dec!` for building sample records in the round-trip tests (the value types
+# round-trip as lossless strings either way).
+rust_decimal = { workspace = true }

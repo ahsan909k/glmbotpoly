@@ -104,3 +104,9 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 # the first TLS connect ("Could not automatically determine the process-level
 # CryptoProvider"). See Decisions Log 2026-06-12.
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+# Allowlist deviation, operator-mandated (Decisions Log 2026-06-14): gzip the
+# journal's rotated capture segments. `rust_backend` selects the pure-Rust
+# miniz_oxide implementation — NO C/cmake build (sidesteps the aws-lc-style 4551
+# pain), no openssl. gzip is universally `gunzip`/`zcat`-replayable. Used only by
+# the `journal` crate.
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }

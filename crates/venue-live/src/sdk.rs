@@ -12,18 +12,20 @@
 //! synthetic acks after signing).
 
 use std::str::FromStr as _;
-use std::time::Duration;
 
 use alloy_signer_local::PrivateKeySigner;
 use chrono::{DateTime, Utc};
 use config::{LiveArming, Secrets};
-use core_types::{ConditionId, Dollars, OrderId, OrderQty, Side, Size, TimestampMs};
+use core_types::{ConditionId, Dollars, OrderId, OrderQty, Side, Size, TimestampMs, TokenId};
+use feed_util::WsTransport;
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::{Credentials, Normal, Signer as _, Uuid};
 use polymarket_client_sdk_v2::clob::types::request::{
     BalanceAllowanceRequest, CancelMarketOrderRequest, OrdersRequest,
 };
-use polymarket_client_sdk_v2::clob::types::response::{CancelOrdersResponse, PostOrderResponse};
+use polymarket_client_sdk_v2::clob::types::response::{
+    CancelOrdersResponse, OpenOrderResponse, PostOrderResponse,
+};
 use polymarket_client_sdk_v2::clob::types::{
     Amount, AssetType, OrderType, Side as SdkSide, SignatureType, SignedOrder,
 };
@@ -37,11 +39,8 @@ use crate::convert::{BuiltOrder, OrderClass};
 use crate::error::{VenueLiveError, map_status_error};
 use crate::params::{LiveParams, SigType};
 use crate::port::{ClobPort, RawAck, RawCancel, RawOpenOrder};
-use crate::reconcile::reconcile_loop;
+use crate::user_ws::{self, UserWsArgs, UserWsCreds};
 use crate::venue::LiveVenue;
-
-/// How often the interim reconcile loop polls open orders.
-const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Pagination safety cap for `open_orders`.
 const MAX_OPEN_ORDER_PAGES: usize = 50;
@@ -299,13 +298,11 @@ impl ClobPort for SdkClobPort {
                 .await
                 .map_err(|e| map_sdk_error(&e))?;
             for order in page.data {
-                if let Ok(order_id) = OrderId::new(order.id) {
-                    out.push(RawOpenOrder {
-                        order_id,
-                        status: format!("{:?}", order.status),
-                        original_size: Size::new(order.original_size).unwrap_or(Size::ZERO),
-                        size_matched: Size::new(order.size_matched).unwrap_or(Size::ZERO),
-                    });
+                match map_open_order(order) {
+                    Ok(open) => out.push(open),
+                    Err(reason) => {
+                        tracing::warn!(target: "venue::live", %reason, "skipping unmappable open order");
+                    }
                 }
             }
             if page.next_cursor.is_empty() || Some(&page.next_cursor) == cursor.as_ref() {
@@ -317,14 +314,41 @@ impl ClobPort for SdkClobPort {
     }
 }
 
+/// Maps one SDK open-order row into the venue-live-normalized [`RawOpenOrder`].
+/// `B256` → `0x`+64-hex condition id; `U256` → bare-decimal token id (CLAUDE.md
+/// §7 id forms — pinned by the unit test below; re-verify live).
+fn map_open_order(order: OpenOrderResponse) -> Result<RawOpenOrder, String> {
+    let order_id = OrderId::new(order.id).map_err(|e| e.to_string())?;
+    let token_id = TokenId::new(order.asset_id.to_string()).map_err(|e| e.to_string())?;
+    let condition_id =
+        ConditionId::new(format!("{:#x}", order.market)).map_err(|e| e.to_string())?;
+    let side = match order.side {
+        SdkSide::Buy => Side::Buy,
+        SdkSide::Sell => Side::Sell,
+        other => return Err(format!("open order has an unsupported side: {other:?}")),
+    };
+    Ok(RawOpenOrder {
+        order_id,
+        status: format!("{:?}", order.status),
+        original_size: Size::new(order.original_size).unwrap_or(Size::ZERO),
+        size_matched: Size::new(order.size_matched).unwrap_or(Size::ZERO),
+        token_id,
+        side,
+        price: order.price,
+        condition_id,
+    })
+}
+
 impl LiveVenue<SdkClobPort> {
     /// The ONLY network-capable, order-submitting constructor. Fails closed:
     /// runs the §11 arming gate first (so a refusal never authenticates the SDK
     /// or touches the network), validates params, authenticates, and spawns the
-    /// interim reconcile poll.
+    /// authenticated `/ws/user` task (which reconciles against REST on every
+    /// (re)connect and streams order/fill events into the canonical store).
     ///
     /// # Errors
-    /// Any [`VenueLiveError`] from the arming gate, param validation, or auth.
+    /// Any [`VenueLiveError`] from the arming gate, param validation, missing
+    /// credentials, or auth.
     pub async fn connect(
         arming: LiveArming,
         dashboard_armed: bool,
@@ -333,10 +357,23 @@ impl LiveVenue<SdkClobPort> {
     ) -> Result<Self, VenueLiveError> {
         check_arming(arming, dashboard_armed, secrets)?;
         params.validate()?;
+        // The §11 gate guarantees the L2 creds; extract them for the WS before
+        // the SDK consumes the secrets.
+        let creds = UserWsCreds::from_secrets(secrets)?;
         let backend = SdkClobPort::authenticate(secrets, &params, false).await?;
         let venue = Self::with_backend(backend, params);
-        let (backend, store, events) = venue.reconcile_handles();
-        tokio::spawn(reconcile_loop(backend, store, events, RECONCILE_INTERVAL));
+        tokio::spawn(user_ws::run(UserWsArgs {
+            params: venue.params(),
+            creds,
+            backend: venue.backend_arc(),
+            store: venue.store_arc(),
+            events: venue.event_sender(),
+            transport: WsTransport,
+            markets_rx: venue.markets_rx(),
+            shutdown_rx: venue.shutdown_rx(),
+            now_fn: timeutil::wall_now,
+            backoff_seed: None,
+        }));
         Ok(venue)
     }
 
@@ -402,4 +439,23 @@ fn millis_to_datetime(ts: TimestampMs) -> Result<DateTime<Utc>, VenueLiveError> 
     DateTime::<Utc>::from_timestamp_millis(ts.as_millis()).ok_or_else(|| {
         VenueLiveError::BadConfig(format!("expiration {} ms out of range", ts.as_millis()))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn b256_and_u256_format_into_valid_ids() {
+        // `B256` lower-hex with `0x` is a valid condition id (lowercase, 64 hex).
+        let market = B256::from([0xabu8; 32]);
+        let cid = format!("{market:#x}");
+        assert_eq!(cid, format!("0x{}", "ab".repeat(32)));
+        assert!(ConditionId::new(cid).is_ok());
+
+        // `U256` decimal is a valid token id (bare digits, no `0x`).
+        let asset = U256::from(123_456_789_u64);
+        assert_eq!(asset.to_string(), "123456789");
+        assert!(TokenId::new(asset.to_string()).is_ok());
+    }
 }

@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::book::{BookSnapshot, TopOfBook};
 use crate::ids::{ConditionId, TokenId};
-use crate::inventory::InventorySnapshot;
+use crate::inventory::{InventorySnapshot, SettlementSummary};
 use crate::market::{MarketInfo, Outcome, WindowId};
 use crate::mode::Mode;
 use crate::model_state::{ModelHealth, ModelHealthReason, ModelSnapshot};
@@ -373,6 +373,8 @@ pub enum Event {
     ModelHealth(ModelHealthEvent),
     /// New inventory snapshot for a window.
     Inventory(Arc<InventorySnapshot>),
+    /// A window settled: its closing inventory summary, for analytics (§8/§10).
+    Settlement(Arc<SettlementSummary>),
     /// Risk-manager notification.
     Risk(RiskEvent),
     /// Control-plane notification.

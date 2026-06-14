@@ -30,7 +30,7 @@ pub use event::{
     WindowLifecycle,
 };
 pub use ids::{ConditionId, IdError, OrderId, TokenId};
-pub use inventory::{InventorySnapshot, SideInventory};
+pub use inventory::{InventorySnapshot, SettlementSummary, SideInventory};
 pub use market::{
     FeeParams, MarketInfo, Outcome, ResolutionKind, ResolutionSource, TokenPair, WindowId,
 };

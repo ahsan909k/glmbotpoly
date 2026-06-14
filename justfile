@@ -95,6 +95,24 @@ ladder series="BTC-5m":
 fair series="BTC-5m":
     cargo run -p bot -- fair --series {{series}}
 
+# Live paper-trading smoke run for one series' current window (real data, paper
+# money; ctrl-c to stop; default BTC-5m). Wires the scheduler + feed-clob into
+# the paper fill simulator with a trivial two-sided quoter that re-quotes at the
+# live touch. Watch for: quotes resting, real prints filling them as Maker
+# (fee 0) at our price, the cancel re-quote cycle, and the paper wallet updating
+# — never filling more or sooner than the live book/prints shown alongside.
+paper-sim series="BTC-5m":
+    cargo run -p bot -- paper-sim --series {{series}}
+
+# Live journal capture (read-only; ctrl-c to stop). Wires the scheduler + all
+# three feeds onto the bus and records every event to gzip-compressed, rotated
+# JSONL segments under out-dir (default data/journal/) — built for days of
+# capture. Records all enabled series by default; pass series="BTC-5m" for one.
+# The captured segments replay through journal::ReplayReader (and feed the
+# venue-parity tests). A nonzero "dropped" in the summary = the disk fell behind.
+record out-dir="data/journal":
+    cargo run -p bot -- record --out-dir {{out-dir}}
+
 # Latency benchmark against live Polymarket endpoints (read-only; network
 # required; ~2-3 min). Run from each candidate VPS region with a label;
 # the JSON report lands in data/latency/. Note: timeutil's harness-gated

@@ -54,6 +54,10 @@ pub struct EngineParams {
     /// Pair-cost discipline (§8): only add passively to a side if the
     /// post-trade `avg_up + avg_down` stays at or below this.
     pub pair_cost_threshold: Decimal,
+    /// Merge policy (§8): request merging matched Up/Down pairs back to
+    /// collateral once at least this many pairs have accumulated (capital
+    /// recycling). The engine reads it via `InventoryParams.merge_min_pairs`.
+    pub merge_min_pairs: Size,
     /// No at-the-money quoting once τ drops below this many seconds.
     pub no_atm_final_secs: u32,
     /// No passive orders at all (cancel-all) once τ drops below this.
@@ -104,6 +108,7 @@ impl Default for EngineParams {
             ladder_size_per_level: shares(10),
             ladder_tick_offset: 1,
             pair_cost_threshold: dec!(0.98),
+            merge_min_pairs: shares(25),
             no_atm_final_secs: 25,
             no_passive_final_secs: 5,
             reprice_threshold_theta: 0.005,
@@ -185,6 +190,11 @@ impl EngineParams {
             self.pair_cost_threshold > Decimal::ZERO && self.pair_cost_threshold < Decimal::ONE,
             key("pair_cost_threshold"),
             "must be in (0, 1) — at 1.00 a matched pair can never lock in profit",
+        );
+        v.require(
+            !self.merge_min_pairs.is_zero(),
+            key("merge_min_pairs"),
+            "must be > 0 — merging zero pairs is a no-op",
         );
         v.require(
             self.no_passive_final_secs <= self.no_atm_final_secs,
@@ -301,6 +311,8 @@ pub struct EngineParamsPatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pair_cost_threshold: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_min_pairs: Option<Size>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub no_atm_final_secs: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_passive_final_secs: Option<u32>,
@@ -353,6 +365,7 @@ impl EngineParamsPatch {
                 .unwrap_or(base.ladder_size_per_level),
             ladder_tick_offset: self.ladder_tick_offset.unwrap_or(base.ladder_tick_offset),
             pair_cost_threshold: self.pair_cost_threshold.unwrap_or(base.pair_cost_threshold),
+            merge_min_pairs: self.merge_min_pairs.unwrap_or(base.merge_min_pairs),
             no_atm_final_secs: self.no_atm_final_secs.unwrap_or(base.no_atm_final_secs),
             no_passive_final_secs: self
                 .no_passive_final_secs
@@ -588,6 +601,21 @@ mod tests {
                 "expected a BTC-5m violation for {field}"
             );
         }
+    }
+
+    #[test]
+    fn merge_min_pairs_must_be_positive() {
+        let mut cfg = EngineConfig::default();
+        cfg.defaults.merge_min_pairs = Size::ZERO;
+        let mut v = Violations::default();
+        cfg.validate_into(&mut v);
+        let violations = v.into_result().unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|x| x.key == "engine.series.BTC-5m.merge_min_pairs"),
+            "expected a merge_min_pairs violation"
+        );
     }
 
     #[test]

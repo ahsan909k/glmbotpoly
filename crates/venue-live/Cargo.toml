@@ -25,9 +25,17 @@ config = { path = "../config" }
 # `wall_now()` for the GTD floor and the reconcile poll clock (default features
 # only — no `harness`, so no network deps leak in).
 timeutil = { path = "../timeutil" }
+# Shared WebSocket plumbing for the authenticated /ws/user driver: the
+# Transport/Connection seam, the jittered Backoff, and (dev) the FakeTransport.
+# Inward arrow — feed-util depends only on core-types — and rustls-only, the
+# same tokio-tungstenite already on the tree via the SDK.
+feed-util = { path = "../feed-util" }
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Wire (de)serialization for the user-channel subscribe message + events.
+serde = { workspace = true }
+serde_json = { workspace = true }
 # The official Polymarket SDK + the chrono it needs for GTD expirations. Pulls
 # alloy (signer), reqwest 0.13, tokio-tungstenite transitively — all rustls.
 polymarket_client_sdk_v2 = { workspace = true }
@@ -37,3 +45,6 @@ rust_decimal = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "test-util"] }
+# The scripted FakeTransport for paused-time user-channel driver tests.
+feed-util = { path = "../feed-util", features = ["fake"] }
+serde_json = { workspace = true }

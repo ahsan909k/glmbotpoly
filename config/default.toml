@@ -114,6 +114,7 @@ ladder_levels = 3
 ladder_size_per_level = 10
 ladder_tick_offset = 1
 pair_cost_threshold = 0.98       # only add passively if pair cost stays <= this
+merge_min_pairs = 25             # request a pair merge once this many pairs accumulate (§8)
 no_atm_final_secs = 25           # no at-the-money quoting in the final 20-30 s
 no_passive_final_secs = 5        # cancel-all; no passive orders in the final ~5 s
 reprice_threshold_theta = 0.005  # p_up move that triggers cancel-first repricing

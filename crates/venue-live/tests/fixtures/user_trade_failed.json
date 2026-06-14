@@ -1,0 +1,28 @@
+{
+  "event_type": "trade",
+  "type": "TRADE",
+  "id": "trade-taker-1",
+  "taker_order_id": "0xorder-up-1",
+  "market": "0x7f3a1c0b9e8d6f5a4c3b2a1908172635445362718091a2b3c4d5e6f708192a3b",
+  "asset_id": "111111111",
+  "outcome": "Up",
+  "side": "BUY",
+  "size": "5",
+  "price": "0.44",
+  "status": "FAILED",
+  "maker_orders": [
+    {
+      "asset_id": "111111111",
+      "order_id": "0xmaker-counterparty",
+      "matched_amount": "5",
+      "outcome": "Up",
+      "owner": "0x00000000000000000000000000000000000000bb",
+      "price": "0.44"
+    }
+  ],
+  "owner": "0x00000000000000000000000000000000000000aa",
+  "trade_owner": "0x00000000000000000000000000000000000000aa",
+  "timestamp": "1718323207000",
+  "matchtime": "1718323205000",
+  "last_update": "1718323207000"
+}

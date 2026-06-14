@@ -11,4 +11,18 @@ workspace = true
 
 [dependencies]
 venue-api = { path = "../venue-api" }
-feed-clob = { path = "../feed-clob" }
+# All market data (Event, BookSnapshot, LastTrade, MarketInfo) and the shared
+# `taker_fee` live in core-types, not feed-clob (whose BookState is private) —
+# so the §4 "feed-clob types" dep is replaced by core-types for a leaner
+# rebuild (see the Decisions Log entry for this task).
+core-types = { path = "../core-types" }
+# The async driver: the order/fill event channel, the Notify wake, and the
+# latency timer task. The sans-IO MatchEngine itself uses no tokio.
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rust_decimal = { workspace = true }
+
+[dev-dependencies]
+# Paused virtual time for the one async-driver integration test.
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "test-util"] }

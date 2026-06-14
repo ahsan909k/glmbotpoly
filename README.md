@@ -164,6 +164,24 @@ captured strike (`exact`/`mismatch`/`unavailable`), confirming which
 `StrikeRule` the venue actually uses. Mid-window, `p_up` should track the book
 mid inside the sanity band; near close it saturates toward the resolving side.
 
+### Journal capture (record real data for replay)
+
+`just record` (= `bot record --out-dir data/journal`, optional `--series`) is
+**read-only**: it wires the scheduler + all three feeds onto the bus (like the
+smoke runs but with no model) and records **every** `Event` — price ticks,
+books, prints, lifecycle, health — to disk for offline strategy work and
+replay. Records **all enabled series** by default, or just one with `--series`.
+
+Segments are **gzip-compressed, rotated JSONL** under the output directory
+(`journal-{YYYYMMDD-HHMMSS}-{NNNNN}.jsonl.gz`), rotated at 128 MiB or hourly,
+so the capture rolls across files indefinitely — built for **days** of data.
+Each line is `{"seq","ts_local_ms","rec":{"type":…,…}}`; `gunzip`/`zcat` reads
+them directly, and `journal::ReplayReader` decodes and reconstructs the bus
+`Event`s (the same path the venue-parity tests replay through `venue-paper`).
+The writer runs off the bus on its own thread; if the disk stalls, events are
+**dropped and counted** rather than back-pressuring the bus — a nonzero
+`dropped` in the ctrl-c summary means the capture is incomplete.
+
 ### Latency benchmark (VPS region selection)
 
 `just latency <label>` (= `bot latency --label <label>`, optional

@@ -104,6 +104,79 @@ impl InventorySnapshot {
     }
 }
 
+/// The closing summary for one settled window (CLAUDE.md §8/§10): produced by the
+/// engine's inventory book on resolution and published as
+/// [`Event::Settlement`](crate::Event) for analytics. Carries the *raw* numbers —
+/// the final two sides, the matched/merged pair counts, fees, and the bottom-line
+/// realized PnL — so the analytics layer derives the §10 locked-pair-vs-inventory
+/// split itself (a pure function of these fields) rather than the engine baking it
+/// in. The matched/pair-cost/excess fields are filled through
+/// [`InventorySnapshot::derive`] so they can never drift from the two sides.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SettlementSummary {
+    /// Window that settled.
+    pub window: WindowId,
+    /// Winning outcome (the side that pays $1/share).
+    pub outcome: Outcome,
+    /// Up-side holdings at close.
+    pub up: SideInventory,
+    /// Down-side holdings at close.
+    pub down: SideInventory,
+    /// Matched pairs still held at close = `min(up.shares, down.shares)`. Each
+    /// nets $1 at settlement; locked-pair PnL = `matched_pairs · (1 − pair_cost)`.
+    pub matched_pairs: Size,
+    /// Combined average cost of a held pair (`avg_up + avg_down`), `None` unless
+    /// both sides were held.
+    pub pair_cost: Option<Decimal>,
+    /// Signed unmatched shares at close: positive = Up excess, negative = Down.
+    pub excess: Decimal,
+    /// Pairs merged back to collateral during the window (the §8 capital-recycling
+    /// mechanic). Cumulative over the window's life.
+    pub merged_pairs: Size,
+    /// Cumulative taker fees paid on this window.
+    pub fees_paid: Dollars,
+    /// Net realized PnL for the window: trading cash flow (buys, sells, fees,
+    /// merge credits) plus the winning side's $1/share payout.
+    pub realized_pnl: Dollars,
+    /// Settlement time (the window's close time).
+    pub ts: TimestampMs,
+}
+
+impl SettlementSummary {
+    /// The single construction path: derives `matched_pairs`/`pair_cost`/`excess`
+    /// from the two sides via [`InventorySnapshot::derive`] so they cannot drift.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a flat closing snapshot of one window"
+    )]
+    pub fn close(
+        window: WindowId,
+        outcome: Outcome,
+        up: SideInventory,
+        down: SideInventory,
+        merged_pairs: Size,
+        fees_paid: Dollars,
+        realized_pnl: Dollars,
+        ts: TimestampMs,
+    ) -> Self {
+        let derived = InventorySnapshot::derive(window, up, down, ts);
+        Self {
+            window,
+            outcome,
+            up,
+            down,
+            matched_pairs: derived.matched_pairs,
+            pair_cost: derived.pair_cost,
+            excess: derived.excess,
+            merged_pairs,
+            fees_paid,
+            realized_pnl,
+            ts,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rust_decimal::dec;
@@ -180,5 +253,47 @@ mod tests {
         assert_eq!(snap.excess, dec!(-40));
         assert_eq!(snap.excess_side(), Some(Outcome::Down));
         assert_eq!(snap.worst_case_if_excess_loses, Dollars::new(dec!(10)));
+    }
+
+    #[test]
+    fn settlement_summary_close_derives_pair_fields() {
+        // 150 Up @ 0.40, 100 Down @ 0.50: 100 matched pairs @ 0.90, 50 Up excess.
+        let summary = SettlementSummary::close(
+            window(),
+            Outcome::Up,
+            side(dec!(150), dec!(60)),
+            side(dec!(100), dec!(50)),
+            Size::new(dec!(20)).unwrap(),
+            Dollars::new(dec!(1.25)),
+            Dollars::new(dec!(7.5)),
+            TimestampMs::from_millis(300_000),
+        );
+        // Derived fields match InventorySnapshot::derive exactly.
+        assert_eq!(summary.matched_pairs, Size::new(dec!(100)).unwrap());
+        assert_eq!(summary.pair_cost, Some(dec!(0.90)));
+        assert_eq!(summary.excess, dec!(50));
+        // Pass-through fields preserved.
+        assert_eq!(summary.outcome, Outcome::Up);
+        assert_eq!(summary.merged_pairs, Size::new(dec!(20)).unwrap());
+        assert_eq!(summary.fees_paid, Dollars::new(dec!(1.25)));
+        assert_eq!(summary.realized_pnl, Dollars::new(dec!(7.5)));
+        assert_eq!(summary.ts, TimestampMs::from_millis(300_000));
+    }
+
+    #[test]
+    fn settlement_summary_serde_roundtrip() {
+        let summary = SettlementSummary::close(
+            window(),
+            Outcome::Down,
+            side(dec!(10), dec!(4)),
+            side(dec!(10), dec!(5)),
+            Size::ZERO,
+            Dollars::ZERO,
+            Dollars::new(dec!(1)),
+            TimestampMs::from_millis(300_000),
+        );
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: SettlementSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, summary);
     }
 }

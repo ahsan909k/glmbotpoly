@@ -10,7 +10,7 @@
 use std::sync::{Arc, Mutex};
 
 use core_types::{ConditionId, NewOrder, OrderId, OrderQty, OrderState, Size};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use venue_api::{
     Accepted, BatchPlaced, CancelReport, NotCanceled, PlaceRejection, RejectReason, VenueError,
     VenueEvent, VenueEvents, VenuePort, Wallet,
@@ -20,7 +20,7 @@ use crate::convert::{self, BuiltOrder};
 use crate::error::classify_reject;
 use crate::params::LiveParams;
 use crate::port::{ClobPort, RawAck, RawCancel};
-use crate::store::{OrderStore, TrackedOrder};
+use crate::store::{OrderStore, TrackedOrder, WindowIndex};
 
 /// Maximum orders per batch request (CLAUDE.md §7). `place_batch` chunks at this
 /// size; the venue itself also enforces a max and is mapped to
@@ -39,6 +39,10 @@ pub struct LiveVenue<P: ClobPort> {
     store: Arc<Mutex<OrderStore>>,
     event_tx: mpsc::Sender<VenueEvent>,
     event_rx: Option<mpsc::Receiver<VenueEvent>>,
+    /// Desired user-channel subscription set (condition ids).
+    markets_tx: watch::Sender<Vec<ConditionId>>,
+    /// Graceful-shutdown signal for the spawned user-channel task.
+    shutdown_tx: watch::Sender<bool>,
 }
 
 impl<P: ClobPort> LiveVenue<P> {
@@ -46,27 +50,57 @@ impl<P: ClobPort> LiveVenue<P> {
     /// `connect` / `dry_run` constructors call this after their checks.
     pub(crate) fn with_backend(backend: P, params: LiveParams) -> Self {
         let (event_tx, event_rx) = mpsc::channel(params.event_channel_capacity.max(1));
+        let mut store = OrderStore::new();
+        store.set_emit_synthetic_fills(params.emit_synthetic_fills);
+        store.set_default_fee_rate(params.default_taker_fee_rate);
+        let (markets_tx, _) = watch::channel(Vec::new());
+        let (shutdown_tx, _) = watch::channel(false);
         Self {
             backend: Arc::new(backend),
             params,
-            store: Arc::new(Mutex::new(OrderStore::new())),
+            store: Arc::new(Mutex::new(store)),
             event_tx,
             event_rx: Some(event_rx),
+            markets_tx,
+            shutdown_tx,
         }
     }
 
-    /// The handles the reconcile loop needs: a backend clone, the shared store,
-    /// and an event sender. The caller spawns [`crate::reconcile_loop`] with
-    /// these.
-    #[must_use]
-    pub(crate) fn reconcile_handles(
-        &self,
-    ) -> (Arc<P>, Arc<Mutex<OrderStore>>, mpsc::Sender<VenueEvent>) {
-        (
-            Arc::clone(&self.backend),
-            Arc::clone(&self.store),
-            self.event_tx.clone(),
-        )
+    /// Updates the user-channel subscription set; the task reconnects to
+    /// resubscribe. The orchestrator drives this from the active windows.
+    pub fn set_markets(&self, markets: Vec<ConditionId>) {
+        // A dropped receiver (task not spawned / already gone) is benign.
+        let _ = self.markets_tx.send(markets);
+    }
+
+    /// Wires the per-token resolver so the store can attribute (and adopt)
+    /// orders it did not place itself.
+    pub fn set_window_index(&self, index: Arc<dyn WindowIndex>) {
+        self.lock_store().set_window_index(index);
+    }
+
+    /// Signals the spawned user-channel task to stop (also happens on drop).
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+
+    pub(crate) fn params(&self) -> LiveParams {
+        self.params.clone()
+    }
+    pub(crate) fn backend_arc(&self) -> Arc<P> {
+        Arc::clone(&self.backend)
+    }
+    pub(crate) fn store_arc(&self) -> Arc<Mutex<OrderStore>> {
+        Arc::clone(&self.store)
+    }
+    pub(crate) fn event_sender(&self) -> mpsc::Sender<VenueEvent> {
+        self.event_tx.clone()
+    }
+    pub(crate) fn markets_rx(&self) -> watch::Receiver<Vec<ConditionId>> {
+        self.markets_tx.subscribe()
+    }
+    pub(crate) fn shutdown_rx(&self) -> watch::Receiver<bool> {
+        self.shutdown_tx.subscribe()
     }
 
     fn lock_store(&self) -> std::sync::MutexGuard<'_, OrderStore> {
@@ -540,15 +574,12 @@ mod tests {
         assert!(venue.take_event_rx().is_none());
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn reconcile_handles_drive_the_event_stream() {
-        use std::time::Duration;
-
-        let (mut venue, fake) = venue();
-        let mut rx = venue.take_event_rx().unwrap();
-
-        // Place a resting order (tracked), then script a poll showing it filled.
-        let accepted = venue
+    #[tokio::test]
+    async fn placed_resting_order_is_tracked_in_the_store() {
+        // The reconcile/stream path that turns a tracked order into events lives
+        // in the store + user_ws tests; here we only assert placement tracks it.
+        let (venue, _fake) = venue();
+        let _ = venue
             .place(&order(
                 Side::Buy,
                 shares(dec!(10)),
@@ -557,29 +588,6 @@ mod tests {
             ))
             .await
             .unwrap();
-        fake.push_open_orders(vec![crate::port::RawOpenOrder {
-            order_id: accepted.order_id.clone(),
-            status: "MATCHED".to_owned(),
-            original_size: Size::new(dec!(10)).unwrap(),
-            size_matched: Size::new(dec!(10)).unwrap(),
-        }]);
-
-        let (backend, store, tx) = venue.reconcile_handles();
-        let handle = tokio::spawn(crate::reconcile_loop(
-            backend,
-            store,
-            tx,
-            Duration::from_millis(100),
-        ));
-
-        let VenueEvent::Order(update) = rx.recv().await.expect("an order update") else {
-            panic!("expected an order update");
-        };
-        assert_eq!(update.order_id, accepted.order_id);
-        assert_eq!(update.state, OrderState::Filled);
-
-        drop(rx);
-        tokio::time::advance(Duration::from_millis(200)).await;
-        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        assert_eq!(venue.lock_store().len(), 1);
     }
 }

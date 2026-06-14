@@ -4,11 +4,12 @@
 //! graceful-shutdown order (stop strategies -> cancel all open orders ->
 //! flush journal -> exit).
 //!
-//! Current state: configuration and telemetry are wired; the engine is not.
-//! `paper` (the default) boots, logs the redacted effective configuration,
-//! and exits cleanly. `check-config` prints the effective configuration to
-//! stdout for inspection. `live` refuses: the live venue adapter does not
-//! exist yet, and Â§11 arming gates apply on top.
+//! Current state: configuration and telemetry are wired; the full engine is
+//! not. `paper` (the default) boots, logs the redacted effective configuration,
+//! and exits cleanly. `paper-sim` runs the paper fill simulator (venue-paper)
+//! against live market data with a trivial quoter. `check-config` prints the
+//! effective configuration to stdout for inspection. `live` refuses: the §11
+//! arming gates fail closed (gate 3, the dashboard arm, does not exist yet).
 //!
 //! Mode is a CLI subcommand on purpose: it is **not** a config value, so no
 //! config file can ever push the bot toward live trading.
@@ -20,6 +21,8 @@ mod feed;
 mod ladder;
 mod latency;
 mod live;
+mod paper;
+mod record;
 mod schedule;
 mod telemetry;
 mod timecfg;
@@ -34,16 +37,21 @@ use core_types::Series;
 
 use crate::feed::FeedSource;
 
-const USAGE: &str = "usage: bot [paper|live|venue-check|check-config|discover|schedule|feed|compare|\
-                     vol|ladder|fair|latency] [--config-dir <path>] [--label <name>] [--out <file>] \
-                     [--raw <file>] [--source rtds|binance] [--series <KEY>] [--depth <N>] \
-                     [--recycle-after <secs>]";
+const USAGE: &str = "usage: bot [paper|paper-sim|live|venue-check|check-config|discover|schedule|feed|\
+                     compare|vol|ladder|fair|record|latency] [--config-dir <path>] [--label <name>] \
+                     [--out <file>] [--raw <file>] [--source rtds|binance] [--series <KEY>] \
+                     [--depth <N>] [--recycle-after <secs>] [--out-dir <dir>]";
 
 /// What the operator asked the binary to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
     /// Paper trading (default): real market data, simulated money.
     Paper,
+    /// Live read-only paper-trading smoke run for one series' current window
+    /// (`--series BTC-5m` default): scheduler + feed-clob wired into the paper
+    /// venue with a trivial two-sided quoter, rendering fills and the paper
+    /// wallet. Real data, paper money. Runs until ctrl-c.
+    PaperSim,
     /// Live trading. Hard-gated (Â§11); refuses unless all three arming gates
     /// pass (gate 3, the dashboard arm, is a later task — so it fails closed).
     Live,
@@ -82,6 +90,12 @@ enum Command {
     /// journaled to `data/calibration/` and post-hoc strike verification
     /// against the venue's resolved `priceToBeat`. Runs until ctrl-c.
     Fair,
+    /// Live read-only journal capture: wire the scheduler + all feeds onto the
+    /// bus and record every event to gzip-compressed, rotated JSONL segments
+    /// under `--out-dir` (default `data/journal/`). Records all enabled series,
+    /// or just `--series`. Runs until ctrl-c (days of capture roll across
+    /// segments).
+    Record,
     /// Latency benchmark against live endpoints; writes a JSON report
     /// (`--label` names the host/region, `--out` overrides the report path).
     Latency,
@@ -105,6 +119,8 @@ struct Cli {
     depth: Option<usize>,
     /// Force one connection recycle after this many seconds (`ladder`).
     recycle_after: Option<u64>,
+    /// Output directory for `record` journal segments (default `data/journal`).
+    out_dir: Option<PathBuf>,
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
@@ -117,16 +133,19 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
     let mut series = None;
     let mut depth = None;
     let mut recycle_after = None;
+    let mut out_dir = None;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "paper" | "live" | "venue-check" | "check-config" | "discover" | "schedule"
-            | "feed" | "compare" | "vol" | "ladder" | "fair" | "latency" => {
+            "paper" | "paper-sim" | "live" | "venue-check" | "check-config" | "discover"
+            | "schedule" | "feed" | "compare" | "vol" | "ladder" | "fair" | "record"
+            | "latency" => {
                 if command.is_some() {
                     return Err(format!("more than one subcommand given (second: {arg:?})"));
                 }
                 command = Some(match arg.as_str() {
                     "paper" => Command::Paper,
+                    "paper-sim" => Command::PaperSim,
                     "live" => Command::Live,
                     "venue-check" => Command::VenueCheck,
                     "discover" => Command::Discover,
@@ -136,6 +155,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
                     "vol" => Command::Vol,
                     "ladder" => Command::Ladder,
                     "fair" => Command::Fair,
+                    "record" => Command::Record,
                     "latency" => Command::Latency,
                     _ => Command::CheckConfig,
                 });
@@ -188,6 +208,12 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
                     .ok_or_else(|| "--recycle-after requires a value (seconds)".to_owned())?;
                 recycle_after = Some(parse_secs(&value)?);
             }
+            "--out-dir" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--out-dir requires a value".to_owned())?;
+                out_dir = Some(PathBuf::from(value));
+            }
             other => {
                 if let Some(value) = other.strip_prefix("--config-dir=") {
                     config_dir = Some(PathBuf::from(value));
@@ -205,6 +231,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
                     depth = Some(parse_depth(value)?);
                 } else if let Some(value) = other.strip_prefix("--recycle-after=") {
                     recycle_after = Some(parse_secs(value)?);
+                } else if let Some(value) = other.strip_prefix("--out-dir=") {
+                    out_dir = Some(PathBuf::from(value));
                 } else {
                     return Err(format!("unrecognized argument: {other:?}"));
                 }
@@ -221,11 +249,22 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
     if source.is_some() && command != Command::Feed {
         return Err("--source only applies to the feed subcommand".to_owned());
     }
-    if series.is_some() && command != Command::Ladder && command != Command::Fair {
-        return Err("--series only applies to the ladder and fair subcommands".to_owned());
+    if series.is_some()
+        && command != Command::Ladder
+        && command != Command::Fair
+        && command != Command::PaperSim
+        && command != Command::Record
+    {
+        return Err(
+            "--series only applies to the ladder, fair, paper-sim, and record subcommands"
+                .to_owned(),
+        );
     }
     if (depth.is_some() || recycle_after.is_some()) && command != Command::Ladder {
         return Err("--depth/--recycle-after only apply to the ladder subcommand".to_owned());
+    }
+    if out_dir.is_some() && command != Command::Record {
+        return Err("--out-dir only applies to the record subcommand".to_owned());
     }
     Ok(Cli {
         command,
@@ -237,6 +276,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
         series,
         depth,
         recycle_after,
+        out_dir,
     })
 }
 
@@ -402,6 +442,34 @@ fn run() -> anyhow::Result<ExitCode> {
                 "fair-value smoke run (read-only)"
             );
             fair::execute(&config, series)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Record => {
+            let _guard = telemetry::init(&config.log).context("initializing telemetry")?;
+            let out_dir = cli
+                .out_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("data/journal"));
+            tracing::info!(
+                version = env!("CARGO_PKG_VERSION"),
+                config_dir = %config_dir.display(),
+                series = cli.series.map(|s| s.key()),
+                out_dir = %out_dir.display(),
+                "journal capture (read-only)"
+            );
+            record::execute(&config, cli.series, &out_dir)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::PaperSim => {
+            let _guard = telemetry::init(&config.log).context("initializing telemetry")?;
+            let series = cli.series.unwrap_or_else(default_btc_5m_series);
+            tracing::info!(
+                version = env!("CARGO_PKG_VERSION"),
+                config_dir = %config_dir.display(),
+                series = series.key(),
+                "paper-sim run (real data, paper money)"
+            );
+            paper::execute(&config, series)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Latency => {
@@ -709,6 +777,76 @@ mod tests {
         assert!(parse(&["fair", "--source", "rtds"]).is_err());
         assert!(parse(&["fair", "--label", "x"]).is_err());
         assert!(parse(&["fair", "--series", "DOGE-5m"]).is_err());
+    }
+
+    #[test]
+    fn parses_paper_sim() {
+        use core_types::{Asset, WindowDuration};
+
+        // Bare paper-sim defaults to BTC-5m at dispatch (series None here).
+        let cli = parse(&["paper-sim"]).unwrap();
+        assert_eq!(cli.command, Command::PaperSim);
+        assert_eq!(cli.series, None);
+
+        // --series applies to paper-sim (shared with ladder/fair), both forms.
+        let cli = parse(&["paper-sim", "--series", "ETH-15m"]).unwrap();
+        assert_eq!(
+            cli.series,
+            Some(Series {
+                asset: Asset::Eth,
+                duration: WindowDuration::M15,
+            })
+        );
+        assert_eq!(
+            parse(&["paper-sim", "--series=BTC-1h"]).unwrap().command,
+            Command::PaperSim
+        );
+
+        // `paper` and `paper-sim` are distinct; ladder-only/feed/latency flags
+        // don't apply to paper-sim.
+        assert_eq!(parse(&["paper"]).unwrap().command, Command::Paper);
+        assert!(parse(&["paper-sim", "--depth", "8"]).is_err());
+        assert!(parse(&["paper-sim", "--raw", "x.jsonl"]).is_err());
+        assert!(parse(&["paper-sim", "--source", "rtds"]).is_err());
+        assert!(parse(&["paper-sim", "--label", "x"]).is_err());
+        assert!(parse(&["paper-sim", "paper"]).is_err());
+        assert!(parse(&["paper-sim", "--series", "DOGE-5m"]).is_err());
+    }
+
+    #[test]
+    fn parses_record_flags() {
+        use core_types::{Asset, WindowDuration};
+
+        // Bare record: all enabled series, default out-dir at dispatch.
+        let cli = parse(&["record"]).unwrap();
+        assert_eq!(cli.command, Command::Record);
+        assert_eq!(cli.series, None);
+        assert_eq!(cli.out_dir, None);
+
+        // --series (shared with ladder/fair/paper-sim) + --out-dir, both forms.
+        let cli = parse(&["record", "--series", "ETH-15m", "--out-dir", "data/cap"]).unwrap();
+        assert_eq!(
+            cli.series,
+            Some(Series {
+                asset: Asset::Eth,
+                duration: WindowDuration::M15,
+            })
+        );
+        assert_eq!(cli.out_dir, Some(PathBuf::from("data/cap")));
+        let cli = parse(&["record", "--series=BTC-1h", "--out-dir=/tmp/j"]).unwrap();
+        assert_eq!(cli.out_dir, Some(PathBuf::from("/tmp/j")));
+
+        // --out-dir is record-only; ladder/feed/latency flags don't apply.
+        assert!(parse(&["record", "--depth", "8"]).is_err());
+        assert!(parse(&["record", "--raw", "x.jsonl"]).is_err());
+        assert!(parse(&["record", "--source", "rtds"]).is_err());
+        assert!(parse(&["record", "--label", "x"]).is_err());
+        assert!(parse(&["record", "--series", "DOGE-5m"]).is_err());
+        assert!(parse(&["record", "paper"]).is_err());
+        // --out-dir does not leak onto other subcommands.
+        assert!(parse(&["ladder", "--out-dir", "x"]).is_err());
+        assert!(parse(&["--out-dir", "x"]).is_err());
+        assert!(parse(&["record", "--out-dir"]).is_err());
     }
 
     #[test]

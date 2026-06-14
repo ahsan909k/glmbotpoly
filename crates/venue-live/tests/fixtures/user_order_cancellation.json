@@ -1,0 +1,16 @@
+{
+  "event_type": "order",
+  "type": "CANCELLATION",
+  "id": "0xorder-up-1",
+  "market": "0x7f3a1c0b9e8d6f5a4c3b2a1908172635445362718091a2b3c4d5e6f708192a3b",
+  "asset_id": "111111111",
+  "outcome": "Up",
+  "side": "BUY",
+  "original_size": "20",
+  "price": "0.43",
+  "size_matched": "8",
+  "order_owner": "0x00000000000000000000000000000000000000aa",
+  "owner": "0x00000000000000000000000000000000000000aa",
+  "timestamp": "1718323260000",
+  "associate_trades": ["trade-1"]
+}

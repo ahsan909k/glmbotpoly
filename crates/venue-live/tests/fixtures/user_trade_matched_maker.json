@@ -1,0 +1,28 @@
+{
+  "event_type": "trade",
+  "type": "TRADE",
+  "id": "trade-maker-1",
+  "taker_order_id": "0xtaker-counterparty",
+  "market": "0x7f3a1c0b9e8d6f5a4c3b2a1908172635445362718091a2b3c4d5e6f708192a3b",
+  "asset_id": "222222222",
+  "outcome": "Down",
+  "side": "SELL",
+  "size": "7",
+  "price": "0.57",
+  "status": "MATCHED",
+  "maker_orders": [
+    {
+      "asset_id": "222222222",
+      "order_id": "0xorder-down-1",
+      "matched_amount": "7",
+      "outcome": "Down",
+      "owner": "0x00000000000000000000000000000000000000aa",
+      "price": "0.57"
+    }
+  ],
+  "owner": "0x00000000000000000000000000000000000000bb",
+  "trade_owner": "0x00000000000000000000000000000000000000bb",
+  "timestamp": "1718323206000",
+  "matchtime": "1718323206000",
+  "last_update": "1718323206000"
+}

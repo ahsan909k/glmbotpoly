@@ -12,3 +12,15 @@ workspace = true
 [dependencies]
 model = { path = "../model" }
 venue-api = { path = "../venue-api" }
+# `model` does not re-export `core_types`, so name it directly: the normalizer
+# needs MarketInfo/Price/Size/TopOfBook/OrderQty/NewOrder/… (CLAUDE.md §4).
+core-types = { path = "../core-types" }
+# RoundingStrategy::ToPositiveInfinity for the min-notional ceil; `dec!` in tests.
+rust_decimal = { workspace = true }
+# The NormalizeReject typed error (CLAUDE.md §12).
+thiserror = { workspace = true }
+# §12 order-level logging from the quote-manager *driver* only (every intent,
+# placement, cancel, breaker reaction). The pure modules (quoting/normalize/
+# inventory + the manager's planner/view) stay tracing-free; the driver is the
+# one effectful, IO-bearing part — the same deliberate exception `feed-clob` took.
+tracing = { workspace = true }
