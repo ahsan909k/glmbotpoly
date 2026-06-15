@@ -311,6 +311,11 @@ fn normalize(ev: &VenueEvent, aliases: &HashMap<String, String>) -> Norm {
             reject: None,
             fee_zero: Some(f.fee == Dollars::ZERO),
         },
+        // User-WS connectivity is a live-only risk-manager signal; venue-paper
+        // never emits it, so it can't appear in these golden sequences.
+        VenueEvent::Connectivity { .. } => {
+            panic!("venue-paper never emits VenueEvent::Connectivity")
+        }
     }
 }
 

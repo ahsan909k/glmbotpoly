@@ -92,6 +92,9 @@ async fn run(config: &AppConfig, series: Series) -> anyhow::Result<()> {
         starting_capital = %starting_capital,
         "paper-sim starting (real data, paper money; ctrl-c to stop)"
     );
+    // Restore prior inventory + order state from the journal (§3/§9). Demonstrates
+    // the boot-rebuild path; the live engine wiring that consumes it is deferred.
+    let _restored = crate::boot::rebuild_and_log(config);
 
     let (bus_tx, mut bus_rx) = mpsc::channel::<Event>(256);
     // A bus sender retained by the orchestrator so the capital-adjust command
@@ -476,6 +479,8 @@ impl State {
                     }
                 ));
             }
+            // Paper has no user channel; this is a live-only risk-manager signal.
+            VenueEvent::Connectivity { .. } => {}
         }
     }
 

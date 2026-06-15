@@ -25,27 +25,37 @@
 
 pub mod inventory;
 pub mod normalize;
-pub mod quote_manager;
 pub mod quoting;
-pub mod taker;
+pub mod risk;
+
+// The strategy drivers are crate-private: the only `pub` path from outside
+// `engine` to the venue port is `risk::RiskManager`, which always interposes the
+// `GuardedPort` (CLAUDE.md §5/§11 — the single-gateway invariant, enforced by
+// visibility). Their pure params/plan/view types stay re-exported below.
+pub(crate) mod late_window;
+pub(crate) mod quote_manager;
+pub(crate) mod taker;
 
 pub use inventory::{
     ExcessConstraint, InventoryEffect, InventoryManager, InventoryParams, MergeIntent,
     WindowInventory, authorizes_passive_add_sides, excess_constraint_sides,
     pair_cost_after_add_sides,
 };
+pub use late_window::{
+    CertaintyTakePlan, LateWindowTakerParams, NoLateTakeReason, plan_certainty_take,
+};
 pub use normalize::{
     Adjustments, NormalizeReject, Normalized, NormalizerParams, OrderDraft, PriceSnap, normalize,
 };
 pub use quote_manager::{
     CancelAction, ClientId, ConvergeRationale, ConvergencePlan, ConvergencePlanner, DesiredPlace,
-    QuoteManager, QuoteManagerParams, RestingOrder, RestingView,
+    QuoteManagerParams, RestingOrder, RestingView,
 };
 pub use quoting::{
-    NoQuoteReason, QuoteDecision, QuoteLevel, QuoteParams, QuoteSet, SuppressReason, Suppressed,
-    calculate_quotes,
+    FinalSecondsViolation, NoQuoteReason, PassiveLevelRef, QuoteDecision, QuoteLevel, QuoteParams,
+    QuoteSet, SuppressReason, Suppressed, calculate_quotes, check_final_seconds_invariant,
 };
+pub use risk::{RiskManager, RiskOutput, RiskParams, RiskStateSnapshot};
 pub use taker::{
-    ConfirmedMove, MomentumTaker, MomentumTakerParams, NoTakeReason, SignalWindow, TakePlan,
-    plan_take,
+    ConfirmedMove, MomentumTakerParams, NoTakeReason, SignalWindow, TakePlan, plan_take,
 };

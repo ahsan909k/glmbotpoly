@@ -1,57 +1,45 @@
-//! [`MomentumTaker`]: the async, IO-bearing executor for the §8 momentum taker.
+//! [`LateWindowTaker`]: the async, IO-bearing executor for the §8 late-window
+//! certainty taker.
 //!
-//! Mirrors [`QuoteManager`](crate::quote_manager::QuoteManager): it needs **no**
-//! `tokio` (it only `.await`s the [`VenuePort`] futures and takes `now:
-//! TimestampMs` as a parameter — sans-clock, like the rest of `engine`), folds
-//! its own fills **only** from the venue stream, owns the `tripped`/
-//! `standing_down` risk veto, and routes every FAK through the
-//! [`normalize`](crate::normalize) chokepoint. It logs via `tracing` (target
-//! `momentum-taker`, §12).
+//! Mirrors [`MomentumTaker`](crate::MomentumTaker): it needs **no** `tokio` (it
+//! only `.await`s the [`VenuePort`] futures and takes `now: TimestampMs` as a
+//! parameter — sans-clock, like the rest of `engine`), folds its own fills **only**
+//! from the venue stream, owns the `tripped`/`standing_down` risk veto, and routes
+//! every FAK through the [`normalize`](crate::normalize) chokepoint. It logs via
+//! `tracing` (target `late-window-taker`, §12).
 //!
-//! The bot's select-loop owns the timers and the single `VenueEvent` receiver
-//! and calls:
-//! - [`MomentumTaker::on_event`] for each bus event (price tick → signal ring;
-//!   model/book → cache + attempt a take; window lifecycle; risk),
-//! - [`MomentumTaker::on_venue_event`] for each item on the venue's order/fill
-//!   stream (charges the budget from our own taker fills).
-//!
-//! ## Ingestion vs decision vs firing
-//!
-//! State ingestion ([`ingest`](MomentumTaker::ingest)) and the take *decision*
-//! ([`decide`](MomentumTaker::decide)) are pure and **synchronous**; only firing
-//! (`normalize` + `port.place`) is async. So the entire gate ladder is unit-
-//! testable without a runtime, while the async fire/fill path is exercised
-//! end-to-end against the real `PaperVenue` in `bot/tests` (the `quote_manager`
-//! precedent).
+//! The decision is purely model-probability driven: there is **no signal ring and
+//! no fast feed**. [`ingest`](LateWindowTaker::ingest) deliberately drops
+//! [`Event::PriceTick`](core_types::Event::PriceTick) — the candidate side and its
+//! certainty come from the Chainlink-anchored [`ModelSnapshot`](core_types::ModelSnapshot)
+//! alone (see [`super`] for the anchor gate and the tie rule).
 //!
 //! ## Budget accounting
 //!
-//! The per-window budget tracks **committed-in-flight** notional explicitly:
-//! `effective_spent = realized_spent + Σ pending`. On a `place` `Accepted` the
-//! planned notional is committed to `pending`; each of our `Fill`s moves notional
-//! into `realized_spent` and decrements that order's `pending`; the order's
-//! terminal `Order` update drops any residual `pending` (a FAK's unfilled
-//! remainder was killed, never spent). So a take can never exceed the budget even
-//! if a fill lags the next decision — the cooldown is a behavioral throttle, not
-//! a correctness crutch (§9 conservatism).
+//! Identical committed-in-flight scheme to the momentum taker: `effective_spent =
+//! realized_spent + Σ pending`; a `place` `Accepted` commits the planned notional
+//! to `pending`; each of our `Fill`s moves notional into `realized_spent` and
+//! decrements that order's `pending`; the order's terminal `Order` update drops any
+//! residual (a FAK's unfilled remainder was killed, never spent). The budget is
+//! driver-local — the shared momentum+late reconciliation is deferred (see
+//! [`super`]).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use core_types::{
-    Asset, BookSnapshot, BreakerKind, Decimal, Dollars, Event, Liquidity, MarketInfo,
-    ModelSnapshot, OrderQty, Outcome, PriceSource, RiskEvent, Side, TickKind, TimeInForce,
-    TimestampMs, TokenId, WindowId, WindowLifecycle,
+    AnchorSource, BookSnapshot, BreakerKind, Decimal, Dollars, Event, Liquidity, MarketInfo,
+    ModelSnapshot, OrderQty, Outcome, RiskEvent, Side, TimeInForce, TimestampMs, TokenId, WindowId,
+    WindowLifecycle,
 };
 use venue_api::{VenueEvent, VenuePort};
 
-use super::edge::{TakePlan, plan_take};
-use super::signal::SignalWindow;
-use super::{MomentumTakerParams, NoTakeReason};
+use super::edge::{CertaintyTakePlan, plan_certainty_take};
+use super::{LateWindowTakerParams, NoLateTakeReason};
 use crate::normalize::{NormalizerParams, OrderDraft, normalize};
 
 /// Seconds remaining to close, clamped at zero — computed inline so the driver
-/// needs no `timeutil` dependency (the `quote_manager` precedent).
+/// needs no `timeutil` dependency (the `quote_manager`/`taker` precedent).
 fn tau_secs(now: TimestampMs, close: TimestampMs) -> f64 {
     let ms = close.as_millis() - now.as_millis();
     if ms <= 0 { 0.0 } else { ms as f64 / 1000.0 }
@@ -68,17 +56,16 @@ struct Decision {
     outcome: Outcome,
     token_id: TokenId,
     market: Arc<MarketInfo>,
-    plan: TakePlan,
+    plan: CertaintyTakePlan,
 }
 
-/// The fee-aware momentum taker (CLAUDE.md §8). Generic placement happens through
-/// the [`VenuePort`] passed to each method; the taker stores no port (and so is
-/// not itself generic), keeping it trivially shareable across the bot's venue.
-pub struct MomentumTaker {
-    params: MomentumTakerParams,
+/// The late-window certainty taker (CLAUDE.md §8). Generic placement happens
+/// through the [`VenuePort`] passed to each method; the taker stores no port (and
+/// so is not itself generic), keeping it trivially shareable across the bot's
+/// venue.
+pub struct LateWindowTaker {
+    params: LateWindowTakerParams,
     normalizer_params: NormalizerParams,
-    /// Per-asset signal rings (span window rolls — price history is continuous).
-    signals: HashMap<Asset, SignalWindow>,
     /// Latest model snapshot.
     last_model: Option<ModelSnapshot>,
     /// Latest full book per active-window token (depth for sizing).
@@ -103,14 +90,13 @@ pub struct MomentumTaker {
     take_count: u64,
 }
 
-impl MomentumTaker {
+impl LateWindowTaker {
     /// Builds a taker with the given tunables and an empty state.
     #[must_use]
-    pub fn new(params: MomentumTakerParams, normalizer_params: NormalizerParams) -> Self {
+    pub fn new(params: LateWindowTakerParams, normalizer_params: NormalizerParams) -> Self {
         Self {
             params,
             normalizer_params,
-            signals: HashMap::new(),
             last_model: None,
             books: HashMap::new(),
             active: None,
@@ -153,8 +139,8 @@ impl MomentumTaker {
     }
 
     /// Handles one bus event; attempts a take after a model or active-token book
-    /// update (a fresh fair or a fresh book may have opened an opportunity). A
-    /// price tick only updates the signal ring — the decision needs a fresh fair.
+    /// update (a fresh fair or a fresh book may have opened the endgame). A price
+    /// tick is ignored — this taker uses no fast-feed signal.
     pub async fn on_event<P: VenuePort>(&mut self, event: &Event, port: &P, now: TimestampMs) {
         if self.ingest(event) {
             self.attempt_take(port, now).await;
@@ -170,7 +156,7 @@ impl MomentumTaker {
                     debug_assert_eq!(
                         f.liquidity,
                         Liquidity::Taker,
-                        "the momentum taker only ever fires FAK taker orders"
+                        "the late-window taker only ever fires FAK taker orders"
                     );
                     let filled = Dollars::new(f.price.as_decimal() * f.size.as_decimal());
                     self.realized_spent = self.realized_spent + filled;
@@ -182,7 +168,7 @@ impl MomentumTaker {
                             after
                         };
                     }
-                    tracing::info!(target: "momentum-taker", order = %f.order_id, price = %f.price, size = %f.size, "taker fill");
+                    tracing::info!(target: "late-window-taker", order = %f.order_id, price = %f.price, size = %f.size, "taker fill");
                 }
             }
             VenueEvent::Order(u) => {
@@ -202,17 +188,9 @@ impl MomentumTaker {
     /// should be attempted (a model update, or a fresh book on an active token).
     fn ingest(&mut self, event: &Event) -> bool {
         match event {
-            Event::PriceTick(tick) => {
-                // Only the fast leading signal: direct-Binance top-of-book mid.
-                if tick.source == PriceSource::BinanceDirect && tick.kind == TickKind::Mid {
-                    let lookback = self.params.signal_lookback_ms;
-                    self.signals
-                        .entry(tick.asset)
-                        .or_insert_with(|| SignalWindow::new(lookback))
-                        .push(tick.ts_local, tick.value);
-                }
-                false
-            }
+            // No fast feed: the late-window decision is Chainlink-anchored only,
+            // so price ticks never feed it.
+            Event::PriceTick(_) => false,
             Event::Model(snap) => {
                 self.last_model = Some(*snap);
                 true
@@ -256,7 +234,7 @@ impl MomentumTaker {
                 self.our_orders.clear();
                 self.books.clear();
                 self.last_take_ms = None;
-                tracing::info!(target: "momentum-taker", window = %market.window, "window open: taker armed");
+                tracing::info!(target: "late-window-taker", window = %market.window, "window open: late taker armed");
             }
             WindowLifecycle::Closing
             | WindowLifecycle::Closed
@@ -267,7 +245,7 @@ impl MomentumTaker {
                     .is_some_and(|a| a.window == market.window)
                 {
                     self.active = None;
-                    tracing::debug!(target: "momentum-taker", window = %market.window, ?lifecycle, "window ended: taker stood down");
+                    tracing::debug!(target: "late-window-taker", window = %market.window, ?lifecycle, "window ended: late taker stood down");
                 }
             }
             WindowLifecycle::Discovered => {}
@@ -282,13 +260,13 @@ impl MomentumTaker {
                 self.standing_down = true;
                 // No cancel-all: a FAK is immediately terminal, so the taker
                 // never holds resting orders — it just stops firing.
-                tracing::warn!(target: "momentum-taker", ?breaker, "risk veto: taker standing down");
+                tracing::warn!(target: "late-window-taker", ?breaker, "risk veto: late taker standing down");
             }
             RiskEvent::BreakerCleared { breaker } => {
                 self.tripped.remove(&breaker);
                 if self.tripped.is_empty() {
                     self.standing_down = false;
-                    tracing::info!(target: "momentum-taker", "all breakers cleared: taker resuming");
+                    tracing::info!(target: "late-window-taker", "all breakers cleared: late taker resuming");
                 }
             }
         }
@@ -296,50 +274,71 @@ impl MomentumTaker {
 
     // ---- decision (sync, pure) ---------------------------------------------
 
-    /// The full take gate ladder. Each gate maps to a typed [`NoTakeReason`] so
+    /// The full take gate ladder. Each gate maps to a typed [`NoLateTakeReason`] so
     /// every non-fire is explainable. Pure and synchronous.
-    fn decide(&self, now: TimestampMs) -> Result<Decision, NoTakeReason> {
+    fn decide(&self, now: TimestampMs) -> Result<Decision, NoLateTakeReason> {
         if self.standing_down {
-            return Err(NoTakeReason::StandingDown);
+            return Err(NoLateTakeReason::StandingDown);
         }
-        let active = self.active.as_ref().ok_or(NoTakeReason::NoActiveWindow)?;
-        let model = self.last_model.ok_or(NoTakeReason::NoModel)?;
+        let active = self
+            .active
+            .as_ref()
+            .ok_or(NoLateTakeReason::NoActiveWindow)?;
+        let model = self.last_model.ok_or(NoLateTakeReason::NoModel)?;
         if model.window != Some(active.window) {
-            return Err(NoTakeReason::WindowMismatch {
+            return Err(NoLateTakeReason::WindowMismatch {
                 model: model.window,
                 active: active.window,
             });
         }
         if !model.health.allows_quoting() {
-            return Err(NoTakeReason::ModelNotReady {
+            return Err(NoLateTakeReason::ModelNotReady {
                 health: model.health,
                 reason: model.reason,
             });
         }
+        // Resolution-grade feed only: never act on a fast-feed-anchored fair (§8).
+        if model.anchor != AnchorSource::Chainlink {
+            return Err(NoLateTakeReason::NotChainlinkAnchored {
+                anchor: model.anchor,
+            });
+        }
+        // The certainty taker WANTS a saturated fair (p_up at/near 1.0 or 0.0), so
+        // it accepts the closed interval [0, 1] — unlike the momentum taker's
+        // strict (0, 1) interior. Only a non-finite or out-of-range fair is unusable.
         let p_up = model.p_up;
-        if !p_up.is_finite() || p_up <= 0.0 || p_up >= 1.0 {
-            return Err(NoTakeReason::UnusableFair { p_up });
+        if !p_up.is_finite() || !(0.0..=1.0).contains(&p_up) {
+            return Err(NoLateTakeReason::UnusableFair { p_up });
         }
-        let sigma = model.sigma_1s;
-        if !sigma.is_finite() || sigma <= 0.0 {
-            return Err(NoTakeReason::UnusableVol { sigma_1s: sigma });
-        }
-        // Defensive expiry guard (no τ floor: takes are allowed up to resolution).
+        // Defensive expiry guard, then the late-window activation.
         let tau = tau_secs(now, active.market.close_time);
         if tau <= 0.0 {
-            return Err(NoTakeReason::Expired { tau_secs: tau });
+            return Err(NoLateTakeReason::Expired { tau_secs: tau });
         }
-        // A confirmed fast-feed move picks the candidate side.
-        let confirmed = self
-            .signals
-            .get(&active.window.series.asset)
-            .and_then(|w| w.confirmed_direction(now, sigma, self.params.signal_sigma_mult))
-            .ok_or(NoTakeReason::NoConfirmedMove)?;
+        if tau > f64::from(self.params.tau_threshold_secs) {
+            return Err(NoLateTakeReason::NotLateWindow {
+                tau_secs: tau,
+                threshold: self.params.tau_threshold_secs,
+            });
+        }
+        // Tie rule (§6): the model encodes S>=K (incl. equality) as p_up saturating
+        // toward 1.0, so inclusive comparisons make exact-at-strike lean Up — a
+        // p_up of exactly 1.0 buys Up, 0.0 buys Down.
+        let outcome = if p_up >= self.params.certainty_threshold {
+            Outcome::Up
+        } else if p_up <= 1.0 - self.params.certainty_threshold {
+            Outcome::Down
+        } else {
+            return Err(NoLateTakeReason::NotCertain {
+                p_up,
+                threshold: self.params.certainty_threshold,
+            });
+        };
         // Cooldown.
         if let Some(last) = self.last_take_ms {
             let elapsed = now.as_millis() - last;
             if elapsed < self.params.cooldown_ms {
-                return Err(NoTakeReason::InCooldown {
+                return Err(NoLateTakeReason::InCooldown {
                     remaining_ms: self.params.cooldown_ms - elapsed,
                 });
             }
@@ -347,35 +346,27 @@ impl MomentumTaker {
         // Budget (committed-in-flight aware).
         let remaining = self.params.budget_per_window - self.effective_spent();
         if remaining.as_decimal() < Decimal::ONE {
-            return Err(NoTakeReason::BudgetExhausted {
+            return Err(NoLateTakeReason::BudgetExhausted {
                 remaining,
                 need: Dollars::new(Decimal::ONE),
             });
         }
-        let outcome = confirmed.outcome;
         let token_id = active.market.tokens.get(outcome).clone();
         let book = self
             .books
             .get(&token_id)
-            .ok_or(NoTakeReason::NoBookForToken)?;
-        let fair = if outcome == Outcome::Up {
-            p_up
-        } else {
-            1.0 - p_up
-        };
+            .ok_or(NoLateTakeReason::NoBookForToken)?;
         let fees = &active.market.fees;
         let fee_rate = if fees.enabled {
             fees.rate
         } else {
             Decimal::ZERO
         };
-        let plan = plan_take(
+        let plan = plan_certainty_take(
             outcome,
-            fair,
             &book.asks,
             fee_rate,
-            self.params.taker_rebate_pct,
-            self.params.momentum_buffer,
+            self.params.price_cap,
             remaining,
         )?;
         Ok(Decision {
@@ -392,7 +383,7 @@ impl MomentumTaker {
         match self.decide(now) {
             Ok(decision) => self.fire(port, decision, now).await,
             Err(reason) => {
-                tracing::debug!(target: "momentum-taker", reason = %reason, "no take");
+                tracing::debug!(target: "late-window-taker", reason = %reason, "no take");
             }
         }
     }
@@ -401,7 +392,7 @@ impl MomentumTaker {
         let seq = self.next_seq();
         let open_ms = decision.market.window.open_time.as_millis();
         let draft = OrderDraft {
-            client_id: Some(format!("mt:{open_ms}:{seq}")),
+            client_id: Some(format!("lw:{open_ms}:{seq}")),
             window: decision.market.window,
             token_id: decision.token_id,
             outcome: decision.outcome,
@@ -412,11 +403,11 @@ impl MomentumTaker {
         };
         // FAK is not post-only, so the normalizer's cross check is skipped — no
         // book view needed. It only snaps the worst-price cap (already on-grid)
-        // and re-checks the $1 notional (guaranteed by plan_take).
+        // and re-checks the $1 notional (guaranteed by plan_certainty_take).
         let order = match normalize(&draft, &decision.market, None, &self.normalizer_params) {
             Ok(n) => n.order,
             Err(e) => {
-                tracing::warn!(target: "momentum-taker", reason = %e, "normalize rejected the FAK (unexpected — plan_take guarantees ≥$1 notional + on-grid worst price)");
+                tracing::warn!(target: "late-window-taker", reason = %e, "normalize rejected the FAK (unexpected — plan_certainty_take guarantees ≥$1 notional + on-grid worst price)");
                 return;
             }
         };
@@ -427,17 +418,16 @@ impl MomentumTaker {
                 self.last_take_ms = Some(now.as_millis());
                 self.take_count += 1;
                 tracing::info!(
-                    target: "momentum-taker",
+                    target: "late-window-taker",
                     outcome = %decision.outcome,
                     worst = %decision.plan.worst_price,
                     notional = %decision.plan.notional,
                     shares = %decision.plan.expected_shares,
-                    edge = %decision.plan.aggregate_edge,
-                    "momentum take (FAK)"
+                    "late-window certainty take (FAK)"
                 );
             }
             Err(e) => {
-                tracing::warn!(target: "momentum-taker", error = %e, "FAK place failed");
+                tracing::warn!(target: "late-window-taker", error = %e, "FAK place failed");
             }
         }
     }
@@ -454,10 +444,10 @@ mod tests {
     use std::sync::Arc;
 
     use core_types::{
-        AnchorSource, BookLevel, BookSnapshot, ConditionId, DurationMs, FeeParams, Fill, InputAges,
+        Asset, BookLevel, BookSnapshot, ConditionId, DurationMs, FeeParams, Fill, InputAges,
         Liquidity, ModelHealth, ModelHealthReason, ModelSnapshot, OrderId, OrderState, OrderUpdate,
-        Outcome, Price, PriceTick, ResolutionSource, Series, Side, Size, TickSize, TokenId,
-        TokenPair, WindowDuration, WindowId, WindowLifecycle,
+        Outcome, Price, ResolutionSource, Series, Side, Size, TickSize, TokenId, TokenPair,
+        WindowDuration, WindowId, WindowLifecycle,
     };
     use rust_decimal::dec;
     use venue_api::VenueEvent;
@@ -466,6 +456,8 @@ mod tests {
 
     const OPEN_MS: i64 = 1_781_000_000_000;
     const CLOSE_MS: i64 = OPEN_MS + 300_000;
+    /// A "now" with τ = 20 s remaining — inside the 30 s late-window threshold.
+    const LATE_MS: i64 = CLOSE_MS - 20_000;
     const TICK: TickSize = TickSize::T001;
 
     fn window() -> WindowId {
@@ -498,7 +490,7 @@ mod tests {
     fn market() -> Arc<MarketInfo> {
         Arc::new(MarketInfo {
             window: window(),
-            event_slug: "btc-updown-5m-mt".to_owned(),
+            event_slug: "btc-updown-5m-lw".to_owned(),
             condition_id: ConditionId::new(format!("0x{}", "11".repeat(32))).unwrap(),
             tokens: TokenPair {
                 up: up_token(),
@@ -527,16 +519,21 @@ mod tests {
         }
     }
 
-    fn model_snapshot(p_up: f64, sigma: f64, health: ModelHealth, win: Option<WindowId>) -> Event {
+    fn model_snapshot(
+        p_up: f64,
+        health: ModelHealth,
+        anchor: AnchorSource,
+        win: Option<WindowId>,
+    ) -> Event {
         Event::Model(ModelSnapshot {
             asset: Asset::Btc,
             window: win,
             p_up,
             z: 0.0,
-            sigma_1s: sigma,
-            sigma_tau: sigma,
+            sigma_1s: 1e-4,
+            sigma_tau: 1e-4,
             basis: 0.0,
-            anchor: AnchorSource::BinanceCorrected,
+            anchor,
             health,
             reason: if matches!(health, ModelHealth::Ready) {
                 ModelHealthReason::Nominal
@@ -551,20 +548,14 @@ mod tests {
         })
     }
 
-    /// A Ready BTC model on `window()`.
-    fn ready_model(p_up: f64, sigma: f64) -> Event {
-        model_snapshot(p_up, sigma, ModelHealth::Ready, Some(window()))
-    }
-
-    fn tick(value: Decimal, ts: i64) -> Event {
-        Event::PriceTick(PriceTick {
-            source: PriceSource::BinanceDirect,
-            asset: Asset::Btc,
-            kind: TickKind::Mid,
-            value,
-            ts_exchange: TimestampMs::from_millis(ts),
-            ts_local: TimestampMs::from_millis(ts),
-        })
+    /// A Ready, Chainlink-anchored BTC model on `window()`.
+    fn ready_chainlink(p_up: f64) -> Event {
+        model_snapshot(
+            p_up,
+            ModelHealth::Ready,
+            AnchorSource::Chainlink,
+            Some(window()),
+        )
     }
 
     fn book(token: TokenId, asks: &[(Decimal, Decimal)]) -> Event {
@@ -588,72 +579,182 @@ mod tests {
         TimestampMs::from_millis(ms)
     }
 
-    fn taker() -> MomentumTaker {
-        MomentumTaker::new(MomentumTakerParams::default(), NormalizerParams::default())
+    fn taker() -> LateWindowTaker {
+        LateWindowTaker::new(
+            LateWindowTakerParams::default(),
+            NormalizerParams::default(),
+        )
     }
 
-    /// Ingest a confirmed up-move: 10 ticks 0..900 ms, +$30 each (≈+0.45%).
-    fn feed_up_move(t: &mut MomentumTaker) {
-        for i in 0..10 {
-            t.ingest(&tick(
-                dec!(60000) + dec!(30) * Decimal::from(i),
-                OPEN_MS + i * 100,
-            ));
-        }
-    }
-
-    /// Ingest a confirmed down-move (mirror).
-    fn feed_down_move(t: &mut MomentumTaker) {
-        for i in 0..10 {
-            t.ingest(&tick(
-                dec!(60000) - dec!(30) * Decimal::from(i),
-                OPEN_MS + i * 100,
-            ));
-        }
-    }
-
-    /// A fully-armed taker on `window()` with a confirmed up-move and a
-    /// stale-cheap Up book.
-    fn armed_up() -> MomentumTaker {
+    /// A fully-armed taker on `window()`: open, a Ready+Chainlink model with the
+    /// given `p_up` and anchor, and a cheap (within-cap) book on `token`.
+    fn armed_with(
+        p_up: f64,
+        anchor: AnchorSource,
+        token: TokenId,
+        asks: &[(Decimal, Decimal)],
+    ) -> LateWindowTaker {
         let mut t = taker();
         t.ingest(&open_event());
-        t.ingest(&ready_model(0.85, 1e-4));
-        feed_up_move(&mut t);
-        t.ingest(&book(up_token(), &[(dec!(0.80), dec!(50))]));
+        t.ingest(&model_snapshot(
+            p_up,
+            ModelHealth::Ready,
+            anchor,
+            Some(window()),
+        ));
+        t.ingest(&book(token, asks));
         t
+    }
+
+    /// The canonical armed Up taker: p_up 0.99, Chainlink, Up book at 0.98.
+    fn armed_up() -> LateWindowTaker {
+        armed_with(
+            0.99,
+            AnchorSource::Chainlink,
+            up_token(),
+            &[(dec!(0.98), dec!(50))],
+        )
     }
 
     // ---- gate ladder (decide is sync) -------------------------------------
 
     #[test]
-    fn happy_path_decides_a_take() {
+    fn happy_path_decides_an_up_take() {
         let t = armed_up();
-        let d = t.decide(ts(OPEN_MS + 900)).expect("a take");
+        let d = t.decide(ts(LATE_MS)).expect("a take");
         assert_eq!(d.outcome, Outcome::Up);
         assert_eq!(d.token_id, up_token());
-        assert_eq!(d.plan.worst_price.as_decimal(), dec!(0.80));
-        // $10 budget caps the take (10 / 0.80 = 12.5 shares, $10 notional).
-        assert_eq!(d.plan.notional, Dollars::new(dec!(10)));
+        assert_eq!(d.plan.worst_price.as_decimal(), dec!(0.98));
+        // $10 budget caps the take (10 / 0.98 ≈ 10.2 shares, ~$10 notional, never
+        // above the budget). 0.98 does not divide $10 evenly, so assert the bound.
+        assert!(d.plan.notional.as_decimal() <= dec!(10));
+        assert!(d.plan.notional.as_decimal() > dec!(9.9));
     }
 
     #[test]
-    fn down_move_takes_the_down_side() {
-        let mut t = taker();
-        t.ingest(&open_event());
-        t.ingest(&ready_model(0.15, 1e-4)); // fair_down = 0.85
-        feed_down_move(&mut t);
-        t.ingest(&book(down_token(), &[(dec!(0.80), dec!(50))]));
-        let d = t.decide(ts(OPEN_MS + 900)).expect("a down take");
+    fn certain_down_takes_the_down_side() {
+        let t = armed_with(
+            0.01,
+            AnchorSource::Chainlink,
+            down_token(),
+            &[(dec!(0.98), dec!(50))],
+        );
+        let d = t.decide(ts(LATE_MS)).expect("a down take");
         assert_eq!(d.outcome, Outcome::Down);
         assert_eq!(d.token_id, down_token());
+    }
+
+    /// Required case 1: threshold edges. p_up exactly at the threshold takes; just
+    /// inside the uncertain band refuses; symmetric for Down at 1 − threshold.
+    #[test]
+    fn threshold_edges() {
+        // p_up == 0.97 ⇒ Up (inclusive).
+        let up = armed_with(
+            0.97,
+            AnchorSource::Chainlink,
+            up_token(),
+            &[(dec!(0.95), dec!(50))],
+        );
+        assert_eq!(
+            up.decide(ts(LATE_MS)).expect("up take").outcome,
+            Outcome::Up
+        );
+        // p_up == 0.969 ⇒ uncertain.
+        let near = armed_with(
+            0.969,
+            AnchorSource::Chainlink,
+            up_token(),
+            &[(dec!(0.95), dec!(50))],
+        );
+        assert!(matches!(
+            near.decide(ts(LATE_MS)),
+            Err(NoLateTakeReason::NotCertain { .. })
+        ));
+        // p_up == 0.03 == 1 − 0.97 ⇒ Down (inclusive).
+        let down = armed_with(
+            0.03,
+            AnchorSource::Chainlink,
+            down_token(),
+            &[(dec!(0.95), dec!(50))],
+        );
+        assert_eq!(
+            down.decide(ts(LATE_MS)).expect("down take").outcome,
+            Outcome::Down
+        );
+        // p_up == 0.031 ⇒ uncertain.
+        let near_down = armed_with(
+            0.031,
+            AnchorSource::Chainlink,
+            down_token(),
+            &[(dec!(0.95), dec!(50))],
+        );
+        assert!(matches!(
+            near_down.decide(ts(LATE_MS)),
+            Err(NoLateTakeReason::NotCertain { .. })
+        ));
+    }
+
+    /// Required case 2: the tie lean. The model encodes "S ≥ K ⇒ Up" as p_up = 1.0
+    /// (its fair value uses `if s >= k { p_up = 1.0 }`), so a saturated p_up of 1.0
+    /// buys Up and 0.0 buys Down — exact-at-strike leans Up.
+    #[test]
+    fn tie_lean_saturated_fair() {
+        let up = armed_with(
+            1.0,
+            AnchorSource::Chainlink,
+            up_token(),
+            &[(dec!(0.98), dec!(50))],
+        );
+        assert_eq!(
+            up.decide(ts(LATE_MS)).expect("up take at p_up=1.0").outcome,
+            Outcome::Up
+        );
+        let down = armed_with(
+            0.0,
+            AnchorSource::Chainlink,
+            down_token(),
+            &[(dec!(0.98), dec!(50))],
+        );
+        assert_eq!(
+            down.decide(ts(LATE_MS))
+                .expect("down take at p_up=0.0")
+                .outcome,
+            Outcome::Down
+        );
+    }
+
+    /// Required case 3: refusal when only the fast feed confirms. A
+    /// BinanceCorrected-anchored fair is refused even when certain with a takeable
+    /// book in the late window; the same inputs anchored on Chainlink take.
+    #[test]
+    fn refuses_when_only_the_fast_feed_confirms() {
+        let fast = armed_with(
+            0.99,
+            AnchorSource::BinanceCorrected,
+            up_token(),
+            &[(dec!(0.98), dec!(50))],
+        );
+        assert!(matches!(
+            fast.decide(ts(LATE_MS)),
+            Err(NoLateTakeReason::NotChainlinkAnchored {
+                anchor: AnchorSource::BinanceCorrected
+            })
+        ));
+        let chainlink = armed_with(
+            0.99,
+            AnchorSource::Chainlink,
+            up_token(),
+            &[(dec!(0.98), dec!(50))],
+        );
+        assert!(chainlink.decide(ts(LATE_MS)).is_ok());
     }
 
     #[test]
     fn no_active_window() {
         let t = taker();
         assert!(matches!(
-            t.decide(ts(OPEN_MS)),
-            Err(NoTakeReason::NoActiveWindow)
+            t.decide(ts(LATE_MS)),
+            Err(NoLateTakeReason::NoActiveWindow)
         ));
     }
 
@@ -661,7 +762,10 @@ mod tests {
     fn no_model_yet() {
         let mut t = taker();
         t.ingest(&open_event());
-        assert!(matches!(t.decide(ts(OPEN_MS)), Err(NoTakeReason::NoModel)));
+        assert!(matches!(
+            t.decide(ts(LATE_MS)),
+            Err(NoLateTakeReason::NoModel)
+        ));
     }
 
     #[test]
@@ -669,29 +773,37 @@ mod tests {
         let mut t = taker();
         t.ingest(&open_event());
         t.ingest(&model_snapshot(
-            0.85,
-            1e-4,
+            0.99,
             ModelHealth::Ready,
+            AnchorSource::Chainlink,
             Some(other_window()),
         ));
         assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
-            Err(NoTakeReason::WindowMismatch { .. })
+            t.decide(ts(LATE_MS)),
+            Err(NoLateTakeReason::WindowMismatch { .. })
         ));
     }
 
     #[test]
     fn model_not_ready_blocks() {
         for health in [ModelHealth::Degraded, ModelHealth::Unreliable] {
-            let mut t = taker();
-            t.ingest(&open_event());
-            t.ingest(&model_snapshot(0.85, 1e-4, health, Some(window())));
-            feed_up_move(&mut t);
-            t.ingest(&book(up_token(), &[(dec!(0.80), dec!(50))]));
+            let mut t = armed_with(
+                0.99,
+                AnchorSource::Chainlink,
+                up_token(),
+                &[(dec!(0.98), dec!(50))],
+            );
+            // Overwrite the model with a non-Ready one.
+            t.ingest(&model_snapshot(
+                0.99,
+                health,
+                AnchorSource::Chainlink,
+                Some(window()),
+            ));
             assert!(
                 matches!(
-                    t.decide(ts(OPEN_MS + 900)),
-                    Err(NoTakeReason::ModelNotReady { .. })
+                    t.decide(ts(LATE_MS)),
+                    Err(NoLateTakeReason::ModelNotReady { .. })
                 ),
                 "{health:?} should block"
             );
@@ -699,97 +811,72 @@ mod tests {
     }
 
     #[test]
-    fn unusable_fair_and_vol_block() {
-        let mut t = taker();
-        t.ingest(&open_event());
-        t.ingest(&ready_model(1.0, 1e-4)); // p_up at the domain edge
-        feed_up_move(&mut t);
-        assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
-            Err(NoTakeReason::UnusableFair { .. })
-        ));
+    fn unusable_fair_blocks() {
+        for bad in [f64::NAN, -0.1, 1.1] {
+            let mut t = armed_with(
+                0.99,
+                AnchorSource::Chainlink,
+                up_token(),
+                &[(dec!(0.98), dec!(50))],
+            );
+            t.ingest(&model_snapshot(
+                bad,
+                ModelHealth::Ready,
+                AnchorSource::Chainlink,
+                Some(window()),
+            ));
+            assert!(
+                matches!(
+                    t.decide(ts(LATE_MS)),
+                    Err(NoLateTakeReason::UnusableFair { .. })
+                ),
+                "{bad} should be unusable"
+            );
+        }
+    }
 
-        let mut t2 = taker();
-        t2.ingest(&open_event());
-        t2.ingest(&ready_model(0.85, 0.0)); // σ unusable
-        feed_up_move(&mut t2);
-        assert!(matches!(
-            t2.decide(ts(OPEN_MS + 900)),
-            Err(NoTakeReason::UnusableVol { .. })
-        ));
+    /// p_up exactly 1.0 / 0.0 are *usable* (the certainty taker's closed interval).
+    #[test]
+    fn saturated_fair_is_usable() {
+        let t = armed_with(
+            1.0,
+            AnchorSource::Chainlink,
+            up_token(),
+            &[(dec!(0.98), dec!(50))],
+        );
+        assert!(t.decide(ts(LATE_MS)).is_ok());
     }
 
     #[test]
     fn expired_window_blocks() {
         let t = armed_up();
-        // now past close.
         assert!(matches!(
             t.decide(ts(CLOSE_MS + 1)),
-            Err(NoTakeReason::Expired { .. })
+            Err(NoLateTakeReason::Expired { .. })
         ));
     }
 
     #[test]
-    fn no_confirmed_move_blocks_even_with_a_standing_edge() {
-        // Book is stale-cheap and the model is Ready, but the signal ring is flat
-        // — no fresh move, so no take (the staleness alone is not enough).
-        let mut t = taker();
-        t.ingest(&open_event());
-        t.ingest(&ready_model(0.85, 1e-4));
-        for i in 0..10 {
-            t.ingest(&tick(dec!(60000), OPEN_MS + i * 100)); // flat
-        }
-        t.ingest(&book(up_token(), &[(dec!(0.80), dec!(50))]));
+    fn not_late_window_blocks() {
+        let t = armed_up();
+        // τ = 60 s > 30 s threshold.
         assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
-            Err(NoTakeReason::NoConfirmedMove)
+            t.decide(ts(CLOSE_MS - 60_000)),
+            Err(NoLateTakeReason::NotLateWindow { .. })
         ));
     }
 
     #[test]
-    fn chainlink_or_trade_ticks_do_not_form_a_signal() {
-        let mut t = taker();
-        t.ingest(&open_event());
-        t.ingest(&ready_model(0.85, 1e-4));
-        // A big ramp, but on the wrong source/kind — ignored by the ring.
-        for i in 0..10 {
-            t.ingest(&Event::PriceTick(PriceTick {
-                source: PriceSource::ChainlinkRtds,
-                asset: Asset::Btc,
-                kind: TickKind::Vendor,
-                value: dec!(60000) + dec!(30) * Decimal::from(i),
-                ts_exchange: ts(OPEN_MS + i * 100),
-                ts_local: ts(OPEN_MS + i * 100),
-            }));
-        }
-        t.ingest(&book(up_token(), &[(dec!(0.80), dec!(50))]));
+    fn not_certain_blocks() {
+        let t = armed_with(
+            0.80,
+            AnchorSource::Chainlink,
+            up_token(),
+            &[(dec!(0.78), dec!(50))],
+        );
         assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
-            Err(NoTakeReason::NoConfirmedMove)
-        ));
-    }
-
-    #[test]
-    fn cooldown_blocks() {
-        let mut t = armed_up();
-        t.last_take_ms = Some(OPEN_MS + 800); // fired 100 ms ago < 5 s cooldown
-        assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
-            Err(NoTakeReason::InCooldown { .. })
-        ));
-        // After the cooldown elapses, the take is allowed again.
-        t.last_take_ms = Some(OPEN_MS + 900 - 6_000);
-        assert!(t.decide(ts(OPEN_MS + 900)).is_ok());
-    }
-
-    #[test]
-    fn budget_exhausted_blocks() {
-        let mut t = armed_up();
-        // Spend the whole $10 budget directly.
-        t.realized_spent = Dollars::new(dec!(10));
-        assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
-            Err(NoTakeReason::BudgetExhausted { .. })
+            t.decide(ts(LATE_MS)),
+            Err(NoLateTakeReason::NotCertain { .. })
         ));
     }
 
@@ -797,39 +884,100 @@ mod tests {
     fn no_book_for_token_blocks() {
         let mut t = taker();
         t.ingest(&open_event());
-        t.ingest(&ready_model(0.85, 1e-4));
-        feed_up_move(&mut t);
+        t.ingest(&ready_chainlink(0.99));
         // No book ingested.
         assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
-            Err(NoTakeReason::NoBookForToken)
+            t.decide(ts(LATE_MS)),
+            Err(NoLateTakeReason::NoBookForToken)
         ));
     }
 
     #[test]
-    fn book_already_repriced_blocks() {
-        let mut t = taker();
+    fn all_asks_above_cap_blocks() {
+        // Custom params: cap 0.95, book ask 0.96.
+        let params = LateWindowTakerParams {
+            price_cap: Price::on_grid(dec!(0.95), TICK).unwrap(),
+            ..LateWindowTakerParams::default()
+        };
+        let mut t = LateWindowTaker::new(params, NormalizerParams::default());
         t.ingest(&open_event());
-        t.ingest(&ready_model(0.85, 1e-4));
-        feed_up_move(&mut t);
-        t.ingest(&book(up_token(), &[(dec!(0.86), dec!(50))])); // ask ≥ fair
+        t.ingest(&ready_chainlink(0.99));
+        t.ingest(&book(up_token(), &[(dec!(0.96), dec!(50))]));
         assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
-            Err(NoTakeReason::BookAlreadyRepriced { .. })
+            t.decide(ts(LATE_MS)),
+            Err(NoLateTakeReason::AllAsksAbovePriceCap { .. })
         ));
     }
 
     #[test]
-    fn edge_below_fee_plus_buffer_blocks() {
-        let mut t = taker();
-        t.ingest(&open_event());
-        t.ingest(&ready_model(0.522, 1e-4)); // fair_up 0.522
-        feed_up_move(&mut t);
-        t.ingest(&book(up_token(), &[(dec!(0.50), dec!(100))])); // edge 0.022 < 0.0225
+    fn cooldown_blocks() {
+        let mut t = armed_up();
+        t.last_take_ms = Some(LATE_MS - 100); // fired 100 ms ago < 5 s cooldown
         assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
-            Err(NoTakeReason::EdgeBelowFeePlusBuffer { .. })
+            t.decide(ts(LATE_MS)),
+            Err(NoLateTakeReason::InCooldown { .. })
         ));
+        // After the cooldown elapses, the take is allowed again.
+        t.last_take_ms = Some(LATE_MS - 6_000);
+        assert!(t.decide(ts(LATE_MS)).is_ok());
+    }
+
+    /// Required case 4: budget exhaustion — directly, and via in-flight commitment.
+    #[test]
+    fn budget_exhausted_blocks() {
+        let mut t = armed_up();
+        t.realized_spent = Dollars::new(dec!(10));
+        assert!(matches!(
+            t.decide(ts(LATE_MS)),
+            Err(NoLateTakeReason::BudgetExhausted { .. })
+        ));
+
+        // An in-flight take leaving < $1 also blocks a second.
+        let mut t2 = armed_up();
+        let oid = OrderId::new("lw-1").unwrap();
+        t2.our_orders.insert(oid.clone());
+        t2.pending.insert(oid, Dollars::new(dec!(9.50)));
+        assert!(matches!(
+            t2.decide(ts(LATE_MS)),
+            Err(NoLateTakeReason::BudgetExhausted { .. })
+        ));
+    }
+
+    /// A roomy remaining budget sizes the take against the displayed depth, never
+    /// exceeding the budget.
+    #[test]
+    fn sizes_against_depth_within_budget() {
+        let params = LateWindowTakerParams {
+            budget_per_window: Dollars::new(dec!(49)),
+            ..LateWindowTakerParams::default()
+        };
+        let mut t = LateWindowTaker::new(params, NormalizerParams::default());
+        t.ingest(&open_event());
+        t.ingest(&ready_chainlink(0.99));
+        t.ingest(&book(up_token(), &[(dec!(0.98), dec!(100))]));
+        let d = t.decide(ts(LATE_MS)).expect("a take");
+        // 49 / 0.98 = 50 shares, $49 notional ≤ budget.
+        assert_eq!(d.plan.expected_shares, Size::new(dec!(50)).unwrap());
+        assert!(d.plan.notional.as_decimal() <= dec!(49));
+    }
+
+    // ---- event handling (sync) ---------------------------------------------
+
+    /// Price ticks never trigger a take — the late-window taker uses no fast feed.
+    #[test]
+    fn price_ticks_are_ignored() {
+        use core_types::{PriceSource, PriceTick, TickKind};
+        let mut t = taker();
+        let big_ramp = Event::PriceTick(PriceTick {
+            source: PriceSource::BinanceDirect,
+            asset: Asset::Btc,
+            kind: TickKind::Mid,
+            value: dec!(60000),
+            ts_exchange: ts(OPEN_MS),
+            ts_local: ts(OPEN_MS),
+        });
+        // ingest returns false ⇒ on_event would attempt no take.
+        assert!(!t.ingest(&big_ramp));
     }
 
     #[test]
@@ -840,14 +988,14 @@ mod tests {
         });
         assert!(t.is_standing_down());
         assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
-            Err(NoTakeReason::StandingDown)
+            t.decide(ts(LATE_MS)),
+            Err(NoLateTakeReason::StandingDown)
         ));
         t.on_risk(RiskEvent::BreakerCleared {
             breaker: BreakerKind::FeedStale,
         });
         assert!(!t.is_standing_down());
-        assert!(t.decide(ts(OPEN_MS + 900)).is_ok());
+        assert!(t.decide(ts(LATE_MS)).is_ok());
     }
 
     #[test]
@@ -874,8 +1022,7 @@ mod tests {
         let mut t = armed_up();
         t.realized_spent = Dollars::new(dec!(8));
         t.last_take_ms = Some(OPEN_MS + 100);
-        t.our_orders.insert(OrderId::new("fake-1").unwrap());
-        // A new window opens.
+        t.our_orders.insert(OrderId::new("lw-9").unwrap());
         let next = WindowId {
             series: window().series,
             open_time: TimestampMs::from_millis(CLOSE_MS),
@@ -898,60 +1045,40 @@ mod tests {
     #[test]
     fn fills_charge_budget_and_terminal_drops_residual() {
         let mut t = armed_up();
-        let oid = OrderId::new("fake-7").unwrap();
-        // Simulate a fired take: $10 committed in-flight.
+        let oid = OrderId::new("lw-7").unwrap();
         t.our_orders.insert(oid.clone());
         t.pending.insert(oid.clone(), Dollars::new(dec!(10)));
         assert_eq!(t.effective_spent(), Dollars::new(dec!(10)));
 
-        // A partial taker fill: 5 shares @ 0.80 = $4.
+        // A partial taker fill: 5 shares @ 0.98 = $4.90.
         t.on_venue_event(
-            &VenueEvent::Fill(Arc::new(fill(&oid, dec!(0.80), dec!(5)))),
+            &VenueEvent::Fill(Arc::new(fill(&oid, dec!(0.98), dec!(5)))),
             ts(OPEN_MS),
         );
-        assert_eq!(t.realized_spent(), Dollars::new(dec!(4)));
-        // effective = realized 4 + pending 6 = 10 (unchanged total).
+        assert_eq!(t.realized_spent(), Dollars::new(dec!(4.90)));
+        // effective = realized 4.90 + pending 5.10 = 10 (unchanged total).
         assert_eq!(t.effective_spent(), Dollars::new(dec!(10)));
 
-        // The FAK remainder is killed (Canceled) — residual pending dropped.
+        // The FAK remainder is killed — residual pending dropped.
         t.on_venue_event(
             &VenueEvent::Order(Arc::new(order_update(&oid, OrderState::Canceled))),
             ts(OPEN_MS),
         );
-        // Now effective == realized $4 (only what actually filled).
-        assert_eq!(t.effective_spent(), Dollars::new(dec!(4)));
-        assert_eq!(t.realized_spent(), Dollars::new(dec!(4)));
+        assert_eq!(t.effective_spent(), Dollars::new(dec!(4.90)));
+        assert_eq!(t.realized_spent(), Dollars::new(dec!(4.90)));
     }
 
     #[test]
     fn foreign_fills_are_ignored() {
         let mut t = armed_up();
-        let ours = OrderId::new("fake-1").unwrap();
-        t.our_orders.insert(ours);
-        // A fill for someone else's order (e.g. a quoter maker fill).
+        t.our_orders.insert(OrderId::new("lw-1").unwrap());
         let foreign = OrderId::new("qm-9").unwrap();
         t.on_venue_event(
-            &VenueEvent::Fill(Arc::new(fill(&foreign, dec!(0.50), dec!(20)))),
+            &VenueEvent::Fill(Arc::new(fill(&foreign, dec!(0.98), dec!(20)))),
             ts(OPEN_MS),
         );
         assert_eq!(t.realized_spent(), Dollars::ZERO);
     }
-
-    #[test]
-    fn an_in_flight_take_blocks_a_second_that_would_exceed_budget() {
-        let mut t = armed_up();
-        // Commit $9.50 in-flight (not yet filled).
-        let oid = OrderId::new("fake-1").unwrap();
-        t.our_orders.insert(oid.clone());
-        t.pending.insert(oid, Dollars::new(dec!(9.50)));
-        // Only $0.50 effective budget left (< $1) ⇒ no second take.
-        assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
-            Err(NoTakeReason::BudgetExhausted { .. })
-        ));
-    }
-
-    // ---- fixtures for the venue stream -------------------------------------
 
     fn fill(oid: &OrderId, price: Decimal, size: Decimal) -> Fill {
         Fill {
@@ -981,8 +1108,8 @@ mod tests {
             token_id: up_token(),
             side: Side::Buy,
             state,
-            price: Price::on_grid(dec!(0.80), TICK).unwrap(),
-            original_size: Size::new(dec!(12.5)).unwrap(),
+            price: Price::on_grid(dec!(0.98), TICK).unwrap(),
+            original_size: Size::new(dec!(10.2)).unwrap(),
             filled_size: Size::new(dec!(5)).unwrap(),
             reject_reason: None,
             ts_venue: Some(TimestampMs::from_millis(OPEN_MS)),

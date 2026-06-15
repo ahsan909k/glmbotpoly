@@ -561,6 +561,112 @@ pub fn calculate_quotes(
     })
 }
 
+/// A passive quote level handed to the final-seconds invariant checker — the
+/// minimal projection [`check_final_seconds_invariant`] needs (outcome, on-grid
+/// price, size). The quote manager maps each desired placement to one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PassiveLevelRef {
+    /// Outcome ladder the level belongs to.
+    pub outcome: Outcome,
+    /// The level's on-grid resting price.
+    pub price: Price,
+    /// The level's size in shares.
+    pub size: Size,
+}
+
+/// A breach of a final-seconds rule found by [`check_final_seconds_invariant`].
+///
+/// Each mirrors a gate inside [`calculate_quotes`] (G4 no-passive, S6 ATM
+/// lockout), so a set the calculator produced never yields one — a non-empty
+/// result is evidence of a calculator bug, which is exactly what the independent
+/// re-check exists to catch before a forbidden order reaches a venue (§8/§11).
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+pub enum FinalSecondsViolation {
+    /// A passive level survived into the no-passive window (`τ ≤
+    /// no_passive_final_secs`): there must be no resting orders at all (§8).
+    #[error(
+        "final {tau_secs}s: passive {outcome} level @ {price} inside the no-passive window (≤ {limit}s)"
+    )]
+    PassiveInNoPassiveWindow {
+        /// The offending level's outcome.
+        outcome: Outcome,
+        /// The offending level's price.
+        price: Price,
+        /// Seconds remaining when the level was checked.
+        tau_secs: f64,
+        /// The configured no-passive threshold (seconds).
+        limit: u32,
+    },
+    /// A passive level resting within `atm_band` of 0.50 survived into the no-ATM
+    /// window (`τ ≤ no_atm_final_secs`) (§8).
+    #[error(
+        "final {tau_secs}s: at-the-money {outcome} level @ {price} (|p−0.5| ≤ {band}) inside the no-ATM window (≤ {limit}s)"
+    )]
+    AtmInNoAtmWindow {
+        /// The offending level's outcome.
+        outcome: Outcome,
+        /// The offending level's price.
+        price: Price,
+        /// Seconds remaining when the level was checked.
+        tau_secs: f64,
+        /// The at-the-money band (distance from 0.50).
+        band: Decimal,
+        /// The configured no-ATM threshold (seconds).
+        limit: u32,
+    },
+}
+
+/// Re-checks the final-seconds passive rules against a concrete set of intended
+/// passive quote levels — an **independent** defense-in-depth layer over the
+/// gates in [`calculate_quotes`] (G4 no-passive, S6 ATM lockout).
+///
+/// Returns every [`FinalSecondsViolation`] found (empty = clean). It re-asserts
+/// the *same* rule the calculator enforces, with the same `≤` boundaries and the
+/// same `atm_band` distance from 0.50, so on a correctly-produced set it is
+/// always empty; the quote manager runs it just before placement so a calculator
+/// bug can never rest a forbidden passive order on a venue. Pure, sans-IO, and
+/// never panics — a non-finite `tau_secs` yields no violations (the calculator's
+/// G3 already rejects that upstream). The no-passive window nests inside the
+/// no-ATM window (config invariant `no_passive_final_secs ≤ no_atm_final_secs`),
+/// so a level in the inner window is reported once, as the stricter no-passive
+/// breach.
+#[must_use]
+pub fn check_final_seconds_invariant<I>(
+    levels: I,
+    tau_secs: f64,
+    params: &QuoteParams,
+) -> Vec<FinalSecondsViolation>
+where
+    I: IntoIterator<Item = PassiveLevelRef>,
+{
+    let mut violations = Vec::new();
+    if !tau_secs.is_finite() {
+        return violations;
+    }
+    let no_passive = tau_secs <= f64::from(params.no_passive_final_secs);
+    let no_atm = tau_secs <= f64::from(params.no_atm_final_secs);
+    let half = dec!(0.5);
+    for level in levels {
+        if no_passive {
+            violations.push(FinalSecondsViolation::PassiveInNoPassiveWindow {
+                outcome: level.outcome,
+                price: level.price,
+                tau_secs,
+                limit: params.no_passive_final_secs,
+            });
+        } else if no_atm && (level.price.as_decimal() - half).abs() <= params.atm_band {
+            violations.push(FinalSecondsViolation::AtmInNoAtmWindow {
+                outcome: level.outcome,
+                price: level.price,
+                tau_secs,
+                band: params.atm_band,
+                limit: params.no_atm_final_secs,
+            });
+        }
+    }
+    violations
+}
+
 #[cfg(test)]
 mod tests {
     use core_types::{
@@ -1300,5 +1406,109 @@ mod tests {
             assert!(l.price.is_on_grid(TICK));
             assert!(l.size.as_decimal() >= dec!(5));
         }
+    }
+
+    // ---- final-seconds invariant (defense in depth) ----------------------
+
+    /// A standalone passive level for the invariant checker.
+    fn passive(outcome: Outcome, price: Decimal) -> PassiveLevelRef {
+        PassiveLevelRef {
+            outcome,
+            price: Price::on_grid(price, TICK).expect("grid price"),
+            size: shares(10),
+        }
+    }
+
+    /// Map a real quote set into the checker's input.
+    fn refs(q: &QuoteSet) -> Vec<PassiveLevelRef> {
+        q.levels
+            .iter()
+            .map(|l| PassiveLevelRef {
+                outcome: l.outcome,
+                price: l.price,
+                size: l.size,
+            })
+            .collect()
+    }
+
+    /// 25. The invariant holds on a real calculator set well before the windows.
+    #[test]
+    fn invariant_holds_on_calculator_output() {
+        let params = QuoteParams::default();
+        let d = run(&model_ready(0.55, 0.0002), &empty_inv(), &params, 120.0);
+        let q = quotes(&d);
+        assert!(check_final_seconds_invariant(refs(q), 120.0, &params).is_empty());
+    }
+
+    /// 26. Inside the no-ATM window but with quotes far from 0.50, the calculator
+    ///     set still passes (the calculator suppressed any ATM levels itself).
+    #[test]
+    fn invariant_holds_in_no_atm_window_when_quotes_are_far() {
+        let params = QuoteParams::default(); // no_atm 25, no_passive 5, band 0.10
+        // p 0.80, τ 20 (≤ no_atm, > no_passive): Up ~0.79.. / Down ~0.19.. — all
+        // well beyond 0.10 of 0.50.
+        let d = run(&model_ready(0.80, 0.0002), &empty_inv(), &params, 20.0);
+        let q = quotes(&d);
+        assert!(check_final_seconds_invariant(refs(q), 20.0, &params).is_empty());
+    }
+
+    /// 27. Any passive level inside the no-passive window is a violation.
+    #[test]
+    fn invariant_catches_passive_in_no_passive_window() {
+        let params = QuoteParams::default();
+        let v = check_final_seconds_invariant([passive(Outcome::Up, dec!(0.30))], 3.0, &params);
+        assert_eq!(v.len(), 1);
+        assert!(matches!(
+            v[0],
+            FinalSecondsViolation::PassiveInNoPassiveWindow { .. }
+        ));
+    }
+
+    /// 28. An at-the-money level inside the no-ATM window is a violation; one far
+    ///     from 0.50 is not.
+    #[test]
+    fn invariant_catches_atm_in_no_atm_window() {
+        let params = QuoteParams::default();
+        // τ 20: inside no-ATM, outside no-passive. 0.50 is at the money.
+        let atm = check_final_seconds_invariant([passive(Outcome::Up, dec!(0.50))], 20.0, &params);
+        assert_eq!(atm.len(), 1);
+        assert!(matches!(
+            atm[0],
+            FinalSecondsViolation::AtmInNoAtmWindow { .. }
+        ));
+        // 0.30 is 0.20 from 0.50 > band 0.10 ⇒ clean.
+        let far = check_final_seconds_invariant([passive(Outcome::Up, dec!(0.30))], 20.0, &params);
+        assert!(far.is_empty());
+    }
+
+    /// 29. Outside both windows, even an at-the-money-priced level is fine.
+    #[test]
+    fn invariant_clean_outside_windows() {
+        let params = QuoteParams::default();
+        let v = check_final_seconds_invariant([passive(Outcome::Up, dec!(0.50))], 120.0, &params);
+        assert!(v.is_empty());
+    }
+
+    /// 30. Inside the no-passive window an ATM-priced level reports once (the
+    ///     stricter no-passive breach), not twice.
+    #[test]
+    fn invariant_no_double_report_in_no_passive_window() {
+        let params = QuoteParams::default();
+        let v = check_final_seconds_invariant([passive(Outcome::Up, dec!(0.50))], 3.0, &params);
+        assert_eq!(v.len(), 1);
+        assert!(matches!(
+            v[0],
+            FinalSecondsViolation::PassiveInNoPassiveWindow { .. }
+        ));
+    }
+
+    /// 31. Non-finite τ yields no violations (never panics).
+    #[test]
+    fn invariant_non_finite_tau_is_clean() {
+        let params = QuoteParams::default();
+        assert!(
+            check_final_seconds_invariant([passive(Outcome::Up, dec!(0.50))], f64::NAN, &params)
+                .is_empty()
+        );
     }
 }

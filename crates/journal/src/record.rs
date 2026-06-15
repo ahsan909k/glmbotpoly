@@ -439,6 +439,8 @@ mod tests {
             Event::Control(ControlEvent::PaperCapitalSet {
                 amount: Dollars::new(dec!(10000)),
             }),
+            Event::Control(ControlEvent::Kill),
+            Event::Control(ControlEvent::Reset),
         ]
     }
 

@@ -103,6 +103,17 @@ pub enum VenueEvent {
     Order(Arc<OrderUpdate>),
     /// One of our orders executed.
     Fill(Arc<Fill>),
+    /// The authenticated user-channel WebSocket connected or disconnected.
+    ///
+    /// The live adapter emits this on its `/ws/user` connect/disconnect so the
+    /// risk manager can trip [`BreakerKind::WsDisconnect`](core_types::BreakerKind::WsDisconnect)
+    /// on a user-WS drop (§11 "cancel-all on … user-WebSocket disconnect"). The
+    /// paper venue has no user channel and never produces it; carries no payload
+    /// to persist, so the journal does not record it.
+    Connectivity {
+        /// `true` on (re)connect, `false` on disconnect.
+        connected: bool,
+    },
 }
 
 #[cfg(test)]

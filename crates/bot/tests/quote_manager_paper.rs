@@ -1,10 +1,13 @@
-//! Quote-manager integration tests against `venue-paper` (CLAUDE.md §8).
+//! Quote-manager integration tests, now driven through the [`engine::RiskManager`]
+//! gateway against `venue-paper` (CLAUDE.md §8/§11).
 //!
-//! Drives [`engine::QuoteManager`] through the [`venue_api::VenuePort`] surface,
-//! backed by a real [`venue_paper::PaperVenue`] over deterministic market data
-//! under tokio's paused virtual clock. The manager and the paper venue share one
-//! `now` closure, so the manager's injected `now` and the venue's latency
-//! deadlines advance off the same clock.
+//! The strategy drivers are `pub(crate)` in `engine` — the only path to the venue
+//! is `RiskManager`, which interposes the risk guard. With **no breakers tripped**
+//! the guard is transparent, so every property below holds exactly as it did when
+//! the quote manager was driven directly, and each test additionally asserts the
+//! gateway stayed a no-op (`!state_snapshot().any_tripped()`). Only the quote
+//! manager is enabled (the takers never fire on this benign data anyway, but
+//! disabling them keeps the venue stream uncluttered).
 //!
 //! Asserts the four required properties:
 //! - **convergence** — after a stable model/book the resting orders equal the
@@ -20,18 +23,17 @@
 // themselves, so the clippy.toml test exemption doesn't reach them.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use core_types::{
-    AnchorSource, Asset, BookLevel, BookSnapshot, ConditionId, Decimal, DurationMs, Event,
+    AnchorSource, Asset, BookLevel, BookSnapshot, ConditionId, Decimal, Dollars, DurationMs, Event,
     FeeParams, InputAges, InventorySnapshot, MarketInfo, ModelHealth, ModelHealthReason,
     ModelSnapshot, Outcome, Price, ResolutionSource, RoundDir, Series, SideInventory, Size,
     TickSize, TimestampMs, TokenId, TokenPair, WindowDuration, WindowId, WindowLifecycle,
 };
 use engine::{
-    NormalizerParams, QuoteDecision, QuoteManager, QuoteManagerParams, QuoteParams,
-    calculate_quotes,
+    QuoteDecision, QuoteManagerParams, QuoteParams, RiskManager, RiskParams, calculate_quotes,
 };
 use journal::{Recorder, RecorderParams, ReplayReader};
 use rust_decimal::dec;
@@ -169,6 +171,20 @@ fn params() -> PaperParams {
     }
 }
 
+/// A quoter-only risk manager (takers disabled) with a roomy loss cap so no §11
+/// breaker trips on this benign data — the guard is transparent.
+fn quoter_only_risk(qm: QuoteManagerParams) -> RiskManager {
+    let params = RiskParams {
+        quote_manager: qm,
+        momentum_enabled: false,
+        late_window_enabled: false,
+        ..RiskParams::default()
+    };
+    let mut caps = HashMap::new();
+    caps.insert(window().series, Dollars::new(Decimal::from(10_000)));
+    RiskManager::new(params, caps)
+}
+
 /// The desired ladder the calculator produces for `(p_up, sigma)` with an empty
 /// inventory — `(outcome, price, size)` sorted. The manager must converge to
 /// exactly this.
@@ -196,9 +212,10 @@ fn expected_levels(p_up: f64, sigma: f64) -> Vec<(Outcome, Decimal, Decimal)> {
     }
 }
 
-/// The manager's current resting orders as `(outcome, price, size)`, sorted.
-fn resting_levels(manager: &QuoteManager) -> Vec<(Outcome, Decimal, Decimal)> {
-    let mut v: Vec<(Outcome, Decimal, Decimal)> = manager
+/// The quoter's current resting orders as `(outcome, price, size)`, sorted —
+/// delegated through the risk manager.
+fn resting_levels(risk: &RiskManager) -> Vec<(Outcome, Decimal, Decimal)> {
+    let mut v: Vec<(Outcome, Decimal, Decimal)> = risk
         .resting_view()
         .expect("active window")
         .live_orders()
@@ -216,14 +233,13 @@ fn resting_levels(manager: &QuoteManager) -> Vec<(Outcome, Decimal, Decimal)> {
 
 // ---- harness --------------------------------------------------------------
 
-/// Spawns a paper venue + manager bound to one paused virtual clock; returns the
-/// venue, its event rx, the manager, and the clock anchor (build `now` from it).
+/// Spawns a paper venue + risk manager bound to one paused virtual clock.
 fn make(
     qm: QuoteManagerParams,
 ) -> (
     PaperVenue,
     Receiver<VenueEvent>,
-    QuoteManager,
+    RiskManager,
     tokio::time::Instant,
 ) {
     let start = tokio::time::Instant::now();
@@ -231,31 +247,32 @@ fn make(
         TimestampMs::from_millis(BASE_MS + i64::try_from(start.elapsed().as_millis()).unwrap_or(0))
     });
     let rx = venue.take_event_rx().expect("event rx");
-    let manager = QuoteManager::new(qm, QuoteParams::default(), NormalizerParams::default());
-    (venue, rx, manager, start)
+    (venue, rx, quoter_only_risk(qm), start)
 }
 
-/// Feeds one bus event to both the paper venue (fill sim) and the manager
-/// (quoting) — the data flow the real orchestrator wires.
+/// Feeds one bus event to both the paper venue (fill sim) and the risk manager.
 async fn feed<F: Fn() -> TimestampMs>(
     venue: &PaperVenue,
-    manager: &mut QuoteManager,
+    risk: &mut RiskManager,
     ev: &Event,
     now: &F,
 ) {
     venue.on_bus_event(ev).await;
-    manager.on_event(ev, venue, now()).await;
+    risk.on_event(ev, venue, now()).await;
 }
 
-/// Drains every currently-ready venue event into the manager's view + a record.
-fn drain<F: Fn() -> TimestampMs>(
+/// Drains every currently-ready venue event into the risk manager (which folds
+/// the quoter's view + risk accounting) and a record. Async because the gateway's
+/// `on_venue_event` may itself issue cancels through the port.
+async fn drain<F: Fn() -> TimestampMs>(
     rx: &mut Receiver<VenueEvent>,
-    manager: &mut QuoteManager,
+    risk: &mut RiskManager,
+    venue: &PaperVenue,
     now: &F,
     recorded: &mut Vec<VenueEvent>,
 ) {
     while let Ok(ev) = rx.try_recv() {
-        manager.on_venue_event(&ev, now());
+        risk.on_venue_event(&ev, venue, now()).await;
         recorded.push(ev);
     }
 }
@@ -301,17 +318,13 @@ fn order_states(recorded: &[VenueEvent], state: core_types::OrderState) -> Vec<u
 
 // ---- (a) convergence, on journal-recorded data ----------------------------
 
-/// Records the driving session through the journal, replays it, drives the
-/// manager+paper venue off the *replayed* events, and asserts the resting orders
-/// equal the calculator's desired ladder. Covers "convergence" + "on recorded
-/// data" (mirrors `inventory_replay.rs`).
 #[tokio::test(start_paused = true)]
 async fn converges_to_the_calculator_ladder_on_recorded_data() {
     let qm = QuoteManagerParams {
         min_requote_interval_ms: 10,
         ..QuoteManagerParams::default()
     };
-    let (venue, mut rx, mut manager, start) = make(qm);
+    let (venue, mut rx, mut risk, start) = make(qm);
     let now = || {
         TimestampMs::from_millis(BASE_MS + i64::try_from(start.elapsed().as_millis()).unwrap_or(0))
     };
@@ -339,24 +352,22 @@ async fn converges_to_the_calculator_ladder_on_recorded_data() {
     );
 
     for ev in &replayed {
-        feed(&venue, &mut manager, ev, &now).await;
+        feed(&venue, &mut risk, ev, &now).await;
     }
 
-    // Converge, then let the placement latency fire the Open events.
-    manager.on_requote_tick(&venue, now()).await;
+    risk.on_tick(&venue, now()).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let mut recorded = Vec::new();
-    drain(&mut rx, &mut manager, &now, &mut recorded);
+    drain(&mut rx, &mut risk, &venue, &now, &mut recorded).await;
 
     let expected = expected_levels(0.50, 0.0005);
     assert_eq!(expected.len(), 6, "two-sided 3-level ladder");
     assert_eq!(
-        resting_levels(&manager),
+        resting_levels(&risk),
         expected,
         "resting orders == desired ladder"
     );
 
-    // The venue confirmed all six as Open at the desired prices.
     let opened: HashSet<Decimal> = recorded
         .iter()
         .filter_map(|ev| match ev {
@@ -369,9 +380,12 @@ async fn converges_to_the_calculator_ladder_on_recorded_data() {
     let want: HashSet<Decimal> = expected.iter().map(|(_, p, _)| *p).collect();
     assert_eq!(opened, want, "venue Open prices == desired ladder prices");
 
-    // A second tick is a no-op (already converged).
-    manager.on_requote_tick(&venue, now()).await;
-    assert_eq!(manager.place_cycle_count(), 1, "no churn once converged");
+    risk.on_tick(&venue, now()).await;
+    assert_eq!(risk.place_cycle_count(), 1, "no churn once converged");
+    assert!(
+        !risk.state_snapshot().any_tripped(),
+        "the guard was transparent — no breaker tripped"
+    );
     venue.shutdown();
 }
 
@@ -383,12 +397,11 @@ async fn cancels_before_replacing_under_a_price_jump() {
         min_requote_interval_ms: 10,
         ..QuoteManagerParams::default()
     };
-    let (venue, mut rx, mut manager, start) = make(qm);
+    let (venue, mut rx, mut risk, start) = make(qm);
     let now = || {
         TimestampMs::from_millis(BASE_MS + i64::try_from(start.elapsed().as_millis()).unwrap_or(0))
     };
 
-    // Converge at p_up = 0.50.
     for ev in [
         window_event(WindowLifecycle::Open),
         book(
@@ -405,26 +418,20 @@ async fn cancels_before_replacing_under_a_price_jump() {
         ),
         model(0.50, 0.0005, BASE_MS),
     ] {
-        feed(&venue, &mut manager, &ev, &now).await;
+        feed(&venue, &mut risk, &ev, &now).await;
     }
-    manager.on_requote_tick(&venue, now()).await;
+    risk.on_tick(&venue, now()).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let mut first = Vec::new();
-    drain(&mut rx, &mut manager, &now, &mut first);
-    assert_eq!(
-        resting_levels(&manager).len(),
-        6,
-        "converged before the jump"
-    );
-    let pre_ids: HashSet<String> = manager
+    drain(&mut rx, &mut risk, &venue, &now, &mut first).await;
+    assert_eq!(resting_levels(&risk).len(), 6, "converged before the jump");
+    let pre_ids: HashSet<String> = risk
         .resting_view()
         .unwrap()
         .live_orders()
         .map(|o| o.order_id.as_str().to_owned())
         .collect();
 
-    // A large jump to 0.85: |Δ| = 0.35 > cancel_market_theta (0.02). Feed new
-    // books so the fresh high/low quotes don't cross. Record only post-jump events.
     let mut recorded = Vec::new();
     for ev in [
         book(
@@ -441,22 +448,19 @@ async fn cancels_before_replacing_under_a_price_jump() {
         ),
         model(0.85, 0.0005, BASE_MS + 1000),
     ] {
-        feed(&venue, &mut manager, &ev, &now).await;
+        feed(&venue, &mut risk, &ev, &now).await;
     }
-    // The urgent path issued a bulk cancel; let it land, then fold the Canceleds.
     tokio::time::sleep(Duration::from_millis(150)).await;
-    drain(&mut rx, &mut manager, &now, &mut recorded);
+    drain(&mut rx, &mut risk, &venue, &now, &mut recorded).await;
     assert!(
-        manager.resting_view().unwrap().is_empty(),
+        risk.resting_view().unwrap().is_empty(),
         "old quotes withdrawn first"
     );
 
-    // The next converge places the fresh ladder into the now-empty slots.
-    manager.on_requote_tick(&venue, now()).await;
+    risk.on_tick(&venue, now()).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    drain(&mut rx, &mut manager, &now, &mut recorded);
+    drain(&mut rx, &mut risk, &venue, &now, &mut recorded).await;
 
-    // Cancel-before-replace: every old Canceled strictly precedes every new Open.
     let cancel_idx = order_states(&recorded, core_types::OrderState::Canceled);
     let open_idx = order_states(&recorded, core_types::OrderState::Open);
     assert_eq!(cancel_idx.len(), 6, "all six old quotes cancelled");
@@ -466,8 +470,7 @@ async fn cancels_before_replacing_under_a_price_jump() {
         "every Canceled precedes every Open (split-cycle): cancels {cancel_idx:?}, opens {open_idx:?}"
     );
 
-    // The replacements are brand-new order ids at the 0.85 ladder prices.
-    let new_ids: HashSet<String> = manager
+    let new_ids: HashSet<String> = risk
         .resting_view()
         .unwrap()
         .live_orders()
@@ -478,10 +481,11 @@ async fn cancels_before_replacing_under_a_price_jump() {
         "replacements use new order ids"
     );
     assert_eq!(
-        resting_levels(&manager),
+        resting_levels(&risk),
         expected_levels(0.85, 0.0005),
         "fresh ladder at 0.85"
     );
+    assert!(!risk.state_snapshot().any_tripped(), "guard transparent");
     venue.shutdown();
 }
 
@@ -493,7 +497,7 @@ async fn respects_the_per_window_rate_budget() {
         min_requote_interval_ms: 1000,
         ..QuoteManagerParams::default()
     };
-    let (venue, mut rx, mut manager, start) = make(qm);
+    let (venue, mut rx, mut risk, start) = make(qm);
     let now = || {
         TimestampMs::from_millis(BASE_MS + i64::try_from(start.elapsed().as_millis()).unwrap_or(0))
     };
@@ -514,40 +518,36 @@ async fn respects_the_per_window_rate_budget() {
         ),
         model(0.50, 0.0005, BASE_MS),
     ] {
-        feed(&venue, &mut manager, &ev, &now).await;
+        feed(&venue, &mut risk, &ev, &now).await;
     }
-    manager.on_requote_tick(&venue, now()).await;
+    risk.on_tick(&venue, now()).await;
     assert_eq!(
-        manager.place_cycle_count(),
+        risk.place_cycle_count(),
         1,
         "initial converge = one placement cycle"
     );
 
-    // Many rapid supra-θ model ticks within ONE interval (no virtual time passes
-    // between them). Each marks dirty; each on_requote_tick is budget-blocked, so
-    // no further placement cycle runs.
     for i in 0..8 {
         let p = if i % 2 == 0 { 0.49 } else { 0.51 };
-        feed(&venue, &mut manager, &model(p, 0.0005, BASE_MS), &now).await;
-        manager.on_requote_tick(&venue, now()).await;
+        feed(&venue, &mut risk, &model(p, 0.0005, BASE_MS), &now).await;
+        risk.on_tick(&venue, now()).await;
     }
     assert_eq!(
-        manager.place_cycle_count(),
+        risk.place_cycle_count(),
         1,
         "all re-placements throttled within the rate-budget interval"
     );
 
-    // After the interval elapses (and the urgent cancels terminalize), the budget
-    // releases and exactly one more placement cycle reconciles the freed slots.
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let mut recorded = Vec::new();
-    drain(&mut rx, &mut manager, &now, &mut recorded);
-    manager.on_requote_tick(&venue, now()).await;
+    drain(&mut rx, &mut risk, &venue, &now, &mut recorded).await;
+    risk.on_tick(&venue, now()).await;
     assert!(
-        manager.place_cycle_count() >= 2,
+        risk.place_cycle_count() >= 2,
         "the budget releases after the interval (got {})",
-        manager.place_cycle_count()
+        risk.place_cycle_count()
     );
+    assert!(!risk.state_snapshot().any_tripped(), "guard transparent");
     venue.shutdown();
 }
 
@@ -559,7 +559,7 @@ async fn withdraws_cleanly_on_window_closing() {
         min_requote_interval_ms: 10,
         ..QuoteManagerParams::default()
     };
-    let (venue, mut rx, mut manager, start) = make(qm);
+    let (venue, mut rx, mut risk, start) = make(qm);
     let now = || {
         TimestampMs::from_millis(BASE_MS + i64::try_from(start.elapsed().as_millis()).unwrap_or(0))
     };
@@ -580,51 +580,45 @@ async fn withdraws_cleanly_on_window_closing() {
         ),
         model(0.50, 0.0005, BASE_MS),
     ] {
-        feed(&venue, &mut manager, &ev, &now).await;
+        feed(&venue, &mut risk, &ev, &now).await;
     }
-    manager.on_requote_tick(&venue, now()).await;
+    risk.on_tick(&venue, now()).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let mut recorded = Vec::new();
-    drain(&mut rx, &mut manager, &now, &mut recorded);
-    assert_eq!(
-        resting_levels(&manager).len(),
-        6,
-        "converged before closing"
-    );
-    let cycles_at_close = manager.place_cycle_count();
+    drain(&mut rx, &mut risk, &venue, &now, &mut recorded).await;
+    assert_eq!(resting_levels(&risk).len(), 6, "converged before closing");
+    let cycles_at_close = risk.place_cycle_count();
 
-    // Window Closing → cancel-all + stand down for the window.
     feed(
         &venue,
-        &mut manager,
+        &mut risk,
         &window_event(WindowLifecycle::Closing),
         &now,
     )
     .await;
     tokio::time::sleep(Duration::from_millis(150)).await;
-    drain(&mut rx, &mut manager, &now, &mut recorded);
+    drain(&mut rx, &mut risk, &venue, &now, &mut recorded).await;
     assert!(
-        manager.resting_view().unwrap().is_empty(),
+        risk.resting_view().unwrap().is_empty(),
         "all quotes withdrawn on Closing"
     );
 
-    // Subsequent ticks place nothing while closing.
     feed(
         &venue,
-        &mut manager,
+        &mut risk,
         &model(0.50, 0.0005, BASE_MS + 1000),
         &now,
     )
     .await;
-    manager.on_requote_tick(&venue, now()).await;
+    risk.on_tick(&venue, now()).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    drain(&mut rx, &mut manager, &now, &mut recorded);
+    drain(&mut rx, &mut risk, &venue, &now, &mut recorded).await;
     assert!(
-        manager.resting_view().unwrap().is_empty(),
+        risk.resting_view().unwrap().is_empty(),
         "no re-quoting after Closing"
     );
     assert_eq!(
-        manager.place_cycle_count(),
+        risk.place_cycle_count(),
         cycles_at_close,
         "no placements after Closing"
     );
@@ -637,7 +631,7 @@ async fn withdraws_in_the_final_seconds_via_the_tau_gate() {
         min_requote_interval_ms: 10,
         ..QuoteManagerParams::default()
     };
-    let (venue, mut rx, mut manager, start) = make(qm);
+    let (venue, mut rx, mut risk, start) = make(qm);
     let now = || {
         TimestampMs::from_millis(BASE_MS + i64::try_from(start.elapsed().as_millis()).unwrap_or(0))
     };
@@ -658,31 +652,30 @@ async fn withdraws_in_the_final_seconds_via_the_tau_gate() {
         ),
         model(0.50, 0.0005, BASE_MS),
     ] {
-        feed(&venue, &mut manager, &ev, &now).await;
+        feed(&venue, &mut risk, &ev, &now).await;
     }
-    manager.on_requote_tick(&venue, now()).await;
+    risk.on_tick(&venue, now()).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let mut recorded = Vec::new();
-    drain(&mut rx, &mut manager, &now, &mut recorded);
-    assert_eq!(resting_levels(&manager).len(), 6, "converged mid-window");
+    drain(&mut rx, &mut risk, &venue, &now, &mut recorded).await;
+    assert_eq!(resting_levels(&risk).len(), 6, "converged mid-window");
 
-    // Advance virtual time to within the final-seconds window: τ = close − now =
-    // 300s − 296s = 4s ≤ no_passive_final_secs (5s). The calculator then returns
-    // NoQuote(FinalSecondsNoPassive) → the planner pulls the whole market.
+    // Advance virtual time to within the final-seconds window: τ = 300s − 296s =
+    // 4s ≤ no_passive_final_secs (5s) → NoQuote(FinalSecondsNoPassive).
     tokio::time::sleep(Duration::from_secs(296)).await;
     feed(
         &venue,
-        &mut manager,
+        &mut risk,
         &model(0.50, 0.0005, BASE_MS + 296_000),
         &now,
     )
     .await;
-    manager.on_requote_tick(&venue, now()).await;
+    risk.on_tick(&venue, now()).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
-    drain(&mut rx, &mut manager, &now, &mut recorded);
+    drain(&mut rx, &mut risk, &venue, &now, &mut recorded).await;
 
     assert!(
-        manager.resting_view().unwrap().is_empty(),
+        risk.resting_view().unwrap().is_empty(),
         "withdrawn in the final seconds"
     );
     venue.shutdown();

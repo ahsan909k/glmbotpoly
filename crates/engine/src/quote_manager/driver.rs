@@ -39,7 +39,9 @@ use super::plan::{CancelAction, ConvergeRationale, ConvergencePlan, ConvergenceP
 use super::view::RestingView;
 use crate::inventory::InventoryManager;
 use crate::normalize::{NormalizerParams, OrderDraft, normalize};
-use crate::quoting::{QuoteParams, calculate_quotes};
+use crate::quoting::{
+    PassiveLevelRef, QuoteParams, calculate_quotes, check_final_seconds_invariant,
+};
 
 /// Seconds remaining to close, clamped at zero — computed inline so the driver
 /// needs no `timeutil` dependency.
@@ -143,7 +145,8 @@ impl QuoteManager {
         self.place_cycles
     }
 
-    /// Whether a risk breaker currently holds the manager down.
+    /// Whether a risk breaker currently holds the manager down (the risk manager
+    /// surfaces this for the dashboard).
     #[must_use]
     pub fn is_standing_down(&self) -> bool {
         self.standing_down
@@ -178,6 +181,9 @@ impl QuoteManager {
                 let _ = self.inv_mgr.on_event(&Event::Fill(Arc::clone(f)));
                 self.mark_dirty();
             }
+            // User-WS connectivity is a risk-manager concern (it owns the venue
+            // stream and trips WsDisconnect); the quoter ignores it.
+            VenueEvent::Connectivity { .. } => {}
         }
     }
 
@@ -420,7 +426,7 @@ impl QuoteManager {
     async fn execute_plan<P: VenuePort>(
         &mut self,
         port: &P,
-        plan: ConvergencePlan,
+        mut plan: ConvergencePlan,
         market: &MarketInfo,
         window: WindowId,
         p_up: f64,
@@ -430,6 +436,47 @@ impl QuoteManager {
 
         // 1. Cancels first — awaited before any placement (split-cycle).
         self.execute_cancels(port, &plan.cancels).await;
+
+        // 1b. Defense in depth (§8/§11): independently re-check the final-seconds
+        //     rules the calculator already enforces (G4 no-passive, S6 ATM
+        //     lockout) against the concrete set we are about to place. `tau` is
+        //     recomputed from the same `now`/`close_time` the calculator used, so
+        //     it agrees with the gate that produced these places. On a correct
+        //     calculator the result is always empty; a violation is a calculator
+        //     bug, so we drop the offending level and log loudly rather than ever
+        //     resting a forbidden order on a venue (the `debug_assert` makes it a
+        //     hard failure in dev/test; production degrades gracefully, §12).
+        let tau = tau_secs(now, market.close_time);
+        let violations = check_final_seconds_invariant(
+            plan.places.iter().map(|d| PassiveLevelRef {
+                outcome: d.outcome,
+                price: d.price,
+                size: d.size,
+            }),
+            tau,
+            &self.quote_params,
+        );
+        debug_assert!(
+            violations.is_empty(),
+            "final-seconds invariant breached by the desired set: {violations:?}"
+        );
+        if !violations.is_empty() {
+            for v in &violations {
+                tracing::error!(target: "quote-manager", violation = %v, "final-seconds invariant breached by the desired set (calculator bug); dropping the level");
+            }
+            plan.places.retain(|d| {
+                check_final_seconds_invariant(
+                    std::iter::once(PassiveLevelRef {
+                        outcome: d.outcome,
+                        price: d.price,
+                        size: d.size,
+                    }),
+                    tau,
+                    &self.quote_params,
+                )
+                .is_empty()
+            });
+        }
 
         // 2. Build the batch: every level through the normalizer chokepoint.
         let mut orders = Vec::with_capacity(plan.places.len());

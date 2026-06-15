@@ -168,9 +168,19 @@ enabled = false
 # enabled = true; leave unset while disarmed. Example:
 # funder = "0x0000000000000000000000000000000000000000"
 
+# Journal: the append-only gzip segment log (source of truth) + a queryable
+# sqlite index over the structured low-rate events. Rotation by size/age;
+# retention by age and total size (0 disables each).
 [journal]
+dir = "data/journal"
 sqlite_path = "data/journal.sqlite"
-tick_dir = "data/ticks"
+max_segment_bytes = 134217728      # 128 MiB (uncompressed input)
+max_segment_age_ms = 3600000       # 1 h
+channel_capacity = 16384
+flush_interval_ms = 250
+fsync_on_flush = false
+retention_max_age_ms = 0           # 0 = keep forever
+retention_max_total_bytes = 0      # 0 = no size cap
 
 [dashboard]
 bind = "127.0.0.1:8080"          # non-loopback binds require BOT_SECRET_DASHBOARD_TOKEN

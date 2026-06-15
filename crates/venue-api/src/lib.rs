@@ -21,7 +21,7 @@ mod error;
 mod port;
 mod types;
 
-pub use error::{RejectReason, TradingDisabledMode, VenueError};
+pub use error::{RejectReason, RiskRejectDetail, TradingDisabledMode, VenueError};
 pub use port::{VenueEvents, VenuePort};
 pub use types::{
     Accepted, BatchPlaced, CancelReport, NotCanceled, PlaceRejection, TokenBalance, VenueEvent,

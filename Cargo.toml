@@ -110,3 +110,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 # pain), no openssl. gzip is universally `gunzip`/`zcat`-replayable. Used only by
 # the `journal` crate.
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+# Allowlisted "rusqlite or sqlx-sqlite": rusqlite chosen (Decisions Log 2026-06-15)
+# — its synchronous API fits the journal's existing writer OS thread, and sqlx is
+# async + heavier and ALSO compiles SQLite C (both go through libsqlite3-sys). The
+# `bundled` feature statically links SQLite 3 from source via the `cc` crate (a C
+# build — the documented Windows 4551 trigger; irrelevant on Linux). No openssl,
+# no system lib. Used only by the `journal` crate (the queryable structured index).
+rusqlite = { version = "0.37", default-features = false, features = ["bundled"] }

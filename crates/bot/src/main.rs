@@ -14,6 +14,7 @@
 //! Mode is a CLI subcommand on purpose: it is **not** a config value, so no
 //! config file can ever push the bot toward live trading.
 
+mod boot;
 mod compare;
 mod discover;
 mod fair;
@@ -346,6 +347,9 @@ fn run() -> anyhow::Result<ExitCode> {
         Command::Paper => {
             let _guard = telemetry::init(&config.log).context("initializing telemetry")?;
             log_boot("paper", &config_dir, &config, &secrets, arming, &rendered);
+            // Restore inventory + order state from the journal (§3/§9). The
+            // orchestrator that consumes this to seed the engine is a later task.
+            let _restored = boot::rebuild_and_log(&config);
             tracing::info!("scaffold boot complete â€” engine not wired yet; exiting cleanly");
             Ok(ExitCode::SUCCESS)
         }
@@ -449,7 +453,7 @@ fn run() -> anyhow::Result<ExitCode> {
             let out_dir = cli
                 .out_dir
                 .clone()
-                .unwrap_or_else(|| PathBuf::from("data/journal"));
+                .unwrap_or_else(|| config.journal.dir.clone());
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
                 config_dir = %config_dir.display(),
@@ -495,6 +499,9 @@ fn run() -> anyhow::Result<ExitCode> {
         Command::Live => {
             let _guard = telemetry::init(&config.log).context("initializing telemetry")?;
             log_boot("live", &config_dir, &config, &secrets, arming, &rendered);
+            // Restore inventory + order state from the journal before arming (§3/§9);
+            // on live the venue's open-orders reconcile then corrects this view.
+            let _restored = boot::rebuild_and_log(&config);
             // The live adapter's constructor is the gate: `connect` runs the
             // §11 arming check first and fails closed before any SDK client is
             // built or any network call is made. Gate 3 (dashboard arm) does not

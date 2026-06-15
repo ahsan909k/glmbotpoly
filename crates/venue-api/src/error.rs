@@ -8,12 +8,29 @@
 
 use std::time::Duration;
 
+/// Why the risk manager refused an order at the gateway, before it ever reached
+/// the venue (CLAUDE.md §11). Carried by [`RejectReason::RiskRejected`] so the
+/// engine can branch on the cause without parsing a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiskRejectDetail {
+    /// A global breaker is tripped — all trading is halted.
+    Halted,
+    /// The order would push open notional past the global cap (§11).
+    OpenNotionalCap,
+    /// The order's window is halted for a per-window loss breach (§11).
+    WindowHalted,
+}
+
 /// Why the venue (or risk manager) refused a single order or cancel, classified
 /// into venue-agnostic categories. The original venue text is carried alongside
 /// in [`PlaceRejection`](crate::PlaceRejection)/[`NotCanceled`](crate::NotCanceled)
 /// for the journal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RejectReason {
+    /// The risk manager refused the order at its gateway before it reached the
+    /// venue — a breaker is tripped, or a pre-trade limit would be breached
+    /// (§11). Never produced by a venue adapter; minted only by the risk guard.
+    RiskRejected(RiskRejectDetail),
     /// A post-only order would have crossed the book — we never pay taker fees
     /// by accident (CLAUDE.md §7).
     CrossedBook,

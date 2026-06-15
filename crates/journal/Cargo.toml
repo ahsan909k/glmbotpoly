@@ -24,8 +24,11 @@ time = { workspace = true }
 # gzip the rotated segments (operator-mandated; pure-Rust backend) — see the
 # workspace allowlist note and Decisions Log 2026-06-14.
 flate2 = { workspace = true }
-
-[dev-dependencies]
-# `dec!` for building sample records in the round-trip tests (the value types
-# round-trip as lossless strings either way).
+# The queryable structured sqlite index over the low-rate events (orders, fills,
+# windows, settlements, breaker trips, config changes) — see the workspace
+# allowlist note and Decisions Log 2026-06-15. The connection lives entirely on
+# the writer thread; reads open a separate read-only connection.
+rusqlite = { workspace = true }
+# Lossless decimal ↔ TEXT conversion at the sqlite column boundary (and `dec!`
+# in tests). The serde/Display string form round-trips every digit and scale.
 rust_decimal = { workspace = true }

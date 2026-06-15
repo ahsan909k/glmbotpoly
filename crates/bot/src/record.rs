@@ -25,7 +25,7 @@ use feed_binance::{BinanceArgs, BinanceSub};
 use feed_clob::ClobArgs;
 use feed_rtds::{FeedSub, RtdsArgs};
 use feed_util::{FeedError, WsTransport};
-use journal::{Recorder, RecorderParams};
+use journal::Recorder;
 use scheduler::{SchedulerArgs, Timing};
 use timeutil::wall_now;
 use tokio::sync::{mpsc, watch};
@@ -93,14 +93,12 @@ async fn run_record(
     let service = DiscoveryService::from_config(&config.feeds, &config.discovery)
         .context("building discovery service")?;
 
-    let recorder = Recorder::spawn(
-        RecorderParams {
-            out_dir: out_dir.clone(),
-            ..RecorderParams::default()
-        },
-        wall_now,
-    )
-    .with_context(|| format!("starting the journal recorder in {}", out_dir.display()))?;
+    // Config-driven rotation + retention + sqlite index, with `--out-dir` (the
+    // already-resolved `out_dir`) overriding the directory.
+    let mut params = crate::boot::journal_params(config);
+    params.out_dir = out_dir.clone();
+    let recorder = Recorder::spawn(params, wall_now)
+        .with_context(|| format!("starting the journal recorder in {}", out_dir.display()))?;
 
     let keys: Vec<&'static str> = series_list.iter().map(|s| s.key()).collect();
     tracing::info!(

@@ -213,7 +213,7 @@ pub enum WindowLifecycle {
 }
 
 /// The §11 circuit breakers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum BreakerKind {
     /// A feed exceeded the staleness bound (500 ms default).
     FeedStale,
@@ -280,6 +280,14 @@ pub enum ControlEvent {
     },
     /// Graceful shutdown requested: stop strategies → cancel all → flush.
     Shutdown,
+    /// Operator manual kill (dashboard or CLI): halt all trading and cancel
+    /// everything immediately, latched until a [`Reset`](Self::Reset). The risk
+    /// manager trips [`BreakerKind::Manual`] on it (§11).
+    Kill,
+    /// Operator reset: clears the operator-latched breakers
+    /// ([`BreakerKind::Manual`] and [`BreakerKind::DailyStop`]) so trading can
+    /// resume after a manual kill or a daily stop (§11 "until manual reset").
+    Reset,
 }
 
 /// Market lifecycle notices from the market-channel WebSocket (`new_market` /
