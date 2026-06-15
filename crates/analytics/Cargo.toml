@@ -11,3 +11,19 @@ workspace = true
 
 [dependencies]
 journal = { path = "../journal" }
+# `journal` does NOT re-export `core_types`, so name it directly: analytics
+# folds bus `Event`s (Fill/Model/Window/Settlement) and the money/markets types
+# (CLAUDE.md §4 — arrows point inward to core-types).
+core-types = { path = "../core-types" }
+# Decimal money math (the PnL attribution + rebate base); `dec!` in tests.
+rust_decimal = { workspace = true }
+# Typed param-validation errors (the HealthMonitor precedent).
+thiserror = { workspace = true }
+# Serialize the output structs (markouts, attribution, rollups) for the
+# dashboard REST snapshot / WS push (the consuming wiring is deferred).
+serde = { workspace = true }
+
+[dev-dependencies]
+# The replay/round-trip integration uses serde_json indirectly via journal; the
+# unit tests use `dec!` (already via rust_decimal's `macros` feature).
+serde_json = { workspace = true }

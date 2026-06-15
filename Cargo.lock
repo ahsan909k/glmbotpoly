@@ -597,7 +597,12 @@ dependencies = [
 name = "analytics"
 version = "0.1.0"
 dependencies = [
+ "core-types",
  "journal",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
