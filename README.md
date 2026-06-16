@@ -182,6 +182,228 @@ The writer runs off the bus on its own thread; if the disk stalls, events are
 **dropped and counted** rather than back-pressuring the bus — a nonzero
 `dropped` in the ctrl-c summary means the capture is incomplete.
 
+### Main run mode (`bot run`)
+
+`just run` (= `bot run`, optional `series="BTC-5m"`) is **the** trading command
+(CLAUDE.md §5): it starts paper trading on **all enabled series at once** under a
+supervision tree. Unlike the smoke subcommands, it wires the *real* engine — the
+scheduler + all three feeds + the multi-asset fair-value model + the
+single-gateway **risk manager** (the quote manager and the momentum / late-window
+takers, behind the §11 breakers) + the paper venue + the journal + analytics +
+the dashboard — onto one bus. Real data, paper money; the dashboard binds
+`config.dashboard.bind`.
+
+It adds three things over the smoke modes:
+
+- **Supervision.** Every long-running task is restarted with backoff if it dies,
+  while the rest keep running. A *critical* dependency's death (a feed or the
+  scheduler) triggers an immediate **cancel-all** and gates new order flow until
+  it recovers (a restarted clob is re-seeded with the current windows so it
+  reconnects without waiting for the next announcement). Watch the `run`-target
+  logs for `supervised task …` / `scheduling restart` / `… restarted`.
+- **Resilient startup self-check.** The bot **refuses to trade** until the clock
+  is sane (the §11 skew monitor's verdict), discovery has a current window for
+  every enabled series (the scheduler's `Open` announcements), and the feeds are
+  healthy (first ticks on the bus). It stays up retrying and **auto-arms** once
+  healthy — logging `ARMED — startup self-check passed` — and never exits on a
+  slow/failed self-check (a skewed clock keeps it up but un-armed until you
+  resync; gate it with `[run].require_clock_check` / `require_discovery_check`).
+- **Graceful shutdown** on Ctrl-C *and* (on Linux) `SIGTERM`: stop strategies →
+  cancel all open orders, draining until **zero remain** (logged) → flush the
+  journal → exit.
+
+Resource discipline is built in: bounded channels everywhere (bus 256 with
+backpressure, journal 16384 drop-and-count, window/market 64), and a periodic
+`resource report` log line (RSS on Linux from `/proc/self/statm`, per-window book
+counts, settled-inventory prune) so a 24/7 session stays memory stable. The
+`[run]` config section tunes the supervision backoff, the self-check gates, and
+the cadences. **Acceptance:** a multi-hour session — six series rolling, dashboard
+live, the RSS line flat, clean shutdown leaving zero open paper orders.
+
+### 24-hour soak checklist
+
+Before a build is allowed near real money it must survive a 24-hour paper soak.
+Run the deterministic chaos suite first, then leave `bot run` up for a day and
+watch the numbers below.
+
+**Pre-flight — the chaos suite (local, deterministic, ~seconds).** `just chaos`
+(= `cargo test -p bot --features chaos --test chaos -- --test-threads=1`) injects
+each failure class — kill each WebSocket, stall each feed past the staleness
+threshold, a matching-engine restart notice, a clock jump, a discovery failure at
+rollover, a process restart mid-window — and asserts the §11 invariants: no orphan
+open orders, the right breaker trips **with a journaled cause**, trading halts and
+resumes exactly per the rules, and state rebuilds exactly from the journal. It is
+feature-gated (off in the default `just test`/`just lint` loop) and paper-only.
+Acceptance: run it ~10× back-to-back — **100% green, zero flakes** — and lint the
+gated code with `cargo clippy -p bot --features chaos --all-targets -- -D warnings`.
+
+**Start the soak.** Resync the VPS clock (`bot schedule` for ~5 min should show no
+`ClockSkew` trip), then `just run` (all six series, paper) — or `bot dashboard
+--with-model` to watch it in a browser. Wait for `ARMED — startup self-check
+passed` in the log; until then the bot is intentionally not trading.
+
+**Watch (dashboard + logs, sampled every 2–4 h).**
+
+- **Markout health (the headline).** Series-comparison → average 5 s markout must
+  not be persistently negative (the adverse-selection alarm); a series whose
+  markout trends red is being picked off — pull it.
+- **Breaker trips.** Risk panel green in steady state; every trip that *does* fire
+  must carry a journaled cause — cross-check with the journal
+  (`JournalIndexReader::breaker_trips()` / the sqlite index). A trip with no
+  cause, or a breaker stuck tripped, disqualifies the build.
+- **Memory.** The `resource report` log line (RSS on Linux, per-window book
+  counts, settled-inventory prune) must stay **flat** over the full day — any
+  steady RSS climb is a leak.
+- **Reconnect counts.** Per-feed reconnects should be bounded self-heals, not a
+  loop; a feed that never reconnects (permanent stale) is a failure.
+- **Feed + WS health.** All feed-health lanes live; windows roll cleanly with the
+  late-window gate marks appearing ≤30 s before close; no rejected-order or
+  cancel loops in the fills blotter; equity curve and per-series win-rate stable
+  comparing hour 0–4 vs 20–24.
+
+**Mid-run drills.** `bot control kill` → TRADING HALTED banner + zero resting
+orders → `bot control reset` → quoting resumes. Then Ctrl-C **and** (on Linux)
+`kill -TERM <pid>` each → clean shutdown logging **zero open paper orders**.
+
+**Disqualifies the build:** any orphan open order at shutdown; a breaker that
+trips without a journaled cause; RSS growth / a memory leak; a feed that never
+reconnects; a series that stalls at rollover; any panic or crash; persistently
+negative markout (adverse selection); or an unresolved clock-skew trip.
+
+### Dashboard (REST + WebSocket)
+
+`just dashboard` (= `bot dashboard`, optional `--series`, optional
+`--with-model`) serves the operator dashboard (CLAUDE.md §10) over a **live paper
+pipeline**: the scheduler + feed-clob + the paper venue across **all enabled
+series** (or one with `--series`), with a trivial two-sided quoter — real data,
+paper money. The axum server binds `config.dashboard.bind` (default
+`127.0.0.1:8080`). Open **`http://<bind>/`** in a browser for the single-page UI;
+the REST snapshots + WebSocket push are the backend it runs on.
+
+**`--with-model`.** By default the run is lean (no fair-value model). Pass
+`--with-model` to additionally wire feed-rtds + feed-binance and the §8
+fair-value model across every series, so the **Live** view's *fair vs book mid*
+panel and the **Fills** blotter's *5-second markout* coloring populate with real
+data. This opens two extra WebSocket connections; the default run leaves the
+model off.
+
+**UI.** A static, phone-usable single page is served at `/` (`/app.css`,
+`/app.js`) — embedded in the binary, no build step, no external assets. Five tabs:
+- **Overview** — paper/live badges, a live equity curve, the paper-capital editor
+  (set absolute, or ±$1k), and a confirm-gated **Kill / Reset**.
+- **Series** — the §9.3 decision table (sortable, min-sample rows muted, green/red).
+- **Live** — chips for each active window; the selected window's Up/Down book
+  ladder with **our resting quotes highlighted**, fair-vs-mid, a seconds-remaining
+  countdown with the late-window gate zones marked (late-taker ≤30s, no-ATM ≤25s,
+  cancel-all ≤5s), inventory + pair-cost, and recent prints.
+- **Fills** — the chronological blotter, filterable by series, each row **colored
+  by its 5-second markout** (green aged well, red picked off; "…" while pending)
+  with maker / taker / late-window attribution tags.
+- **Risk** — every breaker (tripped vs ok) + last-trip cause, the risk snapshot
+  (daily PnL, open notional, errors), feed-health ages, user-WS connectivity,
+  per-asset model health, and the **Kill / Reset** controls.
+
+It live-updates over the WebSocket (and a 1 s countdown ticker) and reconnects on
+its own.
+
+**Auth.** REST is `Authorization: Bearer <token>`; the WebSocket takes the token
+as a `?token=` query (browsers can't set a header on a `WebSocket`). The token is
+`BOT_SECRET_DASHBOARD_TOKEN` — **required** for a non-loopback bind (the server
+refuses to start otherwise), optional on loopback (dev). For a remote bind, open
+`http://<host>/#token=<token>` once — the page stores the token and cleans the
+URL (or paste it via the ⚙ button). `/health` and the static UI (`/`, `/app.css`,
+`/app.js`) are unauthenticated; every `/api/*` data and control route is gated.
+
+Both trading modes are **namespaced and simultaneously available** (`?mode=paper`
+default, or `?mode=live`); this pipeline only populates `paper`, so `live` is
+present-but-empty until the live orchestrator lands. Endpoints:
+
+| Endpoint | What it returns |
+|---|---|
+| `GET /health` | machine-readable status (`ok`/`degraded`/`down`) + feed/breaker/model rollup (no auth) |
+| `GET /api/overview` | both modes' badges, equity curve, wallet/ledger, paper capital |
+| `GET /api/series-comparison?mode&window=today\|7d\|all&days=N&sort=<col>&dir=asc\|desc` | the §9.3 decision table (sortable) |
+| `GET /api/windows?mode` | active windows (shared book/model + this mode's inventory) |
+| `GET /api/windows/{Series@open_ms}?mode` | one window: ladders, our resting orders, prints, fair-vs-mid, inventory |
+| `GET /api/fills?mode&limit&window&since_ms` | the fills blotter (newest first); each row carries `markout_5s`/`markout_pending` + `attribution` (maker/taker/late) |
+| `GET /api/risk?mode` | breakers, feed/book/model health, WS connectivity |
+| `GET /api/params` | the current safe-listed parameters + paper capital |
+| `POST /api/control/kill` | global kill: cancel everything + halt (latched) |
+| `POST /api/control/reset` | clear the operator-latched breakers, resume |
+| `POST /api/control/reset-daily-stop` | clear only the daily-stop latch |
+| `POST /api/control/paper-capital` | `{"amount":"N"}` (set absolute) or `{"delta":"±N"}` (adjust) |
+| `POST /api/control/enable-series` / `disable-series` | `{"series":"BTC-5m"}` — runtime series toggle |
+| `POST /api/control/set-param` | `{"series":"BTC-5m"\|null,"key":"min_edge","value":"0.02"}` — safe-listed tunables only |
+| `POST /api/control/arm-live/begin` → `arm-live/confirm` `{"phrase":"…"}` → `disarm` | the §11 multi-step live-arming flow |
+| `GET /api/control/status` | the control-plane state (kill, enabled series, arming gates, param overrides) |
+| `GET /api/ws?token=<t>` | WebSocket: `hello`, then `equity`/`quote`/`fill`/`breaker`/`lifecycle` (+ `top`/`model`) updates |
+
+Every control command is **validated, journaled with origin** (a `ControlAudit`
+record → the `command_audit` sqlite table) **and acknowledged with the resulting
+state**: each `POST /api/control/*` returns a `ControlOutcome`
+(`{kind:"accepted"|"rejected"|"conflict", error?, state}`) and the HTTP status
+maps `accepted`→200, `rejected`→400, `conflict`→409 (e.g. arming with a gate
+missing). The routes return `503` on a read-only deployment (no request sink) and
+require the bearer token like every `/api/*` route.
+
+**CLI control (`bot control …`).** The same control plane is reachable from the
+command line — `bot control <kill|reset|reset-daily-stop|set-capital N|adjust-capital ±N|
+enable-series KEY|disable-series KEY|set-param KEY VAL [--series KEY]|arm-live|
+confirm-arm PHRASE|disarm|status>` is a thin HTTP client to the **running** bot's
+dashboard control API (bind from `config.dashboard.bind`, token from
+`BOT_SECRET_DASHBOARD_TOKEN`, origin tagged `cli` in the audit trail). It prints
+the JSON ack and exits non-zero on a refusal. Examples:
+
+```sh
+bot control status
+bot control disable-series BTC-5m
+bot control set-param min_edge 0.02 --series ETH-5m   # accepted (safe-listed)
+bot control set-param touch_size 20                   # rejected (structural — requires restart)
+bot control arm-live && bot control confirm-arm arm-live-i-accept-real-money-losses
+```
+
+Probe it (loopback dev, no token needed):
+
+```sh
+curl -s localhost:8080/health
+curl -s localhost:8080/api/overview
+curl -s "localhost:8080/api/series-comparison?mode=paper&window=all"
+```
+
+Without `--with-model` the "fair vs mid" panel and the markout coloring stay
+empty (no model data); the series-comparison table still populates once windows
+settle (an in-process `InventoryManager` folds the paper fills into settlements).
+The **Control** card on the overview shows the live-arming gates, per-series
+enable toggles (a disabled series stops quoting in the running loop), and a
+safe-listed parameter editor. The live namespace stays empty until the live
+orchestrator lands — the control plane holds the runtime state (enabled series,
+parameter overrides, the gate-3 arm flag) that the future orchestrator reads.
+
+**Acceptance — paper run against live data (screenshot checklist).** Start
+`bot dashboard --with-model` (loopback, dev — no token needed) and open
+`http://localhost:8080/`. Let it warm up a minute (the model needs ~60 ticks +
+a window open to produce `p_up`), then verify by eye that each updates smoothly
+in real time:
+
+1. **Overview** — the equity curve advances; paper badge shows *running*.
+2. **Live** — active-window chips for the enabled series; pick one and watch the
+   Up/Down ladder churn, with at least one bid level highlighted as **ours**
+   (the quoter's resting order); the countdown decrements each second and its bar
+   crosses the three gate marks (late-taker ≤30 s, no-ATM ≤25 s, cancel-all ≤5 s)
+   near close; **fair vs mid** shows a non-blank `p_up`, the Up mid, and their Δ,
+   with a model-health pill; inventory + pair-cost and the scrolling prints fill.
+3. **Fills** — rows appear as the quoter trades; each is colored by its 5-second
+   markout (some green/red once matured, some "…" while pending) and tagged
+   maker / taker / late; the series filter narrows the list.
+4. **Risk** — breaker chips are green (ok); feed-health shows all-live (or a red
+   row during an RTDS hiccup); model health shows the per-asset tier; press
+   **Kill** → the *TRADING HALTED* banner + a tripped `Manual` breaker, then
+   **Reset** clears it.
+
+(The live `--with-model` smoke is the operator's interactive step, like the
+`bot fair` / `bot ladder` acceptances — the backend folds and the markout/model
+math are covered by unit + integration tests.)
+
 ### Latency benchmark (VPS region selection)
 
 `just latency <label>` (= `bot latency --label <label>`, optional

@@ -29,8 +29,9 @@ use std::path::Path;
 use std::str::FromStr;
 
 use core_types::{
-    BreakerKind, ConditionId, Decimal, Dollars, Mode, Outcome, Price, ResolutionKind, RiskEvent,
-    Series, Side, Size, TickSize, TimestampMs, TokenId, TokenPair, WindowId, WindowLifecycle,
+    BreakerKind, CommandOrigin, ConditionId, Decimal, Dollars, Mode, Outcome, Price,
+    ResolutionKind, RiskEvent, Series, Side, Size, TickSize, TimestampMs, TokenId, TokenPair,
+    WindowId, WindowLifecycle,
 };
 use core_types::{Liquidity, OrderState};
 use rusqlite::types::Type;
@@ -40,7 +41,13 @@ use crate::record::JournalRecord;
 use crate::recorder::JournalError;
 
 /// The structured-index schema version, stored in the `meta` table.
-const SCHEMA_VERSION: i64 = 1;
+///
+/// v2 (2026-06-15, control-plane task): added the `command_audit` table. The
+/// addition is purely additive (`CREATE TABLE IF NOT EXISTS`); an old v1 DB is
+/// upgraded in place by the idempotent DDL and the version is only ever written
+/// on first creation, so existing rows are untouched and the index stays
+/// rebuildable from the gzip source of truth regardless.
+const SCHEMA_VERSION: i64 = 2;
 
 /// Idempotent DDL: six structured tables + a `meta` table + query indexes.
 const SCHEMA_DDL: &str = "\
@@ -147,16 +154,27 @@ CREATE TABLE IF NOT EXISTS control_events (
     amount      TEXT
 );
 CREATE INDEX IF NOT EXISTS control_events_ts ON control_events(ts_local_ms);
+CREATE TABLE IF NOT EXISTS command_audit (
+    seq         INTEGER NOT NULL,
+    ts_local_ms INTEGER NOT NULL,
+    origin      TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    detail      TEXT NOT NULL,
+    accepted    INTEGER NOT NULL,
+    error       TEXT
+);
+CREATE INDEX IF NOT EXISTS command_audit_ts ON command_audit(ts_local_ms);
 ";
 
-/// The six structured tables, in a stable order — used by retention pruning.
-const STRUCTURED_TABLES: [&str; 6] = [
+/// The seven structured tables, in a stable order — used by retention pruning.
+const STRUCTURED_TABLES: [&str; 7] = [
     "orders",
     "fills",
     "windows",
     "settlements",
     "breaker_trips",
     "control_events",
+    "command_audit",
 ];
 
 // ----------------------------------------------------------------------------
@@ -361,6 +379,24 @@ impl JournalIndex {
                 )?;
                 self.indexed += 1;
             }
+            JournalRecord::ControlAudit(a) => {
+                self.begin_if_needed()?;
+                self.conn.execute(
+                    "INSERT INTO command_audit
+                     (seq, ts_local_ms, origin, kind, detail, accepted, error)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    params![
+                        seq,
+                        ts_local_ms,
+                        origin_str(a.origin),
+                        a.kind.as_str(),
+                        a.detail.as_str(),
+                        i64::from(a.accepted),
+                        a.error.as_deref(),
+                    ],
+                )?;
+                self.indexed += 1;
+            }
             // High-rate / non-structured kinds: stay in the gzip log only.
             _ => {}
         }
@@ -562,6 +598,19 @@ impl JournalIndexReader {
         )?;
         collect(stmt.query_map([], control_row)?)
     }
+
+    /// Every command-audit record (the §10.6/§11 operator audit trail), oldest
+    /// first — accepted and rejected commands alike, with origin and outcome.
+    ///
+    /// # Errors
+    /// [`JournalError::Sqlite`] / [`JournalError::Corrupt`].
+    pub fn command_audit(&self) -> Result<Vec<ControlAuditRow>, JournalError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, ts_local_ms, origin, kind, detail, accepted, error
+             FROM command_audit ORDER BY seq ASC",
+        )?;
+        collect(stmt.query_map([], audit_row)?)
+    }
 }
 
 /// Collapses a `query_map` iterator into a `Vec`, surfacing the first error.
@@ -727,7 +776,7 @@ pub struct ControlRow {
     /// Local write time (unix ms).
     pub ts_local_ms: i64,
     /// Event kind (`mode_changed`/`series_enabled`/`series_disabled`/
-    /// `paper_capital_set`/`shutdown`/`kill`/`reset`).
+    /// `paper_capital_set`/`shutdown`/`kill`/`reset`/`daily_stop_reset`).
     pub kind: String,
     /// New mode, for `mode_changed`.
     pub mode: Option<Mode>,
@@ -735,6 +784,25 @@ pub struct ControlRow {
     pub series: Option<Series>,
     /// New paper capital, for `paper_capital_set`.
     pub amount: Option<Dollars>,
+}
+
+/// An indexed command-audit record — the §10.6/§11 operator audit trail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlAuditRow {
+    /// Journal sequence number of the record.
+    pub seq: u64,
+    /// Local write time (unix ms).
+    pub ts_local_ms: i64,
+    /// Which frontend issued the command.
+    pub origin: CommandOrigin,
+    /// Stable command-kind label (e.g. `kill`, `set_param`, `arm_live`).
+    pub kind: String,
+    /// Arguments / resulting-state summary.
+    pub detail: String,
+    /// Whether the command was accepted.
+    pub accepted: bool,
+    /// The rejection reason when not accepted.
+    pub error: Option<String>,
 }
 
 // ----------------------------------------------------------------------------
@@ -837,6 +905,18 @@ fn control_row(row: &Row) -> rusqlite::Result<ControlRow> {
         mode: get_opt_mode(row, 3)?,
         series: get_opt_series(row, 4)?,
         amount: get_opt_dollars(row, 5)?,
+    })
+}
+
+fn audit_row(row: &Row) -> rusqlite::Result<ControlAuditRow> {
+    Ok(ControlAuditRow {
+        seq: get_seq(row, 0)?,
+        ts_local_ms: row.get(1)?,
+        origin: get_origin(row, 2)?,
+        kind: row.get(3)?,
+        detail: row.get(4)?,
+        accepted: row.get::<_, i64>(5)? != 0,
+        error: row.get(6)?,
     })
 }
 
@@ -983,6 +1063,11 @@ fn get_opt_series(row: &Row, col: usize) -> rusqlite::Result<Option<Series>> {
     }
 }
 
+fn get_origin(row: &Row, col: usize) -> rusqlite::Result<CommandOrigin> {
+    let s: String = row.get(col)?;
+    origin_from(&s).ok_or_else(|| bad_label(col, "command_origin", s))
+}
+
 // ----------------------------------------------------------------------------
 // Enum ↔ stable DB label (deliberately not serde variant names — a new variant
 // forces an update here rather than silently writing an unstable label)
@@ -1124,6 +1209,20 @@ fn mode_from(s: &str) -> Option<Mode> {
     }
 }
 
+fn origin_str(o: CommandOrigin) -> &'static str {
+    match o {
+        CommandOrigin::Dashboard => "dashboard",
+        CommandOrigin::Cli => "cli",
+    }
+}
+fn origin_from(s: &str) -> Option<CommandOrigin> {
+    match s {
+        "dashboard" => Some(CommandOrigin::Dashboard),
+        "cli" => Some(CommandOrigin::Cli),
+        _ => None,
+    }
+}
+
 /// Splits a [`RiskEvent`] into its `(kind, breaker)` columns.
 fn risk_components(r: RiskEvent) -> (&'static str, BreakerKind) {
     match r {
@@ -1156,6 +1255,7 @@ fn control_components(
         C::Shutdown => ("shutdown", None, None, None),
         C::Kill => ("kill", None, None, None),
         C::Reset => ("reset", None, None, None),
+        C::DailyStopReset => ("daily_stop_reset", None, None, None),
     }
 }
 
@@ -1595,6 +1695,54 @@ mod tests {
         let reader = JournalIndexReader::open(&path).unwrap();
         let err = reader.recent_fills(10).unwrap_err();
         assert!(matches!(err, JournalError::Sqlite(_)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn command_audit_round_trips_accepted_and_rejected() {
+        use core_types::{CommandOrigin, ControlAudit};
+
+        let accepted = Event::ControlAudit(Arc::new(ControlAudit {
+            ts: TimestampMs::from_millis(OPEN_MS),
+            origin: CommandOrigin::Cli,
+            kind: "set_param".to_owned(),
+            detail: "series=BTC-5m key=min_edge value=0.02".to_owned(),
+            accepted: true,
+            error: None,
+        }));
+        let rejected = Event::ControlAudit(Arc::new(ControlAudit {
+            ts: TimestampMs::from_millis(OPEN_MS + 1),
+            origin: CommandOrigin::Dashboard,
+            kind: "set_param".to_owned(),
+            detail: "key=touch_size".to_owned(),
+            accepted: false,
+            error: Some("touch_size requires a restart".to_owned()),
+        }));
+        let path = build_index("audit", &[rec(&accepted), rec(&rejected)]);
+        let reader = JournalIndexReader::open(&path).unwrap();
+        let rows = reader.command_audit().unwrap();
+        assert_eq!(rows.len(), 2, "one audit row per command, accepted or not");
+        assert_eq!(rows[0].origin, CommandOrigin::Cli);
+        assert_eq!(rows[0].kind, "set_param");
+        assert!(rows[0].accepted);
+        assert_eq!(rows[0].error, None);
+        assert_eq!(rows[1].origin, CommandOrigin::Dashboard);
+        assert!(!rows[1].accepted);
+        assert_eq!(
+            rows[1].error.as_deref(),
+            Some("touch_size requires a restart")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn daily_stop_reset_indexes_into_control_events() {
+        let ev = Event::Control(ControlEvent::DailyStopReset);
+        let path = build_index("dsr", &[rec(&ev)]);
+        let reader = JournalIndexReader::open(&path).unwrap();
+        let rows = reader.control_events().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "daily_stop_reset");
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -55,6 +55,7 @@ pub fn validate(config: &AppConfig, secrets: &Secrets) -> Result<(), ConfigError
     config.latency.validate_into(&mut v);
     config.engine.validate_into(&mut v);
     config.risk.validate_into(&mut v);
+    config.run.validate_into(&mut v);
     config.paper.validate_into(&mut v);
     config.journal.validate_into(&mut v);
     config.log.validate_into(&mut v);

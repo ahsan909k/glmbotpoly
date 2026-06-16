@@ -551,6 +551,26 @@ impl InventoryManager {
     pub fn is_empty(&self) -> bool {
         self.books.is_empty()
     }
+
+    /// Drops settled windows whose open time is before `cutoff`, bounding memory
+    /// for 24/7 operation (the orchestrator calls it periodically). Active
+    /// (unsettled) windows are always retained, whatever the cutoff. Removing a
+    /// settled window's book is safe: a late duplicate `Resolved` finds no book
+    /// and emits nothing (the untraded-window path of [`on_event`](Self::on_event)),
+    /// so the idempotency contract holds. Returns the number of windows dropped.
+    pub fn prune_settled_before(&mut self, cutoff: TimestampMs) -> usize {
+        let drop: Vec<WindowId> = self
+            .settled
+            .iter()
+            .copied()
+            .filter(|w| w.open_time.as_millis() < cutoff.as_millis())
+            .collect();
+        for w in &drop {
+            self.books.remove(w);
+            self.settled.remove(w);
+        }
+        drop.len()
+    }
 }
 
 #[cfg(test)]
@@ -1207,5 +1227,51 @@ mod tests {
         assert_eq!(p.hard_cap_excess, sz(dec!(100)));
         assert_eq!(p.merge_min_pairs, sz(dec!(25)));
         assert_eq!(p.max_worst_case_loss, Dollars::new(dec!(25)));
+    }
+
+    // ---- 15. prune_settled_before (24/7 memory hygiene) -------------------
+
+    #[test]
+    fn prune_settled_before_drops_old_settled_keeps_active() {
+        let mut mgr = InventoryManager::new();
+        // Trade + settle window() (opens at OPEN_MS).
+        mgr.on_event(&Event::Fill(Arc::new(buy(
+            Outcome::Up,
+            dec!(0.40),
+            dec!(10),
+        ))));
+        mgr.on_event(&resolved(Outcome::Up));
+        assert!(mgr.is_settled(window()));
+        assert_eq!(mgr.len(), 1);
+
+        // A cutoff at or before the open drops nothing.
+        assert_eq!(
+            mgr.prune_settled_before(TimestampMs::from_millis(OPEN_MS)),
+            0
+        );
+        assert_eq!(mgr.len(), 1);
+
+        // A cutoff past the open drops the settled window (book + settled flag).
+        assert_eq!(
+            mgr.prune_settled_before(TimestampMs::from_millis(OPEN_MS + 1)),
+            1
+        );
+        assert_eq!(mgr.len(), 0);
+        assert!(!mgr.is_settled(window()));
+        // A late duplicate Resolved finds no book → emits nothing (untraded path).
+        assert!(mgr.on_event(&resolved(Outcome::Up)).is_empty());
+
+        // An UNSETTLED (active) window is never pruned, even with a far cutoff.
+        let mut active = InventoryManager::new();
+        active.on_event(&Event::Fill(Arc::new(buy(
+            Outcome::Up,
+            dec!(0.40),
+            dec!(10),
+        ))));
+        assert_eq!(
+            active.prune_settled_before(TimestampMs::from_millis(OPEN_MS + 1_000_000)),
+            0
+        );
+        assert_eq!(active.len(), 1);
     }
 }

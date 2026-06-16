@@ -1096,7 +1096,7 @@ enum CalRecord {
 
 /// Maps `feeds.binance_stale_after_ms` into the basis pairing window; the rest
 /// of [`BasisParams`] are model-crate defaults.
-fn basis_params(feeds: &config::FeedsConfig) -> BasisParams {
+pub(crate) fn basis_params(feeds: &config::FeedsConfig) -> BasisParams {
     BasisParams {
         pairing_max_age_ms: feeds.binance_stale_after_ms.as_millis(),
         ..BasisParams::default()
@@ -1104,7 +1104,7 @@ fn basis_params(feeds: &config::FeedsConfig) -> BasisParams {
 }
 
 /// Maps the `feeds.*` staleness bounds into [`FairParams`] (anchor selection).
-fn fair_params(feeds: &config::FeedsConfig) -> FairParams {
+pub(crate) fn fair_params(feeds: &config::FeedsConfig) -> FairParams {
     FairParams {
         chainlink_stale_ms: feeds.rtds_stale_after_ms.as_millis(),
         fast_stale_ms: feeds.binance_stale_after_ms.as_millis(),
@@ -1113,7 +1113,7 @@ fn fair_params(feeds: &config::FeedsConfig) -> FairParams {
 
 /// Maps `feeds.rtds_stale_after_ms` into the health gate's Chainlink-staleness
 /// bound; the divergence tiers and dwell timers stay at the model-crate defaults.
-fn health_params(feeds: &config::FeedsConfig) -> HealthParams {
+pub(crate) fn health_params(feeds: &config::FeedsConfig) -> HealthParams {
     let stale = feeds.rtds_stale_after_ms.as_millis();
     HealthParams {
         chainlink_stale_ms: stale,

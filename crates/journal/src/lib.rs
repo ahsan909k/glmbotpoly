@@ -27,8 +27,8 @@ pub mod recorder;
 pub mod replay;
 
 pub use index::{
-    BreakerRow, ControlRow, FillRow, JournalIndex, JournalIndexReader, OrderRow, SettlementRow,
-    WindowRow,
+    BreakerRow, ControlAuditRow, ControlRow, FillRow, JournalIndex, JournalIndexReader, OrderRow,
+    SettlementRow, WindowRow,
 };
 pub use record::{JournalRecord, RecordEnvelope};
 pub use recorder::{JournalError, Recorder, RecorderParams, RecorderStats};

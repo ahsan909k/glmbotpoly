@@ -325,8 +325,8 @@ async fn try_merge(venue: &PaperVenue, state: &mut State, market: &Arc<MarketInf
 }
 
 /// Signals shutdown and awaits one task while draining the bus (a full channel
-/// must never deadlock an exiting driver).
-async fn drain_join<T>(
+/// must never deadlock an exiting driver). Shared with `bot dashboard`.
+pub(crate) async fn drain_join<T>(
     shutdown_tx: &watch::Sender<bool>,
     task: &mut tokio::task::JoinHandle<T>,
     bus_rx: &mut mpsc::Receiver<Event>,

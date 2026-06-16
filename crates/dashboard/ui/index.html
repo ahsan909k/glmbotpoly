@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="dark" />
+  <title>Polymarket Bot — Dashboard</title>
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot" id="conn-dot" title="WebSocket disconnected"></span>
+      <strong>Polymarket Bot</strong>
+    </div>
+    <div class="topbar-right">
+      <div class="seg" id="mode-toggle" role="tablist" aria-label="Trading mode">
+        <button class="seg-btn active" data-mode="paper">Paper</button>
+        <button class="seg-btn" data-mode="live">Live</button>
+      </div>
+      <button class="icon-btn" id="token-btn" title="Set access token">&#9881;</button>
+    </div>
+  </header>
+
+  <div class="banner hidden" id="auth-banner">
+    <span>Access token required.</span>
+    <input type="password" id="token-input" placeholder="paste token" autocomplete="off" />
+    <button id="token-save">Save</button>
+  </div>
+
+  <nav class="tabs">
+    <button class="tab active" data-view="overview">Overview</button>
+    <button class="tab" data-view="series">Series</button>
+    <button class="tab" data-view="live">Live</button>
+    <button class="tab" data-view="fills">Fills</button>
+    <button class="tab" data-view="risk">Risk</button>
+  </nav>
+
+  <main>
+    <!-- ===================== OVERVIEW ===================== -->
+    <section id="view-overview" class="view">
+      <div class="cards">
+        <div class="card badges-card">
+          <div class="badge" id="badge-paper"><span class="badge-dot"></span> PAPER <em id="badge-paper-state">—</em></div>
+          <div class="badge" id="badge-live"><span class="badge-dot"></span> LIVE <em id="badge-live-state">—</em></div>
+        </div>
+
+        <div class="card kill-card">
+          <div class="kill-banner hidden" id="kill-banner">TRADING HALTED — kill switch engaged</div>
+          <div class="kill-actions">
+            <button class="btn danger" id="kill-btn">KILL ALL</button>
+            <button class="btn warn" id="reset-btn">Reset</button>
+          </div>
+          <p class="hint">Kill cancels every open order and halts all trading (latched). Reset clears the latch.</p>
+        </div>
+      </div>
+
+      <div class="card chart-card">
+        <div class="card-head">
+          <h2>Equity — <span id="equity-mode">paper</span></h2>
+          <div class="chart-stat"><span id="equity-now">—</span></div>
+        </div>
+        <canvas id="equity-chart" height="180"></canvas>
+        <div class="chart-foot"><span id="equity-min">—</span><span id="equity-max">—</span></div>
+      </div>
+
+      <div class="card capital-card" id="capital-card">
+        <div class="card-head"><h2>Paper capital</h2></div>
+        <div class="capital-row">
+          <div class="kv"><label>Starting capital</label><span id="cap-start">—</span></div>
+          <div class="kv"><label>Current equity</label><span id="cap-equity">—</span></div>
+        </div>
+        <div class="capital-edit">
+          <input type="number" id="cap-input" step="100" min="0" inputmode="decimal" placeholder="set capital ($)" />
+          <button class="btn" id="cap-set">Set</button>
+          <button class="btn ghost" id="cap-plus">+$1k</button>
+          <button class="btn ghost" id="cap-minus">−$1k</button>
+        </div>
+        <div class="income">
+          <span>Fees paid <em id="inc-fees">—</em></span>
+          <span>Rebate accrued <em id="inc-reb-acc">—</em></span>
+          <span>Rebate credited <em id="inc-reb-cr">—</em></span>
+        </div>
+        <p class="hint hidden" id="capital-live-note"></p>
+      </div>
+
+      <div class="card control-card" id="control-card">
+        <div class="card-head"><h2>Control</h2></div>
+
+        <div class="control-block">
+          <div class="kv"><label>Live arming (§11)</label><span id="arming-state">—</span></div>
+          <div class="arming-gates" id="arming-gates"></div>
+          <div class="control-actions">
+            <button class="btn warn" id="arm-btn">Arm live…</button>
+            <button class="btn ghost" id="disarm-btn">Disarm</button>
+            <button class="btn ghost" id="reset-daily-btn">Reset daily stop</button>
+          </div>
+          <p class="hint">Arming needs all three §11 gates: config flag, the env confirmation phrase, and this multi-step session action.</p>
+        </div>
+
+        <div class="control-block">
+          <label class="control-label">Series (disabled series stop quoting)</label>
+          <div class="series-toggles" id="series-toggles"></div>
+        </div>
+
+        <div class="control-block">
+          <label class="control-label">Tune a safe-listed parameter (spreads / buffers / budgets)</label>
+          <div class="param-edit">
+            <input id="param-series" placeholder="series (blank = all)" />
+            <input id="param-key" placeholder="param (e.g. min_edge)" />
+            <input id="param-value" placeholder="value (e.g. 0.02)" />
+            <button class="btn" id="param-set">Set</button>
+          </div>
+          <div class="param-overrides" id="param-overrides"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== SERIES ===================== -->
+    <section id="view-series" class="view hidden">
+      <div class="series-controls">
+        <div class="seg" id="window-toggle" aria-label="Time window">
+          <button class="seg-btn" data-window="today">Today</button>
+          <button class="seg-btn" data-window="7d">7d</button>
+          <button class="seg-btn active" data-window="all">All</button>
+        </div>
+        <span class="series-note">Pick the best 2–3 series. Tap a column header to sort; tap its name for an explanation.</span>
+      </div>
+      <div class="table-wrap">
+        <table id="series-table">
+          <thead><tr id="series-head"></tr></thead>
+          <tbody id="series-body"></tbody>
+        </table>
+        <p class="empty hidden" id="series-empty">No traded series in this window yet.</p>
+      </div>
+    </section>
+
+    <!-- ===================== LIVE WINDOW ===================== -->
+    <section id="view-live" class="view hidden">
+      <div class="chips" id="window-chips"></div>
+      <p class="empty" id="live-empty">No active windows yet — waiting for the scheduler.</p>
+      <div class="card hidden" id="live-card">
+        <div class="card-head">
+          <h2 id="live-title">—</h2>
+          <a class="live-link" id="live-link" target="_blank" rel="noopener">event ↗</a>
+        </div>
+
+        <div class="countdown">
+          <div class="countbar" id="countbar">
+            <div class="countfill" id="count-fill"></div>
+            <span class="gate gate-late" id="gate-late" title="late-window taker eligible"></span>
+            <span class="gate gate-atm" id="gate-atm" title="no new at-the-money quotes"></span>
+            <span class="gate gate-passive" id="gate-passive" title="cancel-all; no passive orders"></span>
+          </div>
+          <div class="count-row">
+            <span id="count-label">—</span>
+            <span class="count-gates" id="count-gates"></span>
+          </div>
+        </div>
+
+        <div class="fairmid" id="fair-mid"></div>
+
+        <div class="ladder">
+          <div class="lad-col">
+            <div class="lad-head">Up <span id="up-mid" class="lad-mid"></span></div>
+            <div id="ladder-up"></div>
+          </div>
+          <div class="lad-col">
+            <div class="lad-head">Down <span id="down-mid" class="lad-mid"></span></div>
+            <div id="ladder-down"></div>
+          </div>
+        </div>
+
+        <div class="inv-row" id="inv-row"></div>
+        <div class="prints-wrap">
+          <div class="prints-head">recent prints</div>
+          <div class="prints" id="prints"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== FILLS ===================== -->
+    <section id="view-fills" class="view hidden">
+      <div class="series-controls">
+        <select id="fills-series" class="select" aria-label="Filter by series">
+          <option value="">All series</option>
+          <option value="BTC-5m">BTC-5m</option>
+          <option value="BTC-15m">BTC-15m</option>
+          <option value="BTC-1h">BTC-1h</option>
+          <option value="ETH-5m">ETH-5m</option>
+          <option value="ETH-15m">ETH-15m</option>
+          <option value="ETH-1h">ETH-1h</option>
+        </select>
+        <span class="series-note">Colored by 5-second markout (green aged well, red picked off). Tags: maker / taker / late.</span>
+      </div>
+      <div class="table-wrap">
+        <table id="fills-table">
+          <thead><tr>
+            <th class="col-time">Time</th><th>Series</th><th>Side</th><th>Out</th>
+            <th>Price</th><th>Size</th><th>Tag</th><th>Fee</th><th>5s mk</th>
+          </tr></thead>
+          <tbody id="fills-body"></tbody>
+        </table>
+        <p class="empty hidden" id="fills-empty">No fills yet.</p>
+      </div>
+    </section>
+
+    <!-- ===================== RISK ===================== -->
+    <section id="view-risk" class="view hidden">
+      <div class="card">
+        <div class="card-head"><h2>Breakers</h2><span class="pill" id="risk-halt"></span></div>
+        <div class="chips" id="breaker-chips"></div>
+        <p class="hint" id="last-cancel"></p>
+        <div class="risk-stats" id="risk-stats"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>Connectivity &amp; health</h2>
+          <span class="badge" id="ws-badge"><span class="badge-dot"></span> user WS <em id="ws-state">—</em></span>
+        </div>
+        <div class="health-block">
+          <div class="health-label">Feeds</div>
+          <div id="feed-health" class="health-list"></div>
+        </div>
+        <div class="health-block">
+          <div class="health-label">Model</div>
+          <div id="model-health" class="health-list"></div>
+        </div>
+        <div class="health-block">
+          <div class="health-label">Books</div>
+          <div id="book-health" class="health-list"></div>
+        </div>
+      </div>
+
+      <div class="card kill-card">
+        <div class="kill-banner hidden" id="risk-kill-banner">TRADING HALTED — kill switch engaged</div>
+        <div class="kill-actions">
+          <button class="btn danger" id="risk-kill-btn">KILL ALL</button>
+          <button class="btn warn" id="risk-reset-btn">Reset / daily-stop</button>
+        </div>
+        <p class="hint">Kill cancels every open order and halts trading (latched). Reset clears every breaker, including the daily stop-loss.</p>
+      </div>
+    </section>
+  </main>
+
+  <!-- generic confirm modal -->
+  <div class="modal-overlay hidden" id="modal">
+    <div class="modal">
+      <p id="modal-text"></p>
+      <div class="modal-actions">
+        <button class="btn ghost" id="modal-cancel">Cancel</button>
+        <button class="btn danger" id="modal-ok">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- tooltip popover (tap-to-show on touch; hover via title on desktop) -->
+  <div class="tip hidden" id="tip"></div>
+
+  <div class="toast hidden" id="toast"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -10,5 +10,39 @@ description = "Axum REST + WebSocket dashboard served by the bot"
 workspace = true
 
 [dependencies]
+# §4: the dashboard depends on analytics + engine state, and reads the venue
+# snapshot types for its DTOs. Arrows point inward (no crate depends on `bot`);
+# venue-paper is a leaf adapter, so this edge is additive and acyclic.
 analytics = { path = "../analytics" }
 engine = { path = "../engine" }
+core-types = { path = "../core-types" }
+venue-api = { path = "../venue-api" }
+venue-paper = { path = "../venue-paper" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+rust_decimal = { workspace = true }
+# rt/sync for the broadcast channel, net for the TcpListener `serve` binds,
+# macros for `select!` in the WebSocket connection task.
+tokio = { workspace = true, features = ["rt", "sync", "net", "macros"] }
+axum = { workspace = true }
+
+[dev-dependencies]
+# Endpoint contract tests drive the router with `ServiceExt::oneshot`; the WS
+# stream test boots a real `axum::serve` on an ephemeral `127.0.0.1:0` listener
+# (needs `net`) and connects a `tokio-tungstenite` client. `test-util` gives the
+# paused clock.
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "time", "sync", "test-util"] }
+axum = { workspace = true }
+tower = { workspace = true }
+http-body-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+serde_json = { workspace = true }
+core-types = { path = "../core-types" }
+venue-api = { path = "../venue-api" }
+venue-paper = { path = "../venue-paper" }
+engine = { path = "../engine" }
+rust_decimal = { workspace = true }

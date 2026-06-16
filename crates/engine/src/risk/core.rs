@@ -180,6 +180,25 @@ impl RiskCore {
         self.open_notional
     }
 
+    /// Prunes settled per-window loss books (and their cached condition ids)
+    /// older than `cutoff`, bounding memory for 24/7 operation. Active windows
+    /// are retained regardless of cutoff (their cid is kept so a window-loss can
+    /// still `cancel_market`). Returns the number of windows dropped.
+    pub(crate) fn prune_settled_before(&mut self, cutoff: TimestampMs) -> usize {
+        // Drop cached cids only for windows that are BOTH old and settled —
+        // never an active long window whose open is already past the cutoff.
+        let old_settled: Vec<WindowId> = self
+            .window_cids
+            .keys()
+            .copied()
+            .filter(|w| w.open_time.as_millis() < cutoff.as_millis() && self.inv.is_settled(*w))
+            .collect();
+        for w in &old_settled {
+            self.window_cids.remove(w);
+        }
+        self.inv.prune_settled_before(cutoff)
+    }
+
     pub(crate) fn snapshot(&self) -> RiskStateSnapshot {
         RiskStateSnapshot {
             tripped: self.tripped.iter().copied().collect(),
@@ -349,6 +368,12 @@ impl RiskCore {
                 self.manual_latched = false;
                 self.daily_stop_latched = false;
                 self.clear_global(BreakerKind::Manual, &mut out);
+                self.clear_global(BreakerKind::DailyStop, &mut out);
+            }
+            Event::Control(core_types::ControlEvent::DailyStopReset) => {
+                // Targeted reset: clears the daily stop only, leaving an
+                // unrelated manual halt latched (its counterpart to `Reset`).
+                self.daily_stop_latched = false;
                 self.clear_global(BreakerKind::DailyStop, &mut out);
             }
             // Bus `Fill`/`OrderUpdate` are for other consumers; our inventory and
@@ -990,6 +1015,41 @@ mod tests {
         let out = c.on_event(&Event::Control(ControlEvent::Reset), ts(CLOSE_MS + 1000));
         assert!(cleared_in(&out).contains(&BreakerKind::DailyStop));
         assert!(!c.is_globally_halted());
+    }
+
+    #[test]
+    fn daily_stop_reset_clears_only_daily_stop_leaving_manual() {
+        let mut caps = HashMap::new();
+        caps.insert(series(), Dollars::new(Decimal::from(25)));
+        let params = RiskParams {
+            daily_stop_loss: Dollars::new(Decimal::from(5)),
+            ..RiskParams::default()
+        };
+        let mut c = RiskCore::new(&params, caps);
+        open_window(&mut c);
+        // Trip both a manual kill and the daily stop.
+        let _ = c.on_event(&Event::Control(ControlEvent::Kill), ts(OPEN_MS));
+        let _ = c.on_venue_event(
+            &fill(Outcome::Up, Side::Buy, dec!(0.40), dec!(50)),
+            ts(OPEN_MS),
+        );
+        let _ = c.on_event(
+            &win_event(WindowLifecycle::Resolved {
+                outcome: Outcome::Down,
+            }),
+            ts(CLOSE_MS),
+        );
+        assert!(c.snapshot().is_tripped(BreakerKind::DailyStop));
+        assert!(c.snapshot().is_tripped(BreakerKind::Manual));
+        // The targeted reset clears DailyStop only; Manual stays latched.
+        let out = c.on_event(
+            &Event::Control(ControlEvent::DailyStopReset),
+            ts(CLOSE_MS + 1),
+        );
+        assert_eq!(cleared_in(&out), vec![BreakerKind::DailyStop]);
+        assert!(!c.snapshot().is_tripped(BreakerKind::DailyStop));
+        assert!(c.snapshot().is_tripped(BreakerKind::Manual));
+        assert!(c.is_globally_halted(), "manual kill still halts");
     }
 
     // ---- sanity (fair vs mid) ----------------------------------------------

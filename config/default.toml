@@ -142,6 +142,22 @@ sanity_bound_duration_ms = 3000  # ...for this long
 error_breaker_max_errors = 10    # API errors...
 error_breaker_window_ms = 60000  # ...within this window trip the breaker
 
+# Main run mode (`bot run`, CLAUDE.md §5): supervision tree + resilient startup
+# self-check. The bot refuses to TRADE until clocks are sane, discovery has
+# current windows, and feeds are healthy — but stays up retrying (it never exits
+# on a slow/failed self-check), auto-arming once healthy.
+[run]
+require_clock_check = true          # gate trading on the §11 clock-skew monitor's verdict
+require_discovery_check = true      # gate trading on a current window for every enabled series
+clock_check_grace_ms = 15000        # wait this long for the skew monitor's startup burst to conclude
+readiness_timeout_ms = 120000       # warn loudly (and keep waiting) if not armed within this
+supervision_initial_backoff_ms = 1000   # a crashed task waits this before its first restart...
+supervision_max_backoff_ms = 30000      # ...doubling up to this cap
+supervision_backoff_multiplier = 2.0
+stable_secs = 60                    # a task healthy this long before dying resets its backoff
+rss_report_secs = 60                # RSS + per-window count report + settled-inventory prune cadence
+risk_tick_ms = 500                  # §11 risk on_tick cadence (staleness/sanity recompute + converge)
+
 # Paper trading (CLAUDE.md §9) — real market data, simulated money.
 [paper]
 starting_capital = 10000         # runtime-adjustable from the dashboard

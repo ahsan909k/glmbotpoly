@@ -9,6 +9,13 @@ description = "Orchestrator binary: wires all subsystems, supervision, control p
 [lints]
 workspace = true
 
+[features]
+# Deterministic, paper-only §11 chaos suite. Feature-gates `tests/chaos.rs` so
+# the heavy fault-injection suite never burdens the default check/test loop
+# (CLAUDE.md §3 — feature-gate heavy optional parts). Adds no code and no
+# dependencies to production builds; run it with `just chaos`.
+chaos = []
+
 [dependencies]
 core-types = { path = "../core-types" }
 config = { path = "../config" }
@@ -29,6 +36,8 @@ analytics = { path = "../analytics" }
 dashboard = { path = "../dashboard" }
 anyhow = { workspace = true }
 rust_decimal = { workspace = true }
+# `bot control` is an HTTP client to the running dashboard's control API.
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

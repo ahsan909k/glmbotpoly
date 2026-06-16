@@ -25,9 +25,9 @@ pub mod time;
 
 pub use book::{BookLevel, BookSnapshot, TopOfBook};
 pub use event::{
-    BookHealth, BookUnreliableReason, BreakerKind, ControlEvent, Event, FeedHealth,
-    MarketLifecycleEvent, ModelHealthEvent, PriceSource, PriceTick, RiskEvent, TickKind,
-    WindowLifecycle,
+    BookHealth, BookUnreliableReason, BreakerKind, CommandOrigin, ControlAudit, ControlEvent,
+    Event, FeedHealth, MarketLifecycleEvent, ModelHealthEvent, PriceSource, PriceTick, RiskEvent,
+    TickKind, WindowLifecycle,
 };
 pub use ids::{ConditionId, IdError, OrderId, TokenId};
 pub use inventory::{InventorySnapshot, SettlementSummary, SideInventory};

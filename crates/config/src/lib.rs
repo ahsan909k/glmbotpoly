@@ -1,7 +1,7 @@
 //! The layered configuration for the bot (CLAUDE.md §4): file defaults overridden
 //! by an optional local file, overridden by environment variables, parsed
 //! into typed per-subsystem structs so each crate receives only the settings
-//! it owns.
+//! it owns. (Runtime safe-list for the control plane lives in `sections::engine`.)
 //!
 //! - **Layering & loading:** [`load()`] — see `load.rs` for the precedence
 //!   rules (code defaults → `default.toml` → `bot.local.toml` → `BOT_*` env).
@@ -32,7 +32,10 @@ pub use crate::secrets::{
 pub use crate::sections::clock::ClockConfig;
 pub use crate::sections::dashboard::DashboardConfig;
 pub use crate::sections::discovery::{DiscoveryConfig, SeriesSlugs};
-pub use crate::sections::engine::{EngineConfig, EngineParams, EngineParamsPatch, SeriesOverride};
+pub use crate::sections::engine::{
+    EngineConfig, EngineParams, EngineParamsPatch, ParsedParamChange, SAFE_PARAM_KEYS,
+    SeriesOverride, validate_param_change,
+};
 pub use crate::sections::feeds::FeedsConfig;
 pub use crate::sections::journal::JournalConfig;
 pub use crate::sections::latency::LatencyHarnessConfig;
@@ -40,6 +43,7 @@ pub use crate::sections::live::{LIVE_CONFIRM_PHRASE, LiveArming, LiveConfig};
 pub use crate::sections::log::{LogConfig, LogRotation};
 pub use crate::sections::paper::{LatencyConfig, PaperConfig};
 pub use crate::sections::risk::RiskConfig;
+pub use crate::sections::run::RunConfig;
 pub use crate::sections::scheduler::SchedulerConfig;
 pub use crate::validate::validate;
 
@@ -68,6 +72,8 @@ pub struct AppConfig {
     pub engine: EngineConfig,
     /// Global risk-manager limits.
     pub risk: RiskConfig,
+    /// Main run-mode (`bot run`) supervision + startup self-check policy.
+    pub run: RunConfig,
     /// Paper venue settings (starting capital, simulated latencies, fees).
     pub paper: PaperConfig,
     /// Live-arming gate 1 (defaults disarmed).

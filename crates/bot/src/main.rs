@@ -16,18 +16,25 @@
 
 mod boot;
 mod compare;
+mod control;
+mod control_cli;
+mod dashboard;
 mod discover;
 mod fair;
 mod feed;
 mod ladder;
 mod latency;
 mod live;
+mod model_runtime;
 mod paper;
 mod record;
+mod run;
 mod schedule;
 mod telemetry;
 mod timecfg;
 mod vol;
+
+// Test-exe hash remint marker (Windows App Control 4551 workaround; harmless).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -36,16 +43,27 @@ use anyhow::{Context, bail};
 use config::{LiveArming, Secrets};
 use core_types::Series;
 
+use crate::control_cli::ControlSub;
 use crate::feed::FeedSource;
 
-const USAGE: &str = "usage: bot [paper|paper-sim|live|venue-check|check-config|discover|schedule|feed|\
-                     compare|vol|ladder|fair|record|latency] [--config-dir <path>] [--label <name>] \
-                     [--out <file>] [--raw <file>] [--source rtds|binance] [--series <KEY>] \
-                     [--depth <N>] [--recycle-after <secs>] [--out-dir <dir>]";
+const USAGE: &str = "usage: bot [run|paper|paper-sim|live|venue-check|check-config|discover|schedule|feed|\
+                     compare|vol|ladder|fair|record|latency|dashboard|control] [--config-dir <path>] \
+                     [--label <name>] [--out <file>] [--raw <file>] [--source rtds|binance] \
+                     [--series <KEY>] [--depth <N>] [--recycle-after <secs>] [--out-dir <dir>] \
+                     [--with-model]\n\
+                     \n  control <status|kill|reset|reset-daily-stop|set-capital AMT|adjust-capital DELTA|\
+                     enable-series KEY|disable-series KEY|set-param KEY VAL [--series KEY]|\
+                     arm-live|confirm-arm PHRASE|disarm>  (HTTP client to the running dashboard)";
 
 /// What the operator asked the binary to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
+    /// The main run mode (§5): start paper trading on all enabled series (or
+    /// `--series`) concurrently under a supervision tree — feeds, scheduler,
+    /// model, the risk-managed engine, the paper venue, journal, analytics, and
+    /// the dashboard — with a resilient startup self-check and graceful
+    /// shutdown. Real data, paper money. Runs until ctrl-c / SIGTERM.
+    Run,
     /// Paper trading (default): real market data, simulated money.
     Paper,
     /// Live read-only paper-trading smoke run for one series' current window
@@ -100,6 +118,15 @@ enum Command {
     /// Latency benchmark against live endpoints; writes a JSON report
     /// (`--label` names the host/region, `--out` overrides the report path).
     Latency,
+    /// Serve the dashboard (§10) over a live paper pipeline: scheduler +
+    /// feed-clob + the paper venue across all enabled series (or `--series`),
+    /// with REST + WebSocket on `config.dashboard.bind`. Real data, paper money.
+    /// Runs until ctrl-c.
+    Dashboard,
+    /// Send a control-plane command to the running bot's dashboard control API
+    /// (§10.6/§11): an HTTP client that POSTs/GETs `/api/control/*` and prints
+    /// the JSON acknowledgment (the resulting state).
+    Control(ControlSub),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -122,6 +149,8 @@ struct Cli {
     recycle_after: Option<u64>,
     /// Output directory for `record` journal segments (default `data/journal`).
     out_dir: Option<PathBuf>,
+    /// Wire the fair-value model into `dashboard` (fair-vs-mid + live markout).
+    with_model: bool,
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
@@ -135,16 +164,18 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
     let mut depth = None;
     let mut recycle_after = None;
     let mut out_dir = None;
+    let mut with_model = false;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "paper" | "paper-sim" | "live" | "venue-check" | "check-config" | "discover"
-            | "schedule" | "feed" | "compare" | "vol" | "ladder" | "fair" | "record"
-            | "latency" => {
+            "run" | "paper" | "paper-sim" | "live" | "venue-check" | "check-config"
+            | "discover" | "schedule" | "feed" | "compare" | "vol" | "ladder" | "fair"
+            | "record" | "latency" | "dashboard" => {
                 if command.is_some() {
                     return Err(format!("more than one subcommand given (second: {arg:?})"));
                 }
                 command = Some(match arg.as_str() {
+                    "run" => Command::Run,
                     "paper" => Command::Paper,
                     "paper-sim" => Command::PaperSim,
                     "live" => Command::Live,
@@ -158,8 +189,15 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
                     "fair" => Command::Fair,
                     "record" => Command::Record,
                     "latency" => Command::Latency,
+                    "dashboard" => Command::Dashboard,
                     _ => Command::CheckConfig,
                 });
+            }
+            "control" => {
+                if command.is_some() {
+                    return Err(format!("more than one subcommand given (second: {arg:?})"));
+                }
+                command = Some(Command::Control(parse_control_sub(&mut args)?));
             }
             "--config-dir" => {
                 let value = args
@@ -215,6 +253,9 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
                     .ok_or_else(|| "--out-dir requires a value".to_owned())?;
                 out_dir = Some(PathBuf::from(value));
             }
+            "--with-model" => {
+                with_model = true;
+            }
             other => {
                 if let Some(value) = other.strip_prefix("--config-dir=") {
                     config_dir = Some(PathBuf::from(value));
@@ -255,9 +296,12 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
         && command != Command::Fair
         && command != Command::PaperSim
         && command != Command::Record
+        && command != Command::Dashboard
+        && command != Command::Run
     {
         return Err(
-            "--series only applies to the ladder, fair, paper-sim, and record subcommands"
+            "--series only applies to the run, ladder, fair, paper-sim, record, and dashboard \
+             subcommands"
                 .to_owned(),
         );
     }
@@ -266,6 +310,9 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
     }
     if out_dir.is_some() && command != Command::Record {
         return Err("--out-dir only applies to the record subcommand".to_owned());
+    }
+    if with_model && command != Command::Dashboard {
+        return Err("--with-model only applies to the dashboard subcommand".to_owned());
     }
     Ok(Cli {
         command,
@@ -278,6 +325,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
         depth,
         recycle_after,
         out_dir,
+        with_model,
     })
 }
 
@@ -298,6 +346,60 @@ fn parse_secs(value: &str) -> Result<u64, String> {
     value
         .parse::<u64>()
         .map_err(|_| format!("--recycle-after must be a number of seconds, got {value:?}"))
+}
+
+/// Parses a `bot control <sub> [args]` into a [`ControlSub`], consuming only the
+/// tokens it needs (a fixed number of positionals, plus an optional `--series`
+/// for `set-param`) so any remaining global flags flow back to the main parser.
+fn parse_control_sub<I: Iterator<Item = String>>(
+    args: &mut std::iter::Peekable<I>,
+) -> Result<ControlSub, String> {
+    let sub = args.next().ok_or_else(|| {
+        "control requires a subcommand (status|kill|reset|reset-daily-stop|set-capital|\
+         adjust-capital|enable-series|disable-series|set-param|arm-live|confirm-arm|disarm)"
+            .to_owned()
+    })?;
+    let positional = |args: &mut std::iter::Peekable<I>, what: &str| -> Result<String, String> {
+        match args.next() {
+            Some(v) if !v.starts_with("--") => Ok(v),
+            Some(v) => Err(format!("control {sub} expected {what}, got flag {v:?}")),
+            None => Err(format!("control {sub} requires {what}")),
+        }
+    };
+    Ok(match sub.as_str() {
+        "status" => ControlSub::Status,
+        "kill" => ControlSub::Kill,
+        "reset" => ControlSub::Reset,
+        "reset-daily-stop" => ControlSub::ResetDailyStop,
+        "set-capital" => ControlSub::SetCapital(positional(args, "<amount>")?),
+        "adjust-capital" => ControlSub::AdjustCapital(positional(args, "<delta>")?),
+        "enable-series" => ControlSub::EnableSeries(positional(args, "<series-key>")?),
+        "disable-series" => ControlSub::DisableSeries(positional(args, "<series-key>")?),
+        "set-param" => {
+            let key = positional(args, "<key>")?;
+            let value = positional(args, "<value>")?;
+            let series = match args.peek().map(String::as_str) {
+                Some("--series") => {
+                    args.next();
+                    Some(
+                        args.next()
+                            .ok_or_else(|| "--series requires a value".to_owned())?,
+                    )
+                }
+                Some(s) if s.starts_with("--series=") => {
+                    let v = s["--series=".len()..].to_owned();
+                    args.next();
+                    Some(v)
+                }
+                _ => None,
+            };
+            ControlSub::SetParam { series, key, value }
+        }
+        "arm-live" => ControlSub::ArmLive,
+        "confirm-arm" => ControlSub::ConfirmArm(positional(args, "<phrase>")?),
+        "disarm" => ControlSub::Disarm,
+        other => return Err(format!("unknown control subcommand {other:?}")),
+    })
 }
 
 /// Config directory precedence: `--config-dir` flag > `BOT_CONFIG_DIR` env >
@@ -476,6 +578,32 @@ fn run() -> anyhow::Result<ExitCode> {
             paper::execute(&config, series)?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::Run => {
+            let _guard = telemetry::init(&config.log).context("initializing telemetry")?;
+            log_boot("run", &config_dir, &config, &secrets, arming, &rendered);
+            tracing::info!(
+                version = env!("CARGO_PKG_VERSION"),
+                config_dir = %config_dir.display(),
+                bind = %config.dashboard.bind,
+                series = cli.series.map(|s| s.key()),
+                "main run mode (real data, paper money)"
+            );
+            run::execute(&config, &secrets, cli.series)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Dashboard => {
+            let _guard = telemetry::init(&config.log).context("initializing telemetry")?;
+            tracing::info!(
+                version = env!("CARGO_PKG_VERSION"),
+                config_dir = %config_dir.display(),
+                bind = %config.dashboard.bind,
+                series = cli.series.map(|s| s.key()),
+                with_model = cli.with_model,
+                "dashboard run (real data, paper money)"
+            );
+            dashboard::execute(&config, &secrets, cli.series, cli.with_model)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Latency => {
             let _guard = telemetry::init(&config.log).context("initializing telemetry")?;
             tracing::info!(
@@ -528,6 +656,12 @@ fn run() -> anyhow::Result<ExitCode> {
                      is a later task)"
                 ),
             }
+        }
+        Command::Control(sub) => {
+            // A CLI HTTP client to the running dashboard's control API. No
+            // telemetry — the JSON ack is printed to stdout.
+            control_cli::execute(&config, &secrets, sub)?;
+            Ok(ExitCode::SUCCESS)
         }
     }
 }
@@ -857,6 +991,87 @@ mod tests {
     }
 
     #[test]
+    fn parses_dashboard_flags() {
+        use core_types::{Asset, WindowDuration};
+
+        // Bare dashboard: all enabled series at dispatch (series None here).
+        let cli = parse(&["dashboard"]).unwrap();
+        assert_eq!(cli.command, Command::Dashboard);
+        assert_eq!(cli.series, None);
+        assert!(!cli.with_model);
+
+        // --with-model opts the model in; it is dashboard-only.
+        let cli = parse(&["dashboard", "--with-model"]).unwrap();
+        assert_eq!(cli.command, Command::Dashboard);
+        assert!(cli.with_model);
+        let cli = parse(&["dashboard", "--with-model", "--series", "BTC-5m"]).unwrap();
+        assert!(cli.with_model);
+        assert!(parse(&["paper-sim", "--with-model"]).is_err());
+        assert!(parse(&["--with-model"]).is_err());
+
+        // --series (shared with ladder/fair/paper-sim/record) scopes it, both forms.
+        let cli = parse(&["dashboard", "--series", "ETH-15m"]).unwrap();
+        assert_eq!(
+            cli.series,
+            Some(Series {
+                asset: Asset::Eth,
+                duration: WindowDuration::M15,
+            })
+        );
+        assert_eq!(
+            parse(&["dashboard", "--series=BTC-1h"]).unwrap().command,
+            Command::Dashboard
+        );
+        let cli = parse(&["dashboard", "--config-dir", "cfg"]).unwrap();
+        assert_eq!(cli.config_dir, Some(PathBuf::from("cfg")));
+
+        // Other subcommands' flags don't apply; can't combine with a mode.
+        assert!(parse(&["dashboard", "--depth", "8"]).is_err());
+        assert!(parse(&["dashboard", "--raw", "x.jsonl"]).is_err());
+        assert!(parse(&["dashboard", "--source", "rtds"]).is_err());
+        assert!(parse(&["dashboard", "--label", "x"]).is_err());
+        assert!(parse(&["dashboard", "--out-dir", "x"]).is_err());
+        assert!(parse(&["dashboard", "--series", "DOGE-5m"]).is_err());
+        assert!(parse(&["dashboard", "paper"]).is_err());
+    }
+
+    #[test]
+    fn parses_run_flags() {
+        use core_types::{Asset, WindowDuration};
+
+        // Bare run: all enabled series at dispatch (series None here).
+        let cli = parse(&["run"]).unwrap();
+        assert_eq!(cli.command, Command::Run);
+        assert_eq!(cli.series, None);
+
+        // --series (shared with ladder/fair/paper-sim/record/dashboard) scopes it.
+        let cli = parse(&["run", "--series", "ETH-15m"]).unwrap();
+        assert_eq!(
+            cli.series,
+            Some(Series {
+                asset: Asset::Eth,
+                duration: WindowDuration::M15,
+            })
+        );
+        assert_eq!(
+            parse(&["run", "--series=BTC-1h"]).unwrap().command,
+            Command::Run
+        );
+        let cli = parse(&["run", "--config-dir", "cfg"]).unwrap();
+        assert_eq!(cli.config_dir, Some(PathBuf::from("cfg")));
+
+        // Other subcommands' flags don't apply; can't combine with a mode.
+        assert!(parse(&["run", "--with-model"]).is_err());
+        assert!(parse(&["run", "--depth", "8"]).is_err());
+        assert!(parse(&["run", "--raw", "x.jsonl"]).is_err());
+        assert!(parse(&["run", "--source", "rtds"]).is_err());
+        assert!(parse(&["run", "--label", "x"]).is_err());
+        assert!(parse(&["run", "--out-dir", "x"]).is_err());
+        assert!(parse(&["run", "--series", "DOGE-5m"]).is_err());
+        assert!(parse(&["run", "paper"]).is_err());
+    }
+
+    #[test]
     fn parses_latency_flags_both_forms() {
         let cli = parse(&["latency", "--label", "eu-west-2", "--out", "r.json"]).unwrap();
         assert_eq!(cli.command, Command::Latency);
@@ -909,5 +1124,107 @@ mod tests {
         assert!(parse(&["paper", "live"]).is_err());
         assert!(parse(&["--config-dir"]).is_err());
         assert!(parse(&["--unknown-flag"]).is_err());
+    }
+
+    #[test]
+    fn parses_control_subcommands() {
+        assert_eq!(
+            parse(&["control", "kill"]).unwrap().command,
+            Command::Control(ControlSub::Kill)
+        );
+        assert_eq!(
+            parse(&["control", "status"]).unwrap().command,
+            Command::Control(ControlSub::Status)
+        );
+        assert_eq!(
+            parse(&["control", "reset-daily-stop"]).unwrap().command,
+            Command::Control(ControlSub::ResetDailyStop)
+        );
+        assert_eq!(
+            parse(&["control", "set-capital", "12000"]).unwrap().command,
+            Command::Control(ControlSub::SetCapital("12000".to_owned()))
+        );
+        assert_eq!(
+            parse(&["control", "enable-series", "BTC-5m"])
+                .unwrap()
+                .command,
+            Command::Control(ControlSub::EnableSeries("BTC-5m".to_owned()))
+        );
+        // set-param with the optional --series, both forms.
+        assert_eq!(
+            parse(&[
+                "control",
+                "set-param",
+                "min_edge",
+                "0.02",
+                "--series",
+                "BTC-5m"
+            ])
+            .unwrap()
+            .command,
+            Command::Control(ControlSub::SetParam {
+                series: Some("BTC-5m".to_owned()),
+                key: "min_edge".to_owned(),
+                value: "0.02".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(&[
+                "control",
+                "set-param",
+                "min_edge",
+                "0.02",
+                "--series=ETH-1h"
+            ])
+            .unwrap()
+            .command,
+            Command::Control(ControlSub::SetParam {
+                series: Some("ETH-1h".to_owned()),
+                key: "min_edge".to_owned(),
+                value: "0.02".to_owned(),
+            })
+        );
+        // set-param without --series is a global override.
+        assert_eq!(
+            parse(&["control", "set-param", "min_edge", "0.02"])
+                .unwrap()
+                .command,
+            Command::Control(ControlSub::SetParam {
+                series: None,
+                key: "min_edge".to_owned(),
+                value: "0.02".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(&["control", "confirm-arm", "the-phrase"])
+                .unwrap()
+                .command,
+            Command::Control(ControlSub::ConfirmArm("the-phrase".to_owned()))
+        );
+        // A global flag after the control subcommand still parses.
+        let cli = parse(&["control", "kill", "--config-dir", "cfg"]).unwrap();
+        assert_eq!(cli.command, Command::Control(ControlSub::Kill));
+        assert_eq!(cli.config_dir, Some(PathBuf::from("cfg")));
+    }
+
+    #[test]
+    fn rejects_bad_control_args() {
+        assert!(parse(&["control"]).is_err(), "missing subcommand");
+        assert!(
+            parse(&["control", "nonsense"]).is_err(),
+            "unknown subcommand"
+        );
+        assert!(
+            parse(&["control", "set-capital"]).is_err(),
+            "missing positional"
+        );
+        assert!(
+            parse(&["control", "set-capital", "--series"]).is_err(),
+            "flag where a positional is required"
+        );
+        assert!(
+            parse(&["control", "kill", "kill"]).is_err(),
+            "stray trailing positional is an unrecognized argument"
+        );
     }
 }

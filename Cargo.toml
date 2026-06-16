@@ -117,3 +117,15 @@ flate2 = { version = "1.0", default-features = false, features = ["rust_backend"
 # build — the documented Windows 4551 trigger; irrelevant on Linux). No openssl,
 # no system lib. Used only by the `journal` crate (the queryable structured index).
 rusqlite = { version = "0.37", default-features = false, features = ["bundled"] }
+# §3 allowlist "axum + tower". The dashboard HTTP/WS server (CLAUDE.md §10),
+# served by the bot. Plain HTTP behind the VPS — NO TLS here (rustls stays
+# confined to the feed/venue crates; axum's serve stack is hyper/tower, no
+# openssl). default-features off to stay minimal: `ws` (WebSocket push), `json`
+# (Json extractor/response), `http1` + `tokio` (the serve stack), `query` (the
+# ?mode/?token query extractors). Decisions Log 2026-06-15. Used only by `dashboard`.
+axum = { version = "0.8", default-features = false, features = ["ws", "json", "http1", "tokio", "query"] }
+# §3 allowlist "axum + tower". `util` provides `ServiceExt::oneshot`, used by the
+# dashboard's endpoint contract tests (a dev-dep there). No openssl.
+tower = { version = "0.5", default-features = false, features = ["util"] }
+# Reads response bodies in the dashboard's oneshot endpoint tests (dev-dep only).
+http-body-util = { version = "0.1", default-features = false }

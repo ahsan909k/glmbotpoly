@@ -19,6 +19,7 @@ use core_types::{Decimal, Dollars, DurationMs, Price, Series, Size, TickSize, Wi
 use rust_decimal::dec;
 use serde::{Deserialize, Serialize};
 
+use crate::error::Violation;
 use crate::validate::Violations;
 
 /// Builds a [`Size`] from a non-negative integer literal (defaults only).
@@ -406,6 +407,240 @@ impl EngineParamsPatch {
     }
 }
 
+// ----------------------------------------------------------------------------
+// Runtime safe-list (control plane, §10.6/§11)
+// ----------------------------------------------------------------------------
+
+/// The [`EngineParams`] fields the control plane may adjust at runtime — the
+/// spreads, buffers, and budgets (CLAUDE.md "define the safe list in config").
+/// Every other field is **structural** ([`STRUCTURAL_PARAM_KEYS`]) and requires
+/// a restart: touch/ladder sizing changes the order structure, the final-seconds
+/// windows are window-length-coupled, the excess caps gate sizing, and
+/// `max_worst_case_loss_per_window` is the §8 risk limit — none safe to mutate
+/// under a live book without a clean restart.
+pub const SAFE_PARAM_KEYS: &[&str] = &[
+    "min_edge",
+    "k1_vol_multiplier",
+    "expected_hold_secs",
+    "gamma_inventory_skew",
+    "pair_cost_threshold",
+    "merge_min_pairs",
+    "reprice_threshold_theta",
+    "cancel_market_theta",
+    "ewma_half_life_secs",
+    "vol_floor_1s",
+    "vol_cap_1s",
+    "taker_momentum_buffer",
+    "late_certainty_threshold",
+    "late_taker_price_cap",
+    "taker_budget_per_window",
+    "taker_cooldown_ms",
+];
+
+/// The [`EngineParams`] fields that exist but require a restart to change. A
+/// `set-param` on one of these is rejected with a "requires a restart" message
+/// rather than silently ignored. Together with [`SAFE_PARAM_KEYS`] this covers
+/// every [`EngineParams`] field (pinned by a test).
+const STRUCTURAL_PARAM_KEYS: &[&str] = &[
+    "touch_size",
+    "ladder_levels",
+    "ladder_size_per_level",
+    "ladder_tick_offset",
+    "no_atm_final_secs",
+    "no_passive_final_secs",
+    "late_window_tau_secs",
+    "soft_cap_excess_shares",
+    "hard_cap_excess_shares",
+    "max_worst_case_loss_per_window",
+];
+
+/// A validated runtime parameter change: the safe-list `key` and the
+/// single-field [`EngineParamsPatch`] that applies it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedParamChange {
+    /// The safe-list field name that changed.
+    pub key: String,
+    /// The sparse patch carrying exactly that one field.
+    pub patch: EngineParamsPatch,
+}
+
+/// Validates a runtime parameter change against the safe-list and the §8 range
+/// rules, returning the typed single-field patch when it is accepted.
+///
+/// `base` is the series' current effective [`EngineParams`] (the resolved config
+/// plus any prior runtime overrides), `key`/`value` are the requested change as
+/// strings (the HTTP/CLI boundary), and `window` is the series' window length
+/// (some §8 rules are window-relative). The same [`EngineParams::validate_into`]
+/// rules the config loader runs are reused, so a runtime change can never push a
+/// series outside what a fresh config would accept.
+///
+/// # Errors
+/// A single [`Violation`] when the key is unknown, structural (requires a
+/// restart), the value does not parse into the field's type, or the resulting
+/// params would break a range or cross-field rule.
+pub fn validate_param_change(
+    base: &EngineParams,
+    key: &str,
+    value: &str,
+    window: WindowDuration,
+) -> Result<ParsedParamChange, Violation> {
+    let vkey = format!("param.{key}");
+    let reject = |message: String| Violation {
+        key: vkey.clone(),
+        message,
+    };
+
+    if !SAFE_PARAM_KEYS.contains(&key) {
+        let message = if STRUCTURAL_PARAM_KEYS.contains(&key) {
+            format!(
+                "`{key}` is a structural/risk parameter — it requires a restart, \
+                 not a runtime change"
+            )
+        } else {
+            format!("unknown engine parameter `{key}` — not in the runtime-tunable safe list")
+        };
+        return Err(reject(message));
+    }
+
+    let patch = parse_param_patch(key, value.trim()).map_err(reject)?;
+    let candidate = patch.apply(base);
+    if let Some(v) = introduced_violations(base, &candidate, window)
+        .into_iter()
+        .next()
+    {
+        return Err(v);
+    }
+    Ok(ParsedParamChange {
+        key: key.to_owned(),
+        patch,
+    })
+}
+
+/// Builds a single-field [`EngineParamsPatch`] from a safe-list `key` and a
+/// string `value`, parsing it into the field's type.
+fn parse_param_patch(key: &str, value: &str) -> Result<EngineParamsPatch, String> {
+    let base = EngineParamsPatch::default();
+    let patch = match key {
+        "min_edge" => EngineParamsPatch {
+            min_edge: Some(parse_decimal(value)?),
+            ..base
+        },
+        "k1_vol_multiplier" => EngineParamsPatch {
+            k1_vol_multiplier: Some(parse_f64(value)?),
+            ..base
+        },
+        "expected_hold_secs" => EngineParamsPatch {
+            expected_hold_secs: Some(parse_f64(value)?),
+            ..base
+        },
+        "gamma_inventory_skew" => EngineParamsPatch {
+            gamma_inventory_skew: Some(parse_f64(value)?),
+            ..base
+        },
+        "pair_cost_threshold" => EngineParamsPatch {
+            pair_cost_threshold: Some(parse_decimal(value)?),
+            ..base
+        },
+        "merge_min_pairs" => EngineParamsPatch {
+            merge_min_pairs: Some(parse_size(value)?),
+            ..base
+        },
+        "reprice_threshold_theta" => EngineParamsPatch {
+            reprice_threshold_theta: Some(parse_f64(value)?),
+            ..base
+        },
+        "cancel_market_theta" => EngineParamsPatch {
+            cancel_market_theta: Some(parse_f64(value)?),
+            ..base
+        },
+        "ewma_half_life_secs" => EngineParamsPatch {
+            ewma_half_life_secs: Some(parse_f64(value)?),
+            ..base
+        },
+        "vol_floor_1s" => EngineParamsPatch {
+            vol_floor_1s: Some(parse_f64(value)?),
+            ..base
+        },
+        "vol_cap_1s" => EngineParamsPatch {
+            vol_cap_1s: Some(parse_f64(value)?),
+            ..base
+        },
+        "taker_momentum_buffer" => EngineParamsPatch {
+            taker_momentum_buffer: Some(parse_decimal(value)?),
+            ..base
+        },
+        "late_certainty_threshold" => EngineParamsPatch {
+            late_certainty_threshold: Some(parse_f64(value)?),
+            ..base
+        },
+        "late_taker_price_cap" => EngineParamsPatch {
+            late_taker_price_cap: Some(parse_price(value)?),
+            ..base
+        },
+        "taker_budget_per_window" => EngineParamsPatch {
+            taker_budget_per_window: Some(parse_dollars(value)?),
+            ..base
+        },
+        "taker_cooldown_ms" => EngineParamsPatch {
+            taker_cooldown_ms: Some(parse_duration_ms(value)?),
+            ..base
+        },
+        // Unreachable: the caller gates on SAFE_PARAM_KEYS first.
+        other => return Err(format!("`{other}` is not a runtime-tunable parameter")),
+    };
+    Ok(patch)
+}
+
+fn parse_decimal(value: &str) -> Result<Decimal, String> {
+    value
+        .parse::<Decimal>()
+        .map_err(|e| format!("not a valid decimal number: {e}"))
+}
+
+fn parse_f64(value: &str) -> Result<f64, String> {
+    value
+        .parse::<f64>()
+        .map_err(|e| format!("not a valid number: {e}"))
+}
+
+fn parse_size(value: &str) -> Result<Size, String> {
+    Size::new(parse_decimal(value)?).map_err(|e| format!("invalid share count: {e}"))
+}
+
+fn parse_price(value: &str) -> Result<Price, String> {
+    Price::try_from(parse_decimal(value)?).map_err(|e| format!("invalid price: {e}"))
+}
+
+fn parse_dollars(value: &str) -> Result<Dollars, String> {
+    Ok(Dollars::new(parse_decimal(value)?))
+}
+
+fn parse_duration_ms(value: &str) -> Result<DurationMs, String> {
+    let ms: i64 = value
+        .parse()
+        .map_err(|e| format!("not a valid integer number of milliseconds: {e}"))?;
+    Ok(DurationMs::from_millis(ms))
+}
+
+/// The §8 violations a candidate introduces over `base` — i.e. those present
+/// after the change but not before — so a pre-existing (unrelated) violation in
+/// `base` is never attributed to this change.
+fn introduced_violations(
+    base: &EngineParams,
+    candidate: &EngineParams,
+    window: WindowDuration,
+) -> Vec<Violation> {
+    let before = collect_violations(base, window);
+    let after = collect_violations(candidate, window);
+    after.into_iter().filter(|v| !before.contains(v)).collect()
+}
+
+fn collect_violations(p: &EngineParams, window: WindowDuration) -> Vec<Violation> {
+    let mut v = Violations::default();
+    p.validate_into("param", window, &mut v);
+    v.into_result().err().unwrap_or_default()
+}
+
 /// One series' entry in the override table.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -647,5 +882,107 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.to_string().contains("XRP-5m"));
+    }
+
+    // ---- runtime safe-list (control plane) ---------------------------------
+
+    #[test]
+    fn safe_and_structural_keys_cover_every_params_field_exactly() {
+        // Anti-drift: every EngineParams field is in exactly one of the two
+        // lists, and the lists are disjoint — so a new field forces a decision.
+        let params_json = serde_json::to_value(EngineParams::default()).unwrap();
+        let mut all: Vec<String> = params_json.as_object().unwrap().keys().cloned().collect();
+        all.sort();
+        let mut listed: Vec<String> = SAFE_PARAM_KEYS
+            .iter()
+            .chain(STRUCTURAL_PARAM_KEYS.iter())
+            .map(|s| (*s).to_owned())
+            .collect();
+        listed.sort();
+        assert_eq!(all, listed, "safe ∪ structural must cover every field once");
+        for key in SAFE_PARAM_KEYS {
+            assert!(
+                !STRUCTURAL_PARAM_KEYS.contains(key),
+                "{key} cannot be both safe and structural"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_param_change_accepts_in_range() {
+        let base = EngineParams::default();
+        let change = validate_param_change(&base, "min_edge", "0.02", WindowDuration::M5).unwrap();
+        assert_eq!(change.key, "min_edge");
+        assert_eq!(change.patch.apply(&base).min_edge, dec!(0.02));
+        // A budget and a buffer too.
+        assert!(
+            validate_param_change(&base, "taker_budget_per_window", "25", WindowDuration::M5)
+                .is_ok()
+        );
+        assert!(
+            validate_param_change(&base, "taker_momentum_buffer", "0.01", WindowDuration::H1)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_param_change_rejects_out_of_range() {
+        let base = EngineParams::default();
+        // Below one tick.
+        let err =
+            validate_param_change(&base, "min_edge", "0.005", WindowDuration::M5).unwrap_err();
+        assert_eq!(err.key, "param.min_edge");
+        // A negative budget.
+        assert!(
+            validate_param_change(&base, "taker_budget_per_window", "-5", WindowDuration::M5)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_param_change_enforces_cross_field_rules() {
+        // Raising reprice above the existing cancel-market theta trips the
+        // cross-field rule, reported on the cancel_market_theta key (not the
+        // changed key) — the diff-against-base approach catches it.
+        let base = EngineParams::default(); // reprice 0.005, cancel 0.02
+        let err =
+            validate_param_change(&base, "reprice_threshold_theta", "0.05", WindowDuration::M5)
+                .unwrap_err();
+        assert_eq!(err.key, "param.cancel_market_theta");
+        assert!(err.message.contains("reprice_threshold_theta"));
+    }
+
+    #[test]
+    fn validate_param_change_rejects_structural_and_risk_keys() {
+        let base = EngineParams::default();
+        for key in [
+            "touch_size",
+            "no_passive_final_secs",
+            "max_worst_case_loss_per_window",
+        ] {
+            let err = validate_param_change(&base, key, "20", WindowDuration::M5).unwrap_err();
+            assert!(
+                err.message.contains("requires a restart"),
+                "{key}: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn validate_param_change_rejects_unknown_key_and_unparseable_value() {
+        let base = EngineParams::default();
+        let unknown =
+            validate_param_change(&base, "nonsense", "1", WindowDuration::M5).unwrap_err();
+        assert!(unknown.message.contains("unknown engine parameter"));
+
+        let bad = validate_param_change(&base, "min_edge", "not-a-number", WindowDuration::M5)
+            .unwrap_err();
+        assert_eq!(bad.key, "param.min_edge");
+        assert!(bad.message.contains("decimal"));
+
+        let bad_ms = validate_param_change(&base, "taker_cooldown_ms", "3.5", WindowDuration::M5)
+            .unwrap_err();
+        assert!(bad_ms.message.contains("milliseconds"));
     }
 }

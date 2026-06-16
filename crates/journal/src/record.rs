@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use core_types::{
-    BookHealth, BookSnapshot, ConditionId, ControlEvent, Event, FeedHealth, Fill,
+    BookHealth, BookSnapshot, ConditionId, ControlAudit, ControlEvent, Event, FeedHealth, Fill,
     InventorySnapshot, MarketInfo, ModelHealthEvent, ModelSnapshot, OrderUpdate, Price, PriceTick,
     RiskEvent, SettlementSummary, Side, Size, TickSize, TimestampMs, TokenId, TopOfBook,
     WindowLifecycle,
@@ -91,6 +91,9 @@ pub enum JournalRecord {
     Risk(RiskEvent),
     /// [`Event::Control`].
     Control(ControlEvent),
+    /// [`Event::ControlAudit`]. Boxed so the enum stays small (it carries
+    /// Strings); transparent to serde.
+    ControlAudit(Box<ControlAudit>),
 }
 
 impl JournalRecord {
@@ -141,6 +144,7 @@ impl JournalRecord {
             Event::Settlement(s) => Self::Settlement(Box::new((**s).clone())),
             Event::Risk(r) => Self::Risk(*r),
             Event::Control(c) => Self::Control(c.clone()),
+            Event::ControlAudit(a) => Self::ControlAudit(Box::new((**a).clone())),
         }
     }
 
@@ -193,6 +197,7 @@ impl JournalRecord {
             Self::Settlement(s) => Event::Settlement(Arc::new((**s).clone())),
             Self::Risk(r) => Event::Risk(*r),
             Self::Control(c) => Event::Control(c.clone()),
+            Self::ControlAudit(a) => Event::ControlAudit(Arc::new((**a).clone())),
         }
     }
 }
@@ -274,10 +279,10 @@ mod tests {
     fn sample_events() -> Vec<Event> {
         use core_types::{AnchorSource, InputAges};
         use core_types::{
-            BookSnapshot, BookUnreliableReason, BreakerKind, ControlEvent, FeedHealth, Fill,
-            InventorySnapshot, ModelHealth, ModelHealthEvent, ModelHealthReason, ModelSnapshot,
-            OrderUpdate, PriceSource, PriceTick, RiskEvent, SettlementSummary, SideInventory,
-            TickKind,
+            BookSnapshot, BookUnreliableReason, BreakerKind, CommandOrigin, ControlAudit,
+            ControlEvent, FeedHealth, Fill, InventorySnapshot, ModelHealth, ModelHealthEvent,
+            ModelHealthReason, ModelSnapshot, OrderUpdate, PriceSource, PriceTick, RiskEvent,
+            SettlementSummary, SideInventory, TickKind,
         };
 
         let order = OrderUpdate {
@@ -441,6 +446,23 @@ mod tests {
             }),
             Event::Control(ControlEvent::Kill),
             Event::Control(ControlEvent::Reset),
+            Event::Control(ControlEvent::DailyStopReset),
+            Event::ControlAudit(Arc::new(ControlAudit {
+                ts: ts(1_781_000_000_200),
+                origin: CommandOrigin::Cli,
+                kind: "set_param".to_owned(),
+                detail: "series=BTC-5m key=min_edge value=0.02".to_owned(),
+                accepted: true,
+                error: None,
+            })),
+            Event::ControlAudit(Arc::new(ControlAudit {
+                ts: ts(1_781_000_000_300),
+                origin: CommandOrigin::Dashboard,
+                kind: "set_param".to_owned(),
+                detail: "key=touch_size".to_owned(),
+                accepted: false,
+                error: Some("touch_size requires a restart".to_owned()),
+            })),
         ]
     }
 

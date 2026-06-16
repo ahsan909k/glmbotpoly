@@ -24,6 +24,18 @@ fmt:
 test:
     cargo test --workspace
 
+# Deterministic, paper-only §11 chaos suite (feature-gated; off by default so it
+# never burdens the day-to-day loop). Single-threaded for paused-clock + journal
+# temp-dir determinism. Injects each scripted fault — kill each WebSocket, stall
+# each feed, a matching-engine restart, a clock jump, a discovery failure at
+# rollover, a process restart mid-window — and asserts no orphan orders, the
+# right breaker trips with a journaled cause, halt/resume per the rules, and an
+# exact state rebuild from the journal. Acceptance: run it ~10x, 100% green.
+# Lint the gated code explicitly (the default `just lint` compiles it empty):
+#   cargo clippy -p bot --features chaos --all-targets -- -D warnings
+chaos:
+    cargo test -p bot --features chaos --test chaos -- --test-threads=1
+
 # Continuous check/clippy watcher (install: cargo install bacon)
 watch:
     bacon
@@ -103,6 +115,34 @@ fair series="BTC-5m":
 # — never filling more or sooner than the live book/prints shown alongside.
 paper-sim series="BTC-5m":
     cargo run -p bot -- paper-sim --series {{series}}
+
+# Serve the dashboard (CLAUDE.md §10) over a live paper pipeline (real data,
+# paper money; ctrl-c to stop). Wires the scheduler + feed-clob + the paper venue
+# across all enabled series into the axum REST + WebSocket dashboard, bound to
+# config.dashboard.bind (default 127.0.0.1:8080). The auth token comes from
+# BOT_SECRET_DASHBOARD_TOKEN (required for a non-loopback bind; optional on
+# loopback). Scope it to one series with series="BTC-5m". Probe it with:
+#   curl -s localhost:8080/health
+#   curl -s -H "Authorization: Bearer $BOT_SECRET_DASHBOARD_TOKEN" localhost:8080/api/overview
+#   curl -s -H "Authorization: Bearer $BOT_SECRET_DASHBOARD_TOKEN" "localhost:8080/api/series-comparison?mode=paper&window=all"
+# WebSocket (token via query): ws://localhost:8080/api/ws?token=$BOT_SECRET_DASHBOARD_TOKEN
+dashboard:
+    cargo run -p bot -- dashboard
+
+# THE MAIN RUN MODE (§5; real data, paper money; ctrl-c or SIGTERM to stop).
+# Starts paper trading on all enabled series at once under a supervision tree:
+# feeds + scheduler + the multi-asset model + the risk-managed engine (the real
+# quote manager + momentum/late takers behind the §11 breakers) + the paper venue
+# + journal + analytics + the dashboard, on config.dashboard.bind. Any crashed
+# task restarts with backoff while the rest keep running (a dead feed cancels-all
+# and gates orders until it recovers); a resilient startup self-check refuses to
+# trade until clocks are sane + discovery has windows + feeds are healthy, then
+# auto-arms ("ARMED" in the log). Scope to one series with series="BTC-5m".
+# Acceptance: a multi-hour session — six series rolling, dashboard live, the RSS
+# report (`resource report` log line) flat, clean shutdown leaving zero open
+# paper orders. On Linux, `kill -TERM <pid>` shuts down as cleanly as ctrl-c.
+run series="":
+    cargo run -p bot -- run {{ if series == "" { "" } else { "--series " + series } }}
 
 # Live journal capture (read-only; ctrl-c to stop). Wires the scheduler + all
 # three feeds onto the bus and records every event to gzip-compressed, rotated

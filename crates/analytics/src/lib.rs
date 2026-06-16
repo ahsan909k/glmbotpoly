@@ -43,7 +43,9 @@ pub use attribution::{WindowAttrib, WindowAttribution};
 pub use datekey::DayKey;
 pub use engine::{Analytics, AnalyticsEffect};
 pub use health::{AdverseSelectionMonitor, AdverseSelectionState, SeriesHealth};
-pub use markout::{FillMarkout, MarkoutEngine, MarkoutHorizon, MarkoutPoint, MarkoutSource};
+pub use markout::{
+    FillMarkout, MarkoutEngine, MarkoutHorizon, MarkoutPoint, MarkoutSource, fair_of, position_sign,
+};
 pub use params::{AdverseSelectionParams, AnalyticsParams};
 pub use rollup::{
     ComparisonWindow, DailyRollup, MARKOUT_BIN_COUNT, MARKOUT_BIN_EDGES, MarkoutDistribution,

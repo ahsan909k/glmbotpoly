@@ -97,6 +97,13 @@ impl RiskManager {
         self.core.snapshot()
     }
 
+    /// Prunes settled per-window loss accounting older than `cutoff`, bounding
+    /// memory for a 24/7 session (the orchestrator calls it periodically; active
+    /// windows are always retained). Returns the number of windows dropped.
+    pub fn prune_settled_before(&mut self, cutoff: TimestampMs) -> usize {
+        self.core.prune_settled_before(cutoff)
+    }
+
     /// Whether a global breaker currently halts all trading.
     #[must_use]
     pub fn is_halted(&self) -> bool {

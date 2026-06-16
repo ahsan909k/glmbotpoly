@@ -834,6 +834,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn audit_events_land_in_segments_and_index() {
+        use core_types::{CommandOrigin, ControlAudit};
+
+        let dir = std::env::temp_dir().join(format!("journal-test-audit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sqlite = dir.join("index.sqlite");
+        let (_at, now_fn) = clock();
+        let params = RecorderParams {
+            out_dir: dir.clone(),
+            sqlite_path: Some(sqlite.clone()),
+            ..RecorderParams::default()
+        };
+        let audit = |kind: &str, accepted: bool, origin| {
+            Event::ControlAudit(Arc::new(ControlAudit {
+                ts: TimestampMs::from_millis(BASE_MS),
+                origin,
+                kind: kind.to_owned(),
+                detail: format!("{kind} detail"),
+                accepted,
+                error: (!accepted).then(|| "rejected".to_owned()),
+            }))
+        };
+        let recorder = Recorder::spawn(params, now_fn).expect("spawn");
+        recorder.record(&tick(0)); // gzip only
+        recorder.record(&audit("kill", true, CommandOrigin::Dashboard));
+        recorder.record(&audit("set_param", false, CommandOrigin::Cli));
+        recorder.record(&audit("arm_live", true, CommandOrigin::Cli));
+        let stats = recorder.finish().expect("finish");
+        assert_eq!(stats.records, 4, "all four in the gzip log");
+        assert_eq!(stats.indexed, 3, "the three audit records indexed");
+
+        // record → replay → query: every audited command is in the trail.
+        let replayed: Vec<Event> = ReplayReader::open(&dir)
+            .expect("open replay")
+            .events()
+            .map(|r| r.expect("event"))
+            .collect();
+        assert_eq!(replayed.len(), 4);
+
+        let reader = JournalIndexReader::open(&sqlite).expect("open index");
+        let rows = reader.command_audit().expect("query audit");
+        assert_eq!(rows.len(), 3, "one audit row per command, accepted or not");
+        assert_eq!(rows[0].kind, "kill");
+        assert_eq!(rows[0].origin, CommandOrigin::Dashboard);
+        assert!(rows[0].accepted);
+        assert_eq!(rows[1].kind, "set_param");
+        assert_eq!(rows[1].origin, CommandOrigin::Cli);
+        assert!(!rows[1].accepted);
+        assert_eq!(rows[2].kind, "arm_live");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---- write-crash-reopen ---------------------------------------------
 
     #[test]

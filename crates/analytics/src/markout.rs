@@ -267,8 +267,12 @@ impl MarkoutEngine {
     }
 }
 
-/// Model fair of one outcome from `p_up`.
-fn fair_of(outcome: Outcome, fair_up: f64) -> f64 {
+/// Model fair of one outcome from `p_up`: `p_up` for Up, `1 − p_up` for Down.
+///
+/// Shared with the dashboard's live 5s-markout tracker so the two compute an
+/// identical fair value; only the *policy* differs (the live tracker measures a
+/// single 5s horizon and never clamps to a settled outcome).
+pub fn fair_of(outcome: Outcome, fair_up: f64) -> f64 {
     match outcome {
         Outcome::Up => fair_up,
         Outcome::Down => 1.0 - fair_up,
@@ -280,8 +284,9 @@ fn terminal_fair(outcome: Outcome, winner: Outcome) -> f64 {
     if outcome == winner { 1.0 } else { 0.0 }
 }
 
-/// Position orientation: +1 for a long (BUY), −1 for a short (SELL).
-fn position_sign(side: Side) -> f64 {
+/// Position orientation: +1 for a long (BUY), −1 for a short (SELL). Shared with
+/// the dashboard's live 5s-markout tracker (see [`fair_of`]).
+pub fn position_sign(side: Side) -> f64 {
     match side {
         Side::Buy => 1.0,
         Side::Sell => -1.0,
@@ -499,6 +504,15 @@ mod tests {
         let out = e.on_resolved(window(), Outcome::Up, ts(CLOSE_MS));
         assert!(out.is_empty());
         assert_eq!(e.no_anchor_dropped(), 1);
+    }
+
+    #[test]
+    fn public_helpers_match_the_markout_convention() {
+        // The dashboard's live tracker reuses these; pin their contract.
+        assert!((fair_of(Outcome::Up, 0.7) - 0.7).abs() < 1e-12);
+        assert!((fair_of(Outcome::Down, 0.7) - 0.3).abs() < 1e-12);
+        assert!((position_sign(Side::Buy) - 1.0).abs() < 1e-12);
+        assert!((position_sign(Side::Sell) + 1.0).abs() < 1e-12);
     }
 
     #[test]

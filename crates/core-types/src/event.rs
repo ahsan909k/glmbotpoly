@@ -288,6 +288,45 @@ pub enum ControlEvent {
     /// ([`BreakerKind::Manual`] and [`BreakerKind::DailyStop`]) so trading can
     /// resume after a manual kill or a daily stop (§11 "until manual reset").
     Reset,
+    /// Operator reset of the daily stop only: clears the latched
+    /// [`BreakerKind::DailyStop`] without touching a manual kill. A targeted
+    /// counterpart to [`Reset`](Self::Reset) for resuming after the daily
+    /// stop-loss while leaving an unrelated manual halt in place.
+    DailyStopReset,
+}
+
+/// Which frontend issued a control-plane command — the audit-trail origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CommandOrigin {
+    /// The dashboard web UI (a `POST /api/control/*` without the CLI header).
+    Dashboard,
+    /// The `bot control` CLI (tagged via the `X-Bot-Control-Origin: cli` header).
+    Cli,
+}
+
+/// An audit record for one control-plane command — the journaled trail of who
+/// asked for what and how it resolved (§10.6/§11).
+///
+/// Emitted by the control plane for **every** command, accepted or rejected,
+/// so a refused arm attempt or an out-of-range parameter is as visible as a
+/// successful kill. The subsystem-facing [`ControlEvent`] stream stays clean
+/// (consumers like the risk manager match on intent, not origin); this carries
+/// the origin/outcome/detail the operator audit needs. Strings keep it flexible
+/// across the heterogeneous command set, so it rides the bus [`Arc`]-wrapped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlAudit {
+    /// When the command was processed (local wall time).
+    pub ts: TimestampMs,
+    /// Which frontend issued it.
+    pub origin: CommandOrigin,
+    /// Stable command kind label (e.g. `"kill"`, `"set_param"`, `"arm_live"`).
+    pub kind: String,
+    /// Human-readable detail: the arguments and/or the resulting state summary.
+    pub detail: String,
+    /// Whether the command was accepted (`true`) or refused (`false`).
+    pub accepted: bool,
+    /// The rejection reason when `accepted` is `false`; `None` otherwise.
+    pub error: Option<String>,
 }
 
 /// Market lifecycle notices from the market-channel WebSocket (`new_market` /
@@ -387,6 +426,9 @@ pub enum Event {
     Risk(RiskEvent),
     /// Control-plane notification.
     Control(ControlEvent),
+    /// A control-plane command audit record (origin + outcome), for the
+    /// journaled operator audit trail. Arc-wrapped — it carries Strings.
+    ControlAudit(Arc<ControlAudit>),
 }
 
 #[cfg(test)]
@@ -603,6 +645,62 @@ mod tests {
             let back: MarketLifecycleEvent = serde_json::from_str(&json).unwrap();
             assert_eq!(back, ev);
         }
+    }
+
+    #[test]
+    fn control_audit_arc_keeps_event_small() {
+        // ControlAudit carries Strings, so it must ride the bus Arc-wrapped —
+        // the Event variant is one pointer and the ≤128 guard still holds.
+        let audit = Arc::new(ControlAudit {
+            ts: TimestampMs::from_millis(1_781_166_700_000),
+            origin: CommandOrigin::Cli,
+            kind: "set_param".to_owned(),
+            detail: "series=BTC-5m key=min_edge value=0.02".to_owned(),
+            accepted: true,
+            error: None,
+        });
+        let event = Event::ControlAudit(Arc::clone(&audit));
+        let clone = event.clone();
+        assert_eq!(Arc::strong_count(&audit), 3); // audit + event + clone
+        drop(clone);
+        assert_eq!(Arc::strong_count(&audit), 2);
+        assert!(size_of::<Event>() <= 128);
+    }
+
+    #[test]
+    fn control_audit_serde_round_trips() {
+        for audit in [
+            ControlAudit {
+                ts: TimestampMs::from_millis(0),
+                origin: CommandOrigin::Dashboard,
+                kind: "kill".to_owned(),
+                detail: "halted=true".to_owned(),
+                accepted: true,
+                error: None,
+            },
+            ControlAudit {
+                ts: TimestampMs::from_millis(5),
+                origin: CommandOrigin::Cli,
+                kind: "set_param".to_owned(),
+                detail: "key=touch_size value=20".to_owned(),
+                accepted: false,
+                error: Some("touch_size requires a restart".to_owned()),
+            },
+        ] {
+            let json = serde_json::to_string(&audit).unwrap();
+            let back: ControlAudit = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, audit);
+        }
+    }
+
+    #[test]
+    fn daily_stop_reset_is_a_control_event() {
+        // Exists as a distinct variant and round-trips (journaled into
+        // control_events; consumed by the risk core to clear DailyStop only).
+        let ev = ControlEvent::DailyStopReset;
+        let json = serde_json::to_string(&ev).unwrap();
+        let back: ControlEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ev);
     }
 
     #[test]
