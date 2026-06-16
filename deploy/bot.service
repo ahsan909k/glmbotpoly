@@ -1,0 +1,78 @@
+# systemd service for the Polymarket Up/Down bot (PAPER mode).
+#
+# Install to /etc/systemd/system/bot.service. See README "Deployment (VPS)" for
+# the full directory layout, the dedicated `bot` user, and the env-file layout.
+# Hardening directives are conservative but VERIFY in a staging run before
+# trusting them in production (SystemCallFilter / RestrictAddressFamilies /
+# MemoryDenyWriteExecute are the ones most likely to need adjustment).
+
+[Unit]
+Description=Polymarket trading bot (paper mode)
+Documentation=file:/opt/bot/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# The bot does NOT implement sd_notify; Type=exec makes systemd treat an
+# execve() failure (missing binary / bad symlink / perms) as a start failure.
+Type=exec
+
+User=bot
+Group=bot
+WorkingDirectory=/var/lib/bot
+
+# ExecStart points at the SYMLINK so upgrades are an atomic `ln -sfn` (see
+# deploy/upgrade.sh). Absolute data paths live in bot.local.toml so /opt + /etc
+# can stay read-only under ProtectSystem=strict.
+ExecStart=/opt/bot/bin/bot run --config-dir /etc/bot/config
+EnvironmentFile=/etc/bot/bot.env
+
+# --- Shutdown: the bot drains on SIGTERM (armed=false -> cancel_all -> drain 5s
+#     -> join tasks -> recorder.finish). TimeoutStopSec MUST exceed that. ---
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=30
+
+# --- Restart policy: safe for a self-checking, auto-arming bot. A clean
+#     `systemctl stop` (exit 0) stays stopped; only crashes auto-restart. The
+#     StartLimit guards against a crash-loop hammering the venue. ---
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# --- Logging: capture the console layer into journald. The bot ALSO writes its
+#     own daily-rolling file logs under /var/lib/bot/data/logs (keep both; cap
+#     journald via /etc/systemd/journald.conf — see README). ---
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bot
+
+# --- Hardening (verify in staging) ---
+NoNewPrivileges=true
+ProtectSystem=strict          # /usr, /boot, /etc read-only
+ProtectHome=true              # no /home, /root, /run/user
+PrivateTmp=true               # private /tmp, /var/tmp
+ReadWritePaths=/var/lib/bot   # the ONLY writable tree (data lives here)
+ProtectClock=true             # the bot reads NTP/clock but never SETS it
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+# IPv4/IPv6 for CLOB/WS/REST + NTP; AF_UNIX for tokio/loopback internals;
+# AF_NETLINK is REQUIRED — glibc getaddrinfo uses it for DNS. Dropping it breaks
+# name resolution intermittently.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+LimitNOFILE=65536
+# CAUTION: MemoryDenyWriteExecute can break aws-lc-rs / ring TLS on some kernels.
+# Leave DISABLED until a staging run confirms TLS connects cleanly with it on.
+# MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

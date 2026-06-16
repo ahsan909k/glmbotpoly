@@ -598,11 +598,16 @@ name = "analytics"
 version = "0.1.0"
 dependencies = [
  "core-types",
+ "engine",
+ "flate2",
  "journal",
  "rust_decimal",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+ "venue-api",
+ "venue-paper",
 ]
 
 [[package]]

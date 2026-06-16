@@ -37,6 +37,8 @@ pub mod engine;
 pub mod health;
 pub mod markout;
 pub mod params;
+#[cfg(feature = "replay")]
+pub mod replay;
 pub mod rollup;
 
 pub use attribution::{WindowAttrib, WindowAttribution};
@@ -47,6 +49,11 @@ pub use markout::{
     FillMarkout, MarkoutEngine, MarkoutHorizon, MarkoutPoint, MarkoutSource, fair_of, position_sign,
 };
 pub use params::{AdverseSelectionParams, AnalyticsParams};
+#[cfg(feature = "replay")]
+pub use replay::{
+    ReplayConfig, ReplayError, ReplayOutput, ReplaySummary, SweepAggregate, SweepGrid, SweepPoint,
+    SweepReport, SweepRow, run_replay, run_sweep,
+};
 pub use rollup::{
     ComparisonWindow, DailyRollup, MARKOUT_BIN_COUNT, MARKOUT_BIN_EDGES, MarkoutDistribution,
     RollupStore, SeriesComparison, SeriesComparisonRow, SortColumn,

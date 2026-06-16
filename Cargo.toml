@@ -36,9 +36,18 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 opt-level = 2
 
+# §3 + deployment (see README "Deployment" + Decisions Log 2026-06-16). One
+# production profile (the VPS); `just build-release` + `target/release/bot` are
+# the only deploy artifacts. NOT `target-cpu=native` here — that is opt-in via
+# RUSTFLAGS only when the build host CPU == the run host CPU (SIGILL otherwise).
 [profile.release]
-lto = "thin"
-codegen-units = 1
+opt-level = 3              # full optimization for the hot quoting/feed paths
+lto = "thin"              # cross-crate inlining; thin keeps link RAM/time sane vs "fat"
+codegen-units = 1         # max optimization quality (pairs with thin LTO)
+debug = "line-tables-only" # file:line in panic backtraces — a money bot needs crash diagnostics
+strip = "debuginfo"       # drop heavy DWARF, KEEP the symbol table so backtraces still name frames
+panic = "unwind"          # a panicked tokio task unwinds in isolation and the supervision tree restarts it; abort would SIGABRT the whole 24/7 process
+overflow-checks = true    # trap integer overflow (counters/byte/retention math); money is rust_decimal/checked, hot math is f64 (unaffected) — negligible cost, loud-fail beats silent wrap
 
 # §3 dependency allowlist (add nothing outside it without a Decisions Log entry):
 # tokio, tokio-tungstenite, serde + serde_json, reqwest (rustls), rust_decimal,

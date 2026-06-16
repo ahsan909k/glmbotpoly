@@ -28,6 +28,8 @@ mod live;
 mod model_runtime;
 mod paper;
 mod record;
+#[cfg(feature = "replay")]
+mod replay_cmd;
 mod run;
 mod schedule;
 mod telemetry;
@@ -47,13 +49,17 @@ use crate::control_cli::ControlSub;
 use crate::feed::FeedSource;
 
 const USAGE: &str = "usage: bot [run|paper|paper-sim|live|venue-check|check-config|discover|schedule|feed|\
-                     compare|vol|ladder|fair|record|latency|dashboard|control] [--config-dir <path>] \
+                     compare|vol|ladder|fair|record|latency|dashboard|control|replay|sweep] \
+                     [--config-dir <path>] \
                      [--label <name>] [--out <file>] [--raw <file>] [--source rtds|binance] \
                      [--series <KEY>] [--depth <N>] [--recycle-after <secs>] [--out-dir <dir>] \
                      [--with-model]\n\
                      \n  control <status|kill|reset|reset-daily-stop|set-capital AMT|adjust-capital DELTA|\
                      enable-series KEY|disable-series KEY|set-param KEY VAL [--series KEY]|\
-                     arm-live|confirm-arm PHRASE|disarm>  (HTTP client to the running dashboard)";
+                     arm-live|confirm-arm PHRASE|disarm>  (HTTP client to the running dashboard)\
+                     \n  replay [<journal-dir>] [--window today|<N>d|all] [--out <file>]  (needs --features replay)\
+                     \n  sweep  [<journal-dir>] [--min-edge a,b] [--gamma a,b] [--cancel-theta a,b] \
+                     [--taker-buffer a,b] [--rank <col>] [--parallel] [--window ...] [--out <file>]  (needs --features replay)";
 
 /// What the operator asked the binary to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +133,14 @@ enum Command {
     /// (§10.6/§11): an HTTP client that POSTs/GETs `/api/control/*` and prints
     /// the JSON acknowledgment (the resulting state).
     Control(ControlSub),
+    /// Deterministically re-run the full engine over a recorded journal
+    /// (`<journal-dir>` positional, default `config.journal.dir`) and print the
+    /// §10 series-comparison table. Requires `--features replay`.
+    Replay,
+    /// Run a parameter sweep over (`--min-edge`, `--gamma`, `--cancel-theta`,
+    /// `--taker-buffer`) on a recorded journal and print a ranked comparison.
+    /// Requires `--features replay`.
+    Sweep,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -151,6 +165,24 @@ struct Cli {
     out_dir: Option<PathBuf>,
     /// Wire the fair-value model into `dashboard` (fair-vs-mid + live markout).
     with_model: bool,
+    /// Positional journal directory for `replay`/`sweep` (default
+    /// `config.journal.dir`). Only read under `--features replay`.
+    #[cfg_attr(not(feature = "replay"), allow(dead_code))]
+    journal_dir: Option<PathBuf>,
+    /// Comparison window for `replay`/`sweep` (`today|<N>d|all`).
+    window: Option<String>,
+    /// `replay`/`sweep` grid: comma-separated `min_edge` values.
+    min_edge: Option<String>,
+    /// `sweep` grid: comma-separated skew-strength (`gamma`) values.
+    gamma: Option<String>,
+    /// `sweep` grid: comma-separated cancel-threshold (`reprice_theta`) values.
+    cancel_theta: Option<String>,
+    /// `sweep` grid: comma-separated taker-buffer values.
+    taker_buffer: Option<String>,
+    /// `sweep` ranking column key (default `net-pnl`).
+    rank: Option<String>,
+    /// `sweep`: fan grid points across worker threads.
+    parallel: bool,
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
@@ -165,6 +197,14 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
     let mut recycle_after = None;
     let mut out_dir = None;
     let mut with_model = false;
+    let mut journal_dir = None;
+    let mut window = None;
+    let mut min_edge = None;
+    let mut gamma = None;
+    let mut cancel_theta = None;
+    let mut taker_buffer = None;
+    let mut rank = None;
+    let mut parallel = false;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -198,6 +238,23 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
                     return Err(format!("more than one subcommand given (second: {arg:?})"));
                 }
                 command = Some(Command::Control(parse_control_sub(&mut args)?));
+            }
+            "replay" | "sweep" => {
+                if command.is_some() {
+                    return Err(format!("more than one subcommand given (second: {arg:?})"));
+                }
+                command = Some(if arg == "replay" {
+                    Command::Replay
+                } else {
+                    Command::Sweep
+                });
+                // Optional positional <journal-dir> (a non-flag token right after
+                // the subcommand), like `control`'s positionals.
+                if matches!(args.peek(), Some(v) if !v.starts_with("--"))
+                    && let Some(dir) = args.next()
+                {
+                    journal_dir = Some(PathBuf::from(dir));
+                }
             }
             "--config-dir" => {
                 let value = args
@@ -256,6 +313,45 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
             "--with-model" => {
                 with_model = true;
             }
+            "--window" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--window requires a value (today|<N>d|all)".to_owned())?;
+                window = Some(value);
+            }
+            "--min-edge" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--min-edge requires a comma-separated list".to_owned())?;
+                min_edge = Some(value);
+            }
+            "--gamma" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--gamma requires a comma-separated list".to_owned())?;
+                gamma = Some(value);
+            }
+            "--cancel-theta" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--cancel-theta requires a comma-separated list".to_owned())?;
+                cancel_theta = Some(value);
+            }
+            "--taker-buffer" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--taker-buffer requires a comma-separated list".to_owned())?;
+                taker_buffer = Some(value);
+            }
+            "--rank" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--rank requires a value".to_owned())?;
+                rank = Some(value);
+            }
+            "--parallel" => {
+                parallel = true;
+            }
             other => {
                 if let Some(value) = other.strip_prefix("--config-dir=") {
                     config_dir = Some(PathBuf::from(value));
@@ -275,6 +371,18 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
                     recycle_after = Some(parse_secs(value)?);
                 } else if let Some(value) = other.strip_prefix("--out-dir=") {
                     out_dir = Some(PathBuf::from(value));
+                } else if let Some(value) = other.strip_prefix("--window=") {
+                    window = Some(value.to_owned());
+                } else if let Some(value) = other.strip_prefix("--min-edge=") {
+                    min_edge = Some(value.to_owned());
+                } else if let Some(value) = other.strip_prefix("--gamma=") {
+                    gamma = Some(value.to_owned());
+                } else if let Some(value) = other.strip_prefix("--cancel-theta=") {
+                    cancel_theta = Some(value.to_owned());
+                } else if let Some(value) = other.strip_prefix("--taker-buffer=") {
+                    taker_buffer = Some(value.to_owned());
+                } else if let Some(value) = other.strip_prefix("--rank=") {
+                    rank = Some(value.to_owned());
                 } else {
                     return Err(format!("unrecognized argument: {other:?}"));
                 }
@@ -282,8 +390,27 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
         }
     }
     let command = command.unwrap_or(Command::Paper);
-    if (label.is_some() || out.is_some()) && command != Command::Latency {
-        return Err("--label/--out only apply to the latency subcommand".to_owned());
+    if label.is_some() && command != Command::Latency {
+        return Err("--label only applies to the latency subcommand".to_owned());
+    }
+    if out.is_some() && !matches!(command, Command::Latency | Command::Replay | Command::Sweep) {
+        return Err("--out only applies to the latency, replay, and sweep subcommands".to_owned());
+    }
+    if window.is_some() && !matches!(command, Command::Replay | Command::Sweep) {
+        return Err("--window only applies to the replay and sweep subcommands".to_owned());
+    }
+    let sweep_only = min_edge.is_some()
+        || gamma.is_some()
+        || cancel_theta.is_some()
+        || taker_buffer.is_some()
+        || rank.is_some()
+        || parallel;
+    if sweep_only && command != Command::Sweep {
+        return Err(
+            "--min-edge/--gamma/--cancel-theta/--taker-buffer/--rank/--parallel only apply to the \
+             sweep subcommand"
+                .to_owned(),
+        );
     }
     if raw.is_some() && command != Command::Feed && command != Command::Ladder {
         return Err("--raw only applies to the feed and ladder subcommands".to_owned());
@@ -326,6 +453,14 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
         recycle_after,
         out_dir,
         with_model,
+        journal_dir,
+        window,
+        min_edge,
+        gamma,
+        cancel_theta,
+        taker_buffer,
+        rank,
+        parallel,
     })
 }
 
@@ -662,6 +797,52 @@ fn run() -> anyhow::Result<ExitCode> {
             // telemetry — the JSON ack is printed to stdout.
             control_cli::execute(&config, &secrets, sub)?;
             Ok(ExitCode::SUCCESS)
+        }
+        Command::Replay => {
+            // No telemetry: replay is a batch analysis tool whose output is the
+            // stdout table; the engine's tracing would flood it. Errors surface
+            // via the `Result`.
+            #[cfg(feature = "replay")]
+            {
+                let journal_dir = cli
+                    .journal_dir
+                    .clone()
+                    .unwrap_or_else(|| config.journal.dir.clone());
+                let window = replay_cmd::parse_window(cli.window.as_deref())
+                    .map_err(|m| anyhow::anyhow!(m))?;
+                replay_cmd::execute_replay(&config, &journal_dir, window, cli.out.as_deref())?;
+                Ok(ExitCode::SUCCESS)
+            }
+            #[cfg(not(feature = "replay"))]
+            {
+                bail!("the `replay` subcommand requires building with --features replay");
+            }
+        }
+        Command::Sweep => {
+            #[cfg(feature = "replay")]
+            {
+                let journal_dir = cli
+                    .journal_dir
+                    .clone()
+                    .unwrap_or_else(|| config.journal.dir.clone());
+                let args = replay_cmd::SweepArgs {
+                    journal_dir: &journal_dir,
+                    window: cli.window.as_deref(),
+                    min_edge: cli.min_edge.as_deref(),
+                    gamma: cli.gamma.as_deref(),
+                    cancel_theta: cli.cancel_theta.as_deref(),
+                    taker_buffer: cli.taker_buffer.as_deref(),
+                    rank: cli.rank.as_deref(),
+                    parallel: cli.parallel,
+                    out: cli.out.as_deref(),
+                };
+                replay_cmd::execute_sweep(&config, &args)?;
+                Ok(ExitCode::SUCCESS)
+            }
+            #[cfg(not(feature = "replay"))]
+            {
+                bail!("the `sweep` subcommand requires building with --features replay");
+            }
         }
     }
 }
@@ -1069,6 +1250,93 @@ mod tests {
         assert!(parse(&["run", "--out-dir", "x"]).is_err());
         assert!(parse(&["run", "--series", "DOGE-5m"]).is_err());
         assert!(parse(&["run", "paper"]).is_err());
+    }
+
+    #[test]
+    fn parses_replay_flags() {
+        // Bare replay: default journal-dir + window at dispatch (None here).
+        let cli = parse(&["replay"]).unwrap();
+        assert_eq!(cli.command, Command::Replay);
+        assert_eq!(cli.journal_dir, None);
+        assert_eq!(cli.window, None);
+        assert_eq!(cli.out, None);
+
+        // Positional journal-dir + --window + --out (replay accepts --out).
+        let cli = parse(&[
+            "replay",
+            "data/journal",
+            "--window",
+            "7d",
+            "--out",
+            "r.json",
+        ])
+        .unwrap();
+        assert_eq!(cli.command, Command::Replay);
+        assert_eq!(cli.journal_dir, Some(PathBuf::from("data/journal")));
+        assert_eq!(cli.window.as_deref(), Some("7d"));
+        assert_eq!(cli.out, Some(PathBuf::from("r.json")));
+
+        // A leading flag means no positional dir is consumed.
+        let cli = parse(&["replay", "--window=all"]).unwrap();
+        assert_eq!(cli.journal_dir, None);
+        assert_eq!(cli.window.as_deref(), Some("all"));
+
+        // A non-flag token after `replay` is the positional journal-dir.
+        let cli = parse(&["replay", "paper"]).unwrap();
+        assert_eq!(cli.command, Command::Replay);
+        assert_eq!(cli.journal_dir, Some(PathBuf::from("paper")));
+
+        // Sweep-only grid flags don't apply to replay; series/ladder flags don't either.
+        assert!(parse(&["replay", "--min-edge", "0.01"]).is_err());
+        assert!(parse(&["replay", "--parallel"]).is_err());
+        assert!(parse(&["replay", "--series", "BTC-5m"]).is_err());
+        assert!(parse(&["replay", "--depth", "8"]).is_err());
+        // --window is replay/sweep-only; --out is not record/feed/etc.
+        assert!(parse(&["paper", "--window", "all"]).is_err());
+        assert!(parse(&["schedule", "--out", "r.json"]).is_err());
+        // A second subcommand after a mode is rejected.
+        assert!(parse(&["paper", "replay"]).is_err());
+    }
+
+    #[test]
+    fn parses_sweep_flags() {
+        // Bare sweep.
+        let cli = parse(&["sweep"]).unwrap();
+        assert_eq!(cli.command, Command::Sweep);
+        assert_eq!(cli.journal_dir, None);
+        assert!(!cli.parallel);
+
+        // Full grid, both flag forms, plus positional dir + rank + parallel.
+        let cli = parse(&[
+            "sweep",
+            "data/j",
+            "--min-edge",
+            "0.01,0.02",
+            "--gamma=0.05,0.1",
+            "--cancel-theta",
+            "0.005,0.01",
+            "--taker-buffer=0.005",
+            "--rank",
+            "pnl-per-window",
+            "--parallel",
+            "--window",
+            "today",
+        ])
+        .unwrap();
+        assert_eq!(cli.command, Command::Sweep);
+        assert_eq!(cli.journal_dir, Some(PathBuf::from("data/j")));
+        assert_eq!(cli.min_edge.as_deref(), Some("0.01,0.02"));
+        assert_eq!(cli.gamma.as_deref(), Some("0.05,0.1"));
+        assert_eq!(cli.cancel_theta.as_deref(), Some("0.005,0.01"));
+        assert_eq!(cli.taker_buffer.as_deref(), Some("0.005"));
+        assert_eq!(cli.rank.as_deref(), Some("pnl-per-window"));
+        assert!(cli.parallel);
+        assert_eq!(cli.window.as_deref(), Some("today"));
+
+        // Grid flags are sweep-only; can't combine with another mode.
+        assert!(parse(&["replay", "--gamma", "0.1"]).is_err());
+        assert!(parse(&["paper", "sweep"]).is_err());
+        assert!(parse(&["--min-edge", "0.01"]).is_err());
     }
 
     #[test]

@@ -1,0 +1,37 @@
+# Deploy-local config overrides — copy to /etc/bot/config/bot.local.toml.
+#
+#   sudo install -m 0644 deploy/bot.local.toml.example /etc/bot/config/bot.local.toml
+#
+# Layered OVER config/default.toml (which must also be present in the config
+# dir). Only the keys you override need to appear here. Absolute FHS data paths
+# let the hardened systemd unit keep /opt and /etc read-only while only
+# /var/lib/bot is writable. Inspect the merged result with:
+#   bot check-config --config-dir /etc/bot/config
+
+[log]
+# Daily-rolling app logs (auto-pruned to log.max_files; NO server-side rotation
+# needed — and logrotate must NOT touch these).
+dir = "/var/lib/bot/data/logs"
+
+[journal]
+dir = "/var/lib/bot/data/journal"          # gzip segments — the source of truth
+sqlite_path = "/var/lib/bot/data/journal.sqlite"  # + -wal/-shm sidecars (WAL mode)
+
+# 24/7 RETENTION — REQUIRED for an always-on deploy (defaults are 0 = keep
+# forever -> unbounded growth). Retention runs on each segment rotation + at
+# shutdown, always protects the newest segment, and prunes the matching sqlite
+# rows. logrotate must NEVER touch the segments or the sqlite (corrupts the WAL
+# DB + desyncs the index; there is no `bot reindex` tool yet).
+retention_max_age_ms = 2592000000          # 30 days
+# Size cap: 0 disables; if set it must be >= max_segment_bytes (128 MiB).
+# Measure `du -sh /var/lib/bot/data/journal` after a full day, then size it.
+retention_max_total_bytes = 0
+# Optional power-loss durability of the flushed prefix (small write cost):
+# fsync_on_flush = true
+
+# Dashboard stays on loopback (the default) — reach it via an SSH tunnel:
+#   ssh -N -L 8080:localhost:8080 bot-vps
+# For the public-bind alternative ONLY (also set BOT_SECRET_DASHBOARD_TOKEN in
+# bot.env and firewall the port; the dashboard is plain HTTP -> use a TLS proxy):
+# [dashboard]
+# bind = "0.0.0.0:8080"

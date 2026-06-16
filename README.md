@@ -182,6 +182,49 @@ The writer runs off the bus on its own thread; if the disk stalls, events are
 **dropped and counted** rather than back-pressuring the bus — a nonzero
 `dropped` in the ctrl-c summary means the capture is incomplete.
 
+### Replay & parameter sweep (feature-gated backtester)
+
+`just replay` and `just sweep` re-run the **full engine** (the risk-managed quote
+manager + momentum/late takers) against a recorded journal, driving a fresh
+**seed-stable paper venue**, and emit the §10 series-comparison table. They live
+behind a cargo feature so the core bot stays lean (CLAUDE.md §3) — run them with
+`--features replay`:
+
+```sh
+# Deterministic replay of a recording → the per-series comparison table.
+cargo run -p bot --features replay -- replay data/journal            # or: just replay
+cargo run -p bot --features replay -- replay data/journal --window 7d --out r.json
+
+# Parameter sweep over the four quoting knobs → a ranked table (best NetPnl first).
+cargo run -p bot --features replay -- sweep data/journal \
+  --min-edge 0.01,0.02 --gamma 0.05,0.1 --cancel-theta 0.005,0.01 --taker-buffer 0.005,0.01 \
+  --rank net-pnl --parallel --out sweep.json                          # or: just sweep
+```
+
+How it works: the recorded engine/venue **outputs** (orders, fills, inventory,
+settlements) are dropped; every other recorded event is replayed into the engine
++ venue exactly as the live `bot run` loop feeds them. Re-running the engine
+produces **fresh** orders → the paper venue produces fresh fills → those drive a
+fresh analytics fold. The recorded model snapshots are replayed as-is (model
+params aren't swept). Time is driven from each record's `ts_local_ms` on a
+`start_paused` clock, so a multi-hour recording replays in seconds.
+
+The **sweep** grids over four `EngineParams` fields — `min_edge`,
+`gamma_inventory_skew` (skew), `reprice_threshold_theta` (the cancel threshold;
+`cancel_market_theta` scales with it to preserve the §8 ordering), and
+`momentum_buffer` (taker buffer). An omitted dimension uses the config base
+value; `--rank <col>` picks the ranking column (`net-pnl` default, any §10
+column); `--parallel` fans grid points across cores. Each point is a full,
+independent replay; the report is sorted deterministically.
+
+**Determinism** is the contract: two replays of the same recording + seed produce
+**byte-identical** analytics (proven by `cargo test -p analytics --features
+replay`). The replay reproduces live paper *closely* — same recorded inputs, same
+engine/venue code, fixed seed — but is **not** bit-for-bit against the original
+live session (which used the wall clock + a wall-seeded latency RNG); the exact,
+testable guarantee is replay-vs-replay determinism. To produce a recording to
+replay, run `just record` against the live venue first.
+
 ### Main run mode (`bot run`)
 
 `just run` (= `bot run`, optional `series="BTC-5m"`) is **the** trading command
@@ -420,7 +463,9 @@ Run it from **every candidate VPS region** (Polymarket's matching engine is
 in AWS eu-west-2 per the docs) and from the dev PC as a baseline. Feed the
 REST p50/p95 into `paper.placement_latency` / `paper.cancel_latency` and the
 engine latency premium **manually** — measured numbers are never auto-wired
-into trading config.
+into trading config. The full region-selection procedure (choose by CLOB REST
+**p99**) and a results-table template are under
+[Deployment → VPS region selection](#vps-region-selection).
 
 ### Live execution port (`venue-check` + live arming)
 
@@ -531,27 +576,238 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 Windows and macOS are unaffected (the section is target-scoped); the default
 linker is used there.
 
-### VPS notes
+### VPS notes (building on the VPS)
 
-On the deployment VPS you'll likely want full parallelism. Override the
-committed jobs cap per shell:
+Build **on the target Linux VPS** (or an identical instance — same distro,
+glibc, and CPU family). Cross-compiling from the Windows dev PC is impractical:
+mold is Linux-only, and `aws-lc-rs` (the SDK's rustls provider — still rustls,
+*not* openssl) and `rusqlite`'s bundled SQLite both compile C.
 
-```sh
-CARGO_BUILD_JOBS=$(nproc) cargo build --release -p bot
-```
-
-or per invocation: `cargo build --jobs "$(nproc)" --release -p bot`.
-
-**C toolchain for the live SDK.** `venue-live` pulls the Polymarket SDK, whose
-rustls stack uses `aws-lc-rs` (still rustls — *not* openssl); its `aws-lc-sys`
-build compiles C/assembly, so the VPS needs a C toolchain to build the bot:
+**Prerequisites** (Debian/Ubuntu):
 
 ```sh
-sudo apt install clang cmake        # Debian/Ubuntu (in addition to mold)
+sudo apt-get update
+sudo apt-get install -y build-essential clang cmake mold pkg-config ca-certificates
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+rustup toolchain install stable      # must satisfy rust-version = 1.94 (edition 2024)
 ```
 
-(The dev PC builds it fine with the bundled MSVC/clang. This only matters for a
-clean-room VPS build.)
+**Build** with full parallelism (the committed `jobs = 10` is a dev-PC value)
+and record the cold-build cost the first time:
+
+```sh
+CARGO_BUILD_JOBS=$(nproc) cargo build --release -p bot --timings
+# -> target/release/bot ; archive target/cargo-timings/*.html with the deploy notes
+```
+
+- **RAM/CPU:** thin-LTO + `codegen-units = 1` linking is RAM-hungry — provision
+  **≥ 4 GB RAM / ≥ 2 vCPU** (a 1–2 GB box gets OOM-killed at the LTO link; a
+  temporary swapfile is a stopgap). The cold build is heavy (the aws-lc C build +
+  alloy + the LTO link dominate) — **record the actual minutes**.
+- **`target-cpu=native`** is opt-in and **only** when the build host CPU == the
+  run host CPU (e.g. building on the production VPS itself), else the binary
+  `SIGILL`s on a missing instruction:
+  ```sh
+  RUSTFLAGS="-C target-cpu=native" CARGO_BUILD_JOBS=$(nproc) cargo build --release -p bot
+  ```
+- **Portability check:** `ldd target/release/bot` should list only the system
+  libc/libm/libgcc/pthread (TLS is rustls, SQLite is bundled, flate2 is pure
+  Rust), so the binary moves cleanly to a same-distro host.
+
+If mold is unavailable, fall back to `lld` per [Linker setup](#linker-setup-linux).
+
+## Deployment (VPS)
+
+Operational scaffolding for running the bot 24/7 on a Linux VPS. **Paper phase —
+no live keys:** the systemd unit and env file are paper-only, with the live
+secrets left as commented placeholders. The artifacts live in
+[`deploy/`](deploy/): `bot.service`, `bot.env.example`, `bot.local.toml.example`,
+`upgrade.sh`, `backup.sh`. (The release profile is tuned in `Cargo.toml`
+`[profile.release]`; build it per [VPS notes](#vps-notes-building-on-the-vps).)
+Make the scripts executable after checkout — `chmod +x deploy/*.sh` — or run
+them as `bash deploy/<script>.sh`.
+
+### Directory layout
+
+```
+/opt/bot/bin/
+    bot-<version>-<sha>      # the versioned binary
+    bot -> bot-<version>-<sha>   # symlink; systemd ExecStart points here (atomic swaps)
+/etc/bot/
+    config/default.toml     # copied from repo config/default.toml (REQUIRED)
+    config/bot.local.toml   # from deploy/bot.local.toml.example (absolute paths + retention)
+    bot.env                 # from deploy/bot.env.example (secrets/env), mode 0600
+/var/lib/bot/data/          # the only writable tree: journal/, journal.sqlite(+wal/shm), logs/
+```
+
+Data lives under `/var/lib/bot` (FHS variable state), out of `/opt` and `/etc`,
+so the hardened unit keeps the binary + config read-only. The absolute paths are
+set in `bot.local.toml` (`log.dir`, `journal.dir`, `journal.sqlite_path`).
+
+### systemd service + secrets
+
+Secrets are **environment-only** (never in TOML). Paper phase needs none, unless
+you expose a non-loopback dashboard (then `BOT_SECRET_DASHBOARD_TOKEN`). Install:
+
+```sh
+# 1. Dedicated unprivileged user.
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin bot
+
+# 2. Directories.
+sudo mkdir -p /opt/bot/bin /etc/bot/config /var/lib/bot/data
+
+# 3. Binary (versioned) + symlink.
+V="0.1.0-$(git rev-parse --short HEAD)"
+sudo install -m 0755 target/release/bot "/opt/bot/bin/bot-${V}"
+sudo ln -sfn "/opt/bot/bin/bot-${V}" /opt/bot/bin/bot
+
+# 4. Config + secrets (edit the copies in place).
+sudo install -m 0644 config/default.toml            /etc/bot/config/default.toml
+sudo install -m 0644 deploy/bot.local.toml.example  /etc/bot/config/bot.local.toml
+sudo install -m 0600 deploy/bot.env.example         /etc/bot/bot.env
+sudo chown root:bot /etc/bot/bot.env                # systemd reads it as root pre-drop
+
+# 5. Ownership.
+sudo chown -R bot:bot /var/lib/bot
+
+# 6. Unit.
+sudo install -m 0644 deploy/bot.service /etc/systemd/system/bot.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now bot
+
+# 7. Verify.
+systemctl status bot
+journalctl -u bot -f          # watch the startup self-check, then "ARMED"
+```
+
+The unit drains on `SIGTERM` (`TimeoutStopSec=30` > the 5 s order-drain +
+journal flush), `Restart=on-failure` with a crash-loop guard, captures stdout
+into journald (the bot *also* writes its own file logs), and applies a
+conservative hardening set — **verify `MemoryDenyWriteExecute` /
+`SystemCallFilter` / `RestrictAddressFamilies` in a staging run** before trusting
+them (see comments in `deploy/bot.service`).
+`systemd-analyze verify deploy/bot.service` checks the unit; `systemd-analyze
+security bot` scores the hardening.
+
+### Dashboard remote access
+
+**Recommended — loopback + SSH tunnel.** Keep the default
+`bind = "127.0.0.1:8080"` (no open port, no token, no TLS):
+
+```sh
+ssh -N -L 8080:localhost:8080 bot-vps     # then browse http://localhost:8080
+```
+
+A loopback bind needs **no** `BOT_SECRET_DASHBOARD_TOKEN`. *Alternative
+(documented only):* a non-loopback `bind = "0.0.0.0:8080"` requires the token
+(boot-enforced) **and** a firewall allowlist **and**, because the dashboard is
+plain HTTP, a TLS reverse proxy (nginx/caddy) for any public use.
+
+### Log + journal rotation on the server
+
+Already automatic (operator does nothing): the app **file logs** roll daily and
+prune to `log.max_files` (14); the **journal segments** rotate at 128 MiB / 1 h.
+
+You **must enable journal retention** for 24/7 — it defaults to *off* (unbounded
+growth). Set it in `bot.local.toml`:
+
+```toml
+[journal]
+retention_max_age_ms = 2592000000     # 30 days
+retention_max_total_bytes = 0         # 0 = off; if set, must be >= 134217728 (128 MiB)
+```
+
+Size it empirically: let it run a day, then `du -sh /var/lib/bot/data/journal`,
+× your retention days. Retention runs on each rotation + at shutdown, always
+keeps the newest segment, and prunes the matching sqlite rows.
+
+> **Do NOT point `logrotate` at the journal gzip segments or the sqlite index** —
+> it corrupts the WAL database and desyncs the index (there is no `bot reindex`
+> tool yet). The built-in retention is the only safe mechanism. The app file
+> logs are likewise self-managed — leave them to the bot.
+
+Cap journald (it also holds the captured stdout):
+
+```sh
+# /etc/systemd/journald.conf  ->  SystemMaxUse=2G  /  MaxRetentionSec=2week
+sudo systemctl restart systemd-journald
+# or one-shot: sudo journalctl --vacuum-size=2G
+```
+
+(Or set `StandardOutput=null` in the unit to rely solely on the bot's file
+logs — you then lose `journalctl -u bot` history.)
+
+### Upgrade procedure (drain before swap)
+
+Use `deploy/upgrade.sh <new-binary>` — it stops the service (SIGTERM →
+`armed=false` → `cancel_all` → drain ≤5 s → join → journal flush), verifies
+`zero open orders` + `journal flushed` in the journal, atomically repoints the
+symlink, restarts, and polls `/health` + `ARMED` (auto-rolling-back on failure):
+
+```sh
+sudo deploy/upgrade.sh /path/to/bot-<version>-<sha>
+```
+
+Always upgrade via `systemctl stop` (SIGTERM) — **never `bot control kill`**,
+which only halts order flow and does not exit the process. **Honest note:** paper
+state does *not* survive a restart (no run-loop consumes the journal rebuild
+yet) — a restart begins a fresh paper wallet + new journal session. The drain's
+value is **zero orphaned open orders** across the swap, not state continuity.
+Manual rollback: `sudo ln -sfn /opt/bot/bin/bot-<previous> /opt/bot/bin/bot &&
+sudo systemctl restart bot`.
+
+### Backup / restore
+
+Primary backup = the journal **gzip segments** (the source of truth) + the
+config; back up the **sqlite index** too (rebuildable in principle, but no
+`bot reindex` tool exists yet). Store `bot.env` secrets **separately + encrypted**,
+not in the data backup. Use `deploy/backup.sh` (safe while the bot runs):
+
+```sh
+REMOTE=backup-host:/backups/bot sudo -E deploy/backup.sh
+```
+
+It snapshots sqlite via the online `.backup` API (never raw-`cp` a live WAL DB),
+rsyncs the segments + sqlite snapshot + config **off-box**, and prunes local
+snapshots. Restore (commands at the bottom of `backup.sh`): stop the bot,
+restore `data/` (dropping stale `-wal`/`-shm`) + config, `chown`, start.
+
+### VPS region selection
+
+Pick the region with the lowest **order-path round-trip** to Polymarket's CLOB —
+that RTT bounds the cancel-first reprice loop that defends against adverse
+selection.
+
+1. **Candidates:** spin up one VPS per shortlisted region near Polymarket infra
+   (the matching engine is in AWS eu-west-2/London per the docs — a strong
+   candidate), **same instance type** across candidates for a fair comparison.
+2. **Measure** (read-only, **no keys**, ~2–3 min each):
+   ```sh
+   bot latency --label eu-west-2     # -> data/latency/latency-eu-west-2-<ts>.json
+   ```
+   The harness probes CLOB REST `/time`+`/ok`, the market WS, RTDS WS, and NTP,
+   and reports p50/p95/**p99**.
+3. **Collect** every region's JSON in one place.
+4. **Decide** by the lowest CLOB REST **p99** (`rest[].stats.p99_ms` for the
+   `clob/time` + `clob/ok` targets).
+5. **Tie-breakers / disqualifiers:** WS `connect_ms` and RTDS `gaps.p50` (lower
+   = healthier); **NTP reachability is a hard disqualifier** — a region that
+   blocks UDP/123 leaves the clock-skew breaker permanently tripped and the bot
+   never arms.
+6. **After choosing:** feed the chosen region's measured REST p50/p95 into
+   `paper.placement_latency` / `paper.cancel_latency` so paper fills reflect that
+   region's real RTT.
+
+| Region | Instance type | CLOB REST p50/p95/**p99** (ms) | WS connect (ms) | RTDS gap p50 (ms) | NTP offset / best-rtt (ms) / reachable? | Decision |
+|--------|---------------|--------------------------------|-----------------|-------------------|-----------------------------------------|----------|
+| eu-west-2 (London) | 2 vCPU / 4 GB | 6 / 9 / **12** | 4 | 1010 | +1 / 3 / yes | **CHOSEN** |
+| us-east-1 (Virginia) | 2 vCPU / 4 GB | 78 / 95 / **110** | 33 | 1015 | +1 / 12 / yes | runner-up |
+| eu-central-1 (Frankfurt) | 2 vCPU / 4 GB | 22 / 30 / **—** | 19 | 1011 | n/a / — / **NO (UDP/123 blocked)** | disqualified (NTP) |
+
+> Placeholder numbers — replace each row from that region's `bot latency` JSON
+> (`rest[].stats.{p50,p95,p99}_ms`, `ws[].connect_ms`, RTDS `gaps.p50_ms`, the
+> `ntp` block). Mark the lowest-p99 **NTP-reachable** region **CHOSEN**, and
+> record the date + binary version used.
 
 ## Dependency policy
 

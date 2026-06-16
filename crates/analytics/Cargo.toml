@@ -9,6 +9,15 @@ description = "Markouts, PnL attribution, per-series aggregates"
 [lints]
 workspace = true
 
+[features]
+# The deterministic replay harness + parameter sweep (CLAUDE.md §3: heavy
+# optional parts are feature-gated so the core bot builds lean). It re-runs the
+# real engine + paper venue over a recorded journal, so it pulls `engine` +
+# `venue-paper` + a `tokio` test-time runtime (`test-util` provides
+# `start_paused`/`advance` for faster-than-real-time, byte-deterministic replay).
+# Off by default — `cargo build -p analytics`/`-p bot` never compile any of it.
+replay = ["dep:engine", "dep:venue-paper", "dep:venue-api", "dep:tokio"]
+
 [dependencies]
 journal = { path = "../journal" }
 # `journal` does NOT re-export `core_types`, so name it directly: analytics
@@ -23,7 +32,26 @@ thiserror = { workspace = true }
 # dashboard REST snapshot / WS push (the consuming wiring is deferred).
 serde = { workspace = true }
 
+# Replay-harness-only deps (feature `replay`): re-run the full engine + the
+# seed-stable paper venue over a recorded tape. Arrows still point inward —
+# engine/venue-paper/venue-api do not depend on analytics (CLAUDE.md §4); the
+# `config → params` mapping stays at the bot boundary, so no `config` dep here.
+engine = { path = "../engine", optional = true }
+venue-paper = { path = "../venue-paper", optional = true }
+venue-api = { path = "../venue-api", optional = true }
+tokio = { workspace = true, optional = true, features = [
+    "rt",
+    "time",
+    "sync",
+    "test-util",
+] }
+
 [dev-dependencies]
 # The replay/round-trip integration uses serde_json indirectly via journal; the
-# unit tests use `dec!` (already via rust_decimal's `macros` feature).
+# unit tests use `dec!` (already via rust_decimal's `macros` feature). The
+# determinism tests (feature `replay`) serialize outputs to canonical JSON.
 serde_json = { workspace = true }
+# The replay determinism test writes a gzip journal segment directly (preserving
+# each envelope's exact `ts_local_ms`, which the recorder re-stamps) and reads it
+# back via `ReplayReader` — the same pure-Rust backend `journal` uses.
+flate2 = { workspace = true }

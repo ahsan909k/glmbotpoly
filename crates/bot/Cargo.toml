@@ -15,6 +15,11 @@ workspace = true
 # (CLAUDE.md §3 — feature-gate heavy optional parts). Adds no code and no
 # dependencies to production builds; run it with `just chaos`.
 chaos = []
+# The `bot replay` / `bot sweep` subcommands (deterministic backtest + parameter
+# sweep over a recorded journal). Pulls `analytics`' heavy replay path (engine +
+# paper venue + a tokio test-time runtime); off by default so the core bot builds
+# lean (CLAUDE.md §3). Run via `just replay` / `just sweep`.
+replay = ["analytics/replay"]
 
 [dependencies]
 core-types = { path = "../core-types" }

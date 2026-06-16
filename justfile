@@ -153,6 +153,22 @@ run series="":
 record out-dir="data/journal":
     cargo run -p bot -- record --out-dir {{out-dir}}
 
+# Deterministic replay (feature-gated; CLAUDE.md §3/§10). Re-runs the full engine
+# + a seed-stable paper venue over a recorded journal faster-than-real-time and
+# prints the §10 series-comparison table. Two replays of the same recording are
+# byte-identical. JSON: append `--out r.json`. Default dir data/journal/.
+replay dir="data/journal":
+    cargo run -p bot --features replay -- replay {{dir}}
+
+# Parameter sweep (feature-gated). Runs a grid over the four quoting knobs on one
+# recording and prints a ranked comparison (best NetPnl first; --rank to change).
+# An omitted dimension uses the config base value. --parallel fans across cores.
+# Example:
+#   cargo run -p bot --features replay -- sweep data/journal \
+#     --min-edge 0.01,0.02 --gamma 0.05,0.1 --cancel-theta 0.005,0.01 --taker-buffer 0.005,0.01
+sweep dir="data/journal":
+    cargo run -p bot --features replay -- sweep {{dir}}
+
 # Latency benchmark against live Polymarket endpoints (read-only; network
 # required; ~2-3 min). Run from each candidate VPS region with a label;
 # the JSON report lands in data/latency/. Note: timeutil's harness-gated
@@ -175,6 +191,15 @@ venue-check:
 #   cargo test -p venue-live --features live-smoke -- --ignored live_smoke
 # (Not a just recipe on purpose — run it deliberately, by hand.)
 
-# Optimized build for deployment (slow; not for iteration)
+# Optimized build for deployment (slow; not for iteration). Build ON the target
+# Linux VPS (or an identical instance — same distro/glibc/CPU); cross-compiling
+# from Windows is impractical (mold is Linux-only; aws-lc/rusqlite need a C
+# toolchain). On the VPS use full parallelism (the committed jobs=10 is a dev-PC
+# value) and measure+record the cold-build time + RAM peak:
+#   CARGO_BUILD_JOBS=$(nproc) cargo build --release -p bot --timings
+# Optional, ONLY when the build host CPU == the run host CPU (else SIGILL):
+#   RUSTFLAGS="-C target-cpu=native" CARGO_BUILD_JOBS=$(nproc) cargo build --release -p bot
+# Thin-LTO linking is RAM-hungry — provision >=4 GB RAM / >=2 vCPU. See README
+# "Deployment" for prerequisites, systemd, upgrade, backup, and VPS selection.
 build-release:
     cargo build --release -p bot

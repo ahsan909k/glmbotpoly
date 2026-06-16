@@ -6,6 +6,10 @@
 .env.*
 !.env.example
 *.local.toml
+# Deploy secrets: ignore a real systemd EnvironmentFile if one is created in the
+# repo; only deploy/bot.env.example (the *.example) is committed. (*.local.toml
+# above already ignores a real deploy/bot.local.toml; the .example is kept.)
+/deploy/bot.env
 
 # Runtime data: journals, sqlite ledgers, raw tick captures, logs.
 # Unanchored so it also catches per-crate run dirs (e.g. crates/bot/data/).
