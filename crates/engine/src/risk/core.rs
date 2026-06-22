@@ -89,6 +89,12 @@ pub(crate) struct RiskCore {
     // ws disconnect
     ws_down_windows: HashSet<WindowId>,
     user_ws_down: bool,
+    /// Windows that have closed/resolved. Their book-health is ignored: a closed
+    /// window's connection teardown emits a `Disconnected` (and, during the
+    /// post-close linger, `Stale`) that never gets a paired `Recovered`, so
+    /// without this it would latch `WsDisconnect`/`FeedStale` forever — wedging a
+    /// permanent global halt after the first window rollover.
+    ended_windows: HashSet<WindowId>,
 
     // sanity (fair vs mid)
     active_window: Option<WindowId>,
@@ -148,6 +154,7 @@ impl RiskCore {
             stale_books: HashSet::new(),
             ws_down_windows: HashSet::new(),
             user_ws_down: false,
+            ended_windows: HashSet::new(),
             active_window: None,
             active_up_token: None,
             last_mid: None,
@@ -196,6 +203,10 @@ impl RiskCore {
         for w in &old_settled {
             self.window_cids.remove(w);
         }
+        // Forget ended windows older than the cutoff — far past any window's life
+        // plus linger, so no late book event can arrive for them.
+        self.ended_windows
+            .retain(|w| w.open_time.as_millis() >= cutoff.as_millis());
         self.inv.prune_settled_before(cutoff)
     }
 
@@ -290,12 +301,18 @@ impl RiskCore {
                 self.recompute_feed_stale(now, &mut out);
             }
             Event::BookHealth(BookHealth::Unreliable { window, reason, .. }) => {
-                if *reason == BookUnreliableReason::Disconnected {
-                    self.ws_down_windows.insert(*window);
-                    self.recompute_ws(&mut out);
-                } else {
-                    self.stale_books.insert(*window);
-                    self.recompute_feed_stale(now, &mut out);
+                // Ignore book-health for windows that have ended: a closed/
+                // resolved window's connection teardown emits a Disconnected (and,
+                // during linger, Stale) that never gets a paired Recovered, and
+                // would otherwise wedge a global breaker (the rollover-halt bug).
+                if !self.ended_windows.contains(window) {
+                    if *reason == BookUnreliableReason::Disconnected {
+                        self.ws_down_windows.insert(*window);
+                        self.recompute_ws(&mut out);
+                    } else {
+                        self.stale_books.insert(*window);
+                        self.recompute_feed_stale(now, &mut out);
+                    }
                 }
             }
             Event::BookHealth(BookHealth::Recovered { window, .. }) => {
@@ -338,6 +355,7 @@ impl RiskCore {
                     market.tokens.up.clone(),
                     *lifecycle,
                     event,
+                    now,
                     &mut out,
                 );
             }
@@ -390,6 +408,7 @@ impl RiskCore {
         up_token: TokenId,
         lifecycle: WindowLifecycle,
         event: &Event,
+        now: TimestampMs,
         out: &mut Vec<RiskOutput>,
     ) {
         match lifecycle {
@@ -406,6 +425,7 @@ impl RiskCore {
                     self.active_window = None;
                     self.active_up_token = None;
                 }
+                self.end_window_book_health(window, now, out);
             }
             WindowLifecycle::Resolved { .. } => {
                 for eff in self.inv.on_event(event) {
@@ -418,7 +438,28 @@ impl RiskCore {
                     self.active_window = None;
                     self.active_up_token = None;
                 }
+                self.end_window_book_health(window, now, out);
             }
+        }
+    }
+
+    /// Marks a window ended and purges its book-health from the global breakers.
+    /// A closed/resolved window's connection teardown emits a `Disconnected`
+    /// (and, during the post-close linger, `Stale`) that will never get a paired
+    /// `Recovered` — without this purge it latches `WsDisconnect`/`FeedStale`
+    /// forever, wedging a permanent global halt after the first window rollover.
+    fn end_window_book_health(
+        &mut self,
+        window: WindowId,
+        now: TimestampMs,
+        out: &mut Vec<RiskOutput>,
+    ) {
+        self.ended_windows.insert(window);
+        if self.ws_down_windows.remove(&window) {
+            self.recompute_ws(out);
+        }
+        if self.stale_books.remove(&window) {
+            self.recompute_feed_stale(now, out);
         }
     }
 
@@ -908,6 +949,70 @@ mod tests {
             ts(OPEN_MS),
         );
         assert_eq!(tripped_in(&out), vec![BreakerKind::FeedStale]);
+    }
+
+    #[test]
+    fn resolved_window_teardown_disconnect_does_not_wedge_wsdisconnect() {
+        // The rollover-halt regression: a window's CLOB connection tears down at
+        // close/resolution, emitting a BookHealth::Unreliable{Disconnected} that
+        // never gets a paired Recovered. WsDisconnect must clear when the window
+        // ends, and a late disconnect for the dead window must be ignored.
+        let mut c = core();
+        open_window(&mut c);
+        let out = c.on_event(
+            &Event::BookHealth(BookHealth::Unreliable {
+                window: window(),
+                reason: BookUnreliableReason::Disconnected,
+                ts: ts(CLOSE_MS),
+            }),
+            ts(CLOSE_MS),
+        );
+        assert_eq!(tripped_in(&out), vec![BreakerKind::WsDisconnect]);
+        assert!(c.is_globally_halted());
+        // The window resolves — its teardown disconnect must no longer hold the
+        // global breaker (no Recovered will ever come for a resolved window).
+        let out = c.on_event(
+            &win_event(WindowLifecycle::Resolved {
+                outcome: Outcome::Up,
+            }),
+            ts(CLOSE_MS + 1),
+        );
+        assert!(cleared_in(&out).contains(&BreakerKind::WsDisconnect));
+        assert!(
+            !c.is_globally_halted(),
+            "WsDisconnect must clear once the window ends — else a permanent halt"
+        );
+        // A late disconnect for the now-ended window is ignored (no re-trip).
+        let out = c.on_event(
+            &Event::BookHealth(BookHealth::Unreliable {
+                window: window(),
+                reason: BookUnreliableReason::Disconnected,
+                ts: ts(CLOSE_MS + 2),
+            }),
+            ts(CLOSE_MS + 2),
+        );
+        assert!(tripped_in(&out).is_empty());
+        assert!(!c.is_globally_halted());
+    }
+
+    #[test]
+    fn closed_window_stale_book_clears_feed_stale_on_close() {
+        // During the post-close linger a closed window's book gets no updates and
+        // reports Stale. That must not hold FeedStale once the window is Closed.
+        let mut c = core();
+        open_window(&mut c);
+        let out = c.on_event(
+            &Event::BookHealth(BookHealth::Unreliable {
+                window: window(),
+                reason: BookUnreliableReason::Stale,
+                ts: ts(CLOSE_MS),
+            }),
+            ts(CLOSE_MS),
+        );
+        assert_eq!(tripped_in(&out), vec![BreakerKind::FeedStale]);
+        let out = c.on_event(&win_event(WindowLifecycle::Closed), ts(CLOSE_MS));
+        assert!(cleared_in(&out).contains(&BreakerKind::FeedStale));
+        assert!(!c.is_globally_halted());
     }
 
     // ---- clock skew (honored, not re-published) ----------------------------
