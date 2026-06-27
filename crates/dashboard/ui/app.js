@@ -1,6 +1,8 @@
 "use strict";
-/* Polymarket bot dashboard — single-page UI, no framework, no build step.
-   Talks to the backend's REST snapshots + WebSocket push (CLAUDE.md §10). */
+/* Trading-bot dashboard — single-page UI, no framework, no build step.
+   A calm explanatory Summary is the landing screen; the detailed operational
+   views (Series, Live window, Fills, Risk, Controls) sit behind the secondary
+   "Details" nav. Talks to the backend's REST snapshots + WebSocket push. */
 
 // ---------------------------------------------------------------- token / auth
 const TOKEN_KEY = "pmbot_token";
@@ -43,9 +45,11 @@ async function api(path, opts) {
 }
 
 // ----------------------------------------------------------------------- state
+const ALL_SERIES = ["BTC-5m", "BTC-15m", "BTC-1h", "ETH-5m", "ETH-15m", "ETH-1h"];
 const state = {
   mode: "paper",
-  view: "overview",
+  view: "summary",
+  summary: { series: null, window: "today", seriesList: [], data: null },
   compareWindow: "all",
   sort: { col: null, dir: null },     // null → server default (NetPnl desc)
   sortColumns: {},                    // key → {label, higher_is_better}
@@ -55,10 +59,13 @@ const state = {
   live: { windows: [], selected: null, detail: null },
   fills: { series: "", rows: [] },
   risk: null,
+  cancels: [],                        // client-tracked recent cancels (from quote frames)
+  orderSeen: new Map(),               // order_id → {placed, series, side, price}
   params: { noAtm: 25, noPassive: 5, lateTau: 30, atmBand: 0.10 },
   paramsLoaded: false,
 };
 const EQUITY_CAP = 5000;
+const CANCELS_CAP = 80;
 
 // --------------------------------------------------------------------- helpers
 const $ = (id) => document.getElementById(id);
@@ -74,6 +81,12 @@ function moneyCell(v, signed) {
   const n = num(v);
   const cls = n > 0 ? "pos" : n < 0 ? "neg" : "zero";
   return `<span class="${signed ? cls : ""}">${fmtUsd(v, signed)}</span>`;
+}
+function setSigned(el, v) {
+  const n = num(v);
+  el.textContent = fmtUsd(v, true);
+  el.classList.remove("pos", "neg", "zero");
+  el.classList.add(n > 0 ? "pos" : n < 0 ? "neg" : "zero");
 }
 function pctCell(f) { return ((f || 0) * 100).toFixed(0) + "%"; }
 function markoutCell(f) {
@@ -110,7 +123,227 @@ function confirmAction(text, onOk) {
 
 function showAuthBanner(show) { $("auth-banner").classList.toggle("hidden", !show); }
 
-// ------------------------------------------------------------------- overview
+function fmtClock(ms) { return new Date(ms).toLocaleTimeString([], { hour12: false }); }
+function fmtCountdown(secs) {
+  secs = Math.max(0, Math.floor(secs));
+  return `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
+}
+function seriesOf(windowKey) { return (windowKey || "").split("@")[0]; }
+function windowSecs(seriesKey) {
+  const dur = (seriesKey || "").split("-")[1];
+  if (dur === "5m") return 300;
+  if (dur === "15m") return 900;
+  if (dur === "1h") return 3600;
+  return 300;
+}
+function isActiveLifecycle(lc) { return lc === "Open" || lc === "Closing"; }
+function px3(p) { return num(p).toFixed(3); }
+
+// =========================================================== SUMMARY (landing)
+function summarySeriesParam() { return state.summary.series ? `&series=${state.summary.series}` : ""; }
+
+async function loadSummary() {
+  try {
+    const s = await api(`/api/summary?mode=${state.mode}&window=${state.summary.window}${summarySeriesParam()}`);
+    state.summary.data = s;
+    renderSummary(s);
+    showAuthBanner(false);
+  } catch (e) { if (e.message !== "unauthorized") toast("summary: " + e.message, true); }
+}
+
+// Builds the series sub-tabs from the union of active + traded series.
+async function loadSummaryTabs() {
+  let present = new Set();
+  try {
+    const wins = await api(`/api/windows?mode=${state.mode}`);
+    for (const w of (wins || [])) present.add(seriesOf(w.window));
+  } catch (e) { /* best-effort */ }
+  try {
+    const cmp = await api(`/api/series-comparison?mode=${state.mode}&window=all`);
+    for (const r of ((cmp && cmp.comparison && cmp.comparison.rows) || [])) present.add(r.series);
+  } catch (e) { /* best-effort */ }
+  const list = ALL_SERIES.filter((s) => present.has(s));
+  state.summary.seriesList = list;
+  renderSummaryTabs();
+}
+
+function renderSummaryTabs() {
+  const el = $("sum-series-tabs");
+  const tabs = [{ key: null, label: "All" }].concat(state.summary.seriesList.map((s) => ({ key: s, label: s })));
+  el.innerHTML = tabs.map((t) => {
+    const active = (t.key === state.summary.series) ? " active" : "";
+    return `<button class="sum-tab${active}" data-series="${t.key === null ? "" : t.key}">${t.label}</button>`;
+  }).join("");
+  el.querySelectorAll(".sum-tab").forEach((b) => b.addEventListener("click", () => {
+    state.summary.series = b.dataset.series || null;
+    renderSummaryTabs();
+    loadSummary();
+    refreshOpenDrops();
+  }));
+}
+
+function renderSummary(s) {
+  // headline
+  const h = s.headline;
+  $("hl-start").textContent = h.starting_capital != null ? fmtUsd(h.starting_capital, false) : "—";
+  $("hl-equity").textContent = h.equity != null ? fmtUsd(h.equity, false) : "—";
+  setSigned($("hl-today"), h.today_pl);
+  $("hl-winrate").textContent = h.win_rate != null ? (h.win_rate * 100).toFixed(0) + "%" : "—";
+
+  // status sentence
+  const st = s.status;
+  const banner = $("status-banner");
+  banner.classList.remove("healthy", "caution", "warming");
+  banner.classList.add(st.state === "healthy" ? "healthy" : st.state === "caution" ? "caution" : "warming");
+  $("status-text").textContent = st.sentence;
+  $("status-info").title = st.reason;
+  $("status-info").dataset.tip = encodeURIComponent(st.reason);
+
+  // explainer buckets
+  const e = s.explainer;
+  setSigned($("bk-completed"), e.completed_pair_pnl);
+  setSigned($("bk-stuck"), e.stuck_leg_pnl);
+  const sub = (label, val) => `<div class="sub"><label>${label}</label><span>${val}</span></div>`;
+  $("bucket-sub").innerHTML =
+    sub("Pairs completed", num(e.pairs_completed).toLocaleString()) +
+    sub("Legs stranded", num(e.legs_stranded).toLocaleString()) +
+    sub("Avg cost per pair", e.avg_pair_cost != null ? "$" + num(e.avg_pair_cost).toFixed(3) : "—") +
+    sub("Avg per stranded leg", e.avg_loss_per_stranded != null ? fmtUsd(e.avg_loss_per_stranded, true) : "—");
+  $("explainer-note").textContent =
+    `The two buckets add up to total profit/loss (${fmtUsd(e.total_pnl, true)}). ` +
+    `Estimated maker rebate of ${fmtUsd(e.rebate_estimate, false)} is credited separately.`;
+
+  // activity strip
+  renderActivity(s.activity);
+  $("activity-scope").textContent = state.summary.series ? state.summary.series : "all series";
+}
+
+function renderActivity(a) {
+  const okMark = (ok) => ok ? "good" : "bad";
+  const ttc = a.median_ttc_ms == null ? null : a.median_ttc_ms;
+  const ttr = a.median_ttr_ms == null ? null : a.median_ttr_ms;
+  const tiles = [
+    { label: "Orders placed (1 min)", val: a.placed_1m },
+    { label: "Orders cancelled (1 min)", val: a.cancelled_1m },
+    { label: "Resting now", val: a.resting_now },
+    { label: "Fills (1 min)", val: a.fills_1m },
+    {
+      label: "Time to replace a quote", cls: ttr == null ? "" : okMark(a.ttr_ok),
+      val: ttr == null ? "—" : ttr + " ms", target: "target ≤ " + a.ttr_target_ms + " ms",
+    },
+    {
+      label: "Time to cancel a quote", cls: ttc == null ? "" : okMark(a.ttc_ok),
+      val: ttc == null ? "—" : ttc + " ms",
+      target: ttc == null ? (state.mode === "paper" ? "n/a in paper" : "no sample") : "target ≤ " + a.ttc_target_ms + " ms",
+    },
+  ];
+  $("act-tiles").innerHTML = tiles.map((t) =>
+    `<div class="act-tile ${t.cls || ""}"><label>${t.label}</label><span>${t.val}</span>` +
+    (t.target ? `<span class="target">${t.target}</span>` : "") + `</div>`
+  ).join("");
+}
+
+// ---- summary dropdowns (loaded when opened, refreshed while open) ----
+function dropOpen(id) { const d = $(id); return d && d.parentElement && d.parentElement.open; }
+function refreshOpenDrops() {
+  if (dropOpen("drop-fills")) loadDropFills();
+  if (dropOpen("drop-positions")) loadDropPositions();
+  if (dropOpen("drop-resolved")) loadDropResolved();
+  renderDropCancels();
+}
+
+async function loadDropFills() {
+  try {
+    const resp = await api(`/api/fills?mode=${state.mode}&limit=60${summarySeriesParam()}`);
+    const rows = resp.fills || [];
+    if (!rows.length) { $("drop-fills").innerHTML = `<div class="drop-empty">No fills yet.</div>`; return; }
+    $("drop-fills").innerHTML =
+      `<table class="drop-table"><thead><tr><th>Time</th><th>Series</th><th>Side</th><th>Out</th><th>Price</th><th>Size</th><th>5s markout</th></tr></thead><tbody>` +
+      rows.map((r) => {
+        const mk = (r.markout_5s == null) ? (r.markout_pending ? `<span class="mk-pending">…</span>` : `<span class="zero">—</span>`) : markoutCell(r.markout_5s);
+        return `<tr><td>${fmtClock(r.ts_venue || r.ts_local)}</td><td>${seriesOf(r.window)}</td><td>${r.side}</td><td>${r.outcome}</td><td>${px3(r.price)}</td><td>${num(r.size)}</td><td>${mk}</td></tr>`;
+      }).join("") + `</tbody></table>`;
+  } catch (e) { /* transient */ }
+}
+
+function renderDropCancels() {
+  const sel = state.summary.series;
+  const rows = state.cancels.filter((c) => !sel || c.series === sel).slice(0, 40);
+  if (!rows.length) {
+    $("drop-cancels").innerHTML = `<div class="drop-empty">No cancels observed since this page connected. (The venue does not report a cancel reason; we infer "repriced".)</div>`;
+    return;
+  }
+  $("drop-cancels").innerHTML =
+    `<table class="drop-table"><thead><tr><th>Time</th><th>Series</th><th>Side</th><th>Price</th><th>Rested</th><th>Reason</th></tr></thead><tbody>` +
+    rows.map((c) =>
+      `<tr><td>${fmtClock(c.ts)}</td><td>${c.series}</td><td>${c.side}</td><td>${px3(c.price)}</td><td>${(c.rested / 1000).toFixed(1)}s</td><td>repriced</td></tr>`
+    ).join("") + `</tbody></table>`;
+}
+
+async function loadDropPositions() {
+  try {
+    const list = await api(`/api/windows?mode=${state.mode}`);
+    const sel = state.summary.series;
+    const rows = (list || []).filter((w) => w.inventory && (!sel || seriesOf(w.window) === sel));
+    if (!rows.length) { $("drop-positions").innerHTML = `<div class="drop-empty">No open positions right now.</div>`; return; }
+    $("drop-positions").innerHTML =
+      `<table class="drop-table"><thead><tr><th>Series</th><th>Up</th><th>Down</th><th>Matched pairs</th><th>Stuck</th><th>Pair cost</th></tr></thead><tbody>` +
+      rows.map((w) => {
+        const inv = w.inventory;
+        const up = inv.up ? num(inv.up.shares) : 0, dn = inv.down ? num(inv.down.shares) : 0;
+        const exc = num(inv.excess);
+        return `<tr><td>${seriesOf(w.window)}</td><td>${up}</td><td>${dn}</td><td>${num(inv.matched_pairs)}</td><td>${exc > 0 ? "+" : ""}${exc}</td><td>${inv.pair_cost != null ? num(inv.pair_cost).toFixed(3) : "—"}</td></tr>`;
+      }).join("") + `</tbody></table>`;
+  } catch (e) { /* transient */ }
+}
+
+async function loadDropResolved() {
+  try {
+    const rows = await api(`/api/settlements?mode=${state.mode}&limit=40${summarySeriesParam()}`);
+    if (!rows || !rows.length) { $("drop-resolved").innerHTML = `<div class="drop-empty">No resolved windows yet.</div>`; return; }
+    $("drop-resolved").innerHTML =
+      `<table class="drop-table"><thead><tr><th>Time</th><th>Series</th><th>Outcome</th><th>Completed pairs</th><th>Stuck legs</th><th>Total</th></tr></thead><tbody>` +
+      rows.map((r) =>
+        `<tr><td>${fmtClock(r.ts_ms)}</td><td>${r.series}</td><td>${r.outcome}</td><td>${moneyCell(r.completed_pair_pnl, true)}</td><td>${moneyCell(r.stuck_leg_pnl, true)}</td><td>${moneyCell(r.realized_pnl, true)}</td></tr>`
+      ).join("") + `</tbody></table>`;
+  } catch (e) { /* transient */ }
+}
+
+// ---- client-side cancel tracking (from quote WS frames) ----
+function trackOrder(order, tsMs) {
+  if (!order || !order.order_id) return;
+  const id = order.order_id;
+  const series = (order.window && order.window.series) || seriesOf(order.window || "");
+  const terminal = ["Filled", "Canceled", "Rejected", "Expired"];
+  if (!terminal.includes(order.state)) {
+    if (!state.orderSeen.has(id)) {
+      state.orderSeen.set(id, { placed: tsMs, series, side: order.side, price: order.price });
+    }
+    return;
+  }
+  // terminal
+  if (order.state === "Canceled") {
+    const seen = state.orderSeen.get(id);
+    state.cancels.unshift({
+      ts: tsMs, series, side: order.side, price: order.price,
+      rested: seen ? Math.max(0, tsMs - seen.placed) : 0,
+    });
+    if (state.cancels.length > CANCELS_CAP) state.cancels.length = CANCELS_CAP;
+    if (state.view === "summary") renderDropCancels();
+  }
+  state.orderSeen.delete(id);
+}
+
+let summaryRefreshTimer = null;
+function scheduleSummaryRefresh() {
+  if (summaryRefreshTimer) return;
+  summaryRefreshTimer = setTimeout(() => {
+    summaryRefreshTimer = null;
+    if (state.view === "summary") { loadSummary(); refreshOpenDrops(); }
+  }, 800);
+}
+
+// ===================================================== CONTROLS (equity etc.)
 const COLUMNS = [
   { key: "WindowsTraded", field: "windows_traded", kind: "count", label: "Windows",
     tip: "Windows traded in the selected period. Low counts are muted — too little sample to trust." },
@@ -146,6 +379,7 @@ function renderBadges() {
     const m = o ? o.modes[which] : null;
     const badge = $("badge-" + which);
     const stateEl = $("badge-" + which + "-state");
+    if (!badge) return;
     badge.classList.remove("on", "armed");
     if (!m) { stateEl.textContent = "—"; return; }
     if (which === "live") {
@@ -161,6 +395,7 @@ function renderBadges() {
 }
 
 function renderKill() {
+  $("global-kill-banner").classList.toggle("hidden", !state.killed);
   $("kill-banner").classList.toggle("hidden", !state.killed);
   $("risk-kill-banner").classList.toggle("hidden", !state.killed);
 }
@@ -181,6 +416,7 @@ function renderCapital() {
 // hand-rolled canvas equity chart (no chart library) -------------------------
 function drawEquityChart() {
   const canvas = $("equity-chart");
+  if (!canvas) return;
   const pts = state.equity[state.mode] || [];
   const dpr = window.devicePixelRatio || 1;
   const cssW = canvas.clientWidth || canvas.parentElement.clientWidth || 320;
@@ -208,7 +444,6 @@ function drawEquityChart() {
   const px = (t) => padL + (x1 === x0 ? W : ((t - x0) / (x1 - x0)) * W);
   const py = (v) => padT + (1 - (v - lo) / (hi - lo)) * H;
 
-  // area fill + line
   ctx.beginPath();
   ctx.moveTo(px(xs[0]), py(ys[0]));
   for (let i = 1; i < pts.length; i++) ctx.lineTo(px(xs[i]), py(ys[i]));
@@ -225,7 +460,6 @@ function drawEquityChart() {
   for (let i = 1; i < pts.length; i++) ctx.lineTo(px(xs[i]), py(ys[i]));
   ctx.strokeStyle = line; ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.stroke();
 
-  // last point marker
   const lx = px(xs[xs.length - 1]), ly = py(ys[ys.length - 1]);
   ctx.fillStyle = line; ctx.beginPath(); ctx.arc(lx, ly, 3, 0, Math.PI * 2); ctx.fill();
 
@@ -326,7 +560,6 @@ async function loadOverview() {
   try {
     const o = await api("/api/overview");
     state.overview = o;
-    // Replace local equity from the authoritative snapshot (WS appends after).
     for (const m of ["paper", "live"]) {
       const arr = (o.modes[m].equity || []).map((p) => ({ t: p.ts_ms, v: num(p.equity) }));
       state.equity[m] = arr.slice(-EQUITY_CAP);
@@ -352,6 +585,7 @@ async function loadSeries() {
 function loadAll() {
   if (!state.paramsLoaded) loadParams();
   loadOverview();
+  loadSummaryTabs();
   refreshActiveView();
 }
 
@@ -364,23 +598,6 @@ function scheduleRefresh() {
     if (state.view === "series") loadSeries();
   }, 1500);
 }
-
-// ----------------------------------------------- live / fills / risk helpers
-function fmtClock(ms) { return new Date(ms).toLocaleTimeString([], { hour12: false }); }
-function fmtCountdown(secs) {
-  secs = Math.max(0, Math.floor(secs));
-  return `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
-}
-function seriesOf(windowKey) { return (windowKey || "").split("@")[0]; }
-function windowSecs(seriesKey) {
-  const dur = (seriesKey || "").split("-")[1];
-  if (dur === "5m") return 300;
-  if (dur === "15m") return 900;
-  if (dur === "1h") return 3600;
-  return 300;
-}
-function isActiveLifecycle(lc) { return lc === "Open" || lc === "Closing"; }
-function px3(p) { return num(p).toFixed(3); }
 
 async function loadParams() {
   try {
@@ -420,7 +637,6 @@ async function loadWindowDetail() {
     renderLiveDetail(d);
   } catch (e) {
     if (e.message === "not found" || e.message === "404") loadWindows();
-    // else transient: keep the last detail rendered
   }
 }
 
@@ -511,8 +727,8 @@ function ladderRows(book, ours, outcome) {
   for (const o of (ours || [])) {
     if (o.outcome === outcome && o.side === "Buy") oursAt[px3(o.price)] = o.remaining;
   }
-  const asks = (book.asks || []).slice(0, 6).reverse(); // high→low above the touch
-  const bids = (book.bids || []).slice(0, 6);           // high→low below the touch
+  const asks = (book.asks || []).slice(0, 6).reverse();
+  const bids = (book.bids || []).slice(0, 6);
   let html = "";
   for (const l of asks) {
     html += `<div class="lad-row ask"><span class="lad-price">${px3(l.price)}</span><span class="lad-size">${num(l.size)}</span></div>`;
@@ -551,7 +767,7 @@ function renderInventory(d) {
 }
 
 function renderPrints(d) {
-  const prints = (d.recent_prints || []).slice().reverse().slice(0, 24); // newest first
+  const prints = (d.recent_prints || []).slice().reverse().slice(0, 24);
   $("prints").innerHTML = prints.length
     ? prints.map((p) => `<span class="print ${p.side === "Buy" ? "buy" : "sell"}">${px3(p.price)}×${num(p.size)}</span>`).join("")
     : `<span class="health-none">no prints yet</span>`;
@@ -663,7 +879,9 @@ function scheduleFillsRefresh() {
 }
 
 function refreshActiveView() {
-  if (state.view === "series") loadSeries();
+  if (state.view === "summary") { loadSummary(); refreshOpenDrops(); }
+  else if (state.view === "controls") { loadOverview(); drawEquityChart(); }
+  else if (state.view === "series") loadSeries();
   else if (state.view === "live") loadWindows();
   else if (state.view === "fills") loadFills();
   else if (state.view === "risk") loadRisk();
@@ -674,7 +892,8 @@ let ws = null, wsBackoff = 1000, wsTimer = null;
 function setConn(on) {
   const dot = $("conn-dot");
   dot.classList.toggle("on", on);
-  dot.title = on ? "WebSocket connected" : "WebSocket disconnected";
+  dot.title = on ? "Live updates connected" : "Live updates disconnected";
+  $("reconnect-banner").classList.toggle("hidden", on);
 }
 function connectWS() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -698,7 +917,8 @@ function onWsMessage(msg) {
       const arr = state.equity[msg.mode] || (state.equity[msg.mode] = []);
       arr.push({ t: msg.ts_ms, v: num(msg.equity) });
       if (arr.length > EQUITY_CAP) arr.shift();
-      if (msg.mode === state.mode && state.view === "overview") { drawEquityChart(); renderCapital(); }
+      if (msg.mode === state.mode && state.view === "controls") { drawEquityChart(); renderCapital(); }
+      if (msg.mode === state.mode && state.view === "summary") scheduleSummaryRefresh();
       break;
     }
     case "control":
@@ -716,19 +936,26 @@ function onWsMessage(msg) {
       }
       if (state.view === "risk") loadRisk();
       break;
+    case "quote":
+      if (msg.mode === state.mode) trackOrder(msg.order, msg.ts_ms);
+      if (state.view === "summary") scheduleSummaryRefresh();
+      if (state.view === "live") scheduleLiveRefresh();
+      break;
     case "fill":
       scheduleRefresh();
+      if (state.view === "summary") scheduleSummaryRefresh();
       if (state.view === "fills") scheduleFillsRefresh();
       if (state.view === "live") scheduleLiveRefresh();
       break;
     case "lifecycle":
       scheduleRefresh();
-      if (state.view === "live") loadWindows(); // the active-window set may have changed
+      if (state.view === "summary") { loadSummaryTabs(); scheduleSummaryRefresh(); }
+      if (state.view === "live") loadWindows();
       break;
     case "top":
-    case "quote":
     case "model":
       if (state.view === "live") scheduleLiveRefresh();
+      if (state.view === "summary") scheduleSummaryRefresh();
       break;
     case "resync":
       loadAll();
@@ -746,13 +973,10 @@ async function postControl(path, body, okMsg) {
   } catch (e) { toast(e.message, true); }
 }
 
-// Polls /api/control/status and renders the arming gates, series toggles, and
-// the parameter overrides (the §11 prominent state display).
 async function loadControlStatus() {
   let s;
   try { s = await api("/api/control/status"); }
-  catch { return; } // 404 until the orchestrator pushes a snapshot.
-  // Arming state + gates.
+  catch { return; }
   const a = s.arming || {};
   $("arming-state").textContent =
     a.session_armed ? "ARMED" : a.pending ? "pending confirmation" : "disarmed";
@@ -763,10 +987,8 @@ async function loadControlStatus() {
     gate(a.config_enabled, "config") + gate(a.env_confirmed, "env phrase") +
     gate(a.session_armed, "session");
   $("arm-btn").disabled = !a.can_arm || a.session_armed;
-  // Series toggles (enabled set from the snapshot).
   const enabled = new Set(s.enabled_series || []);
-  const all = ["BTC-5m", "BTC-15m", "BTC-1h", "ETH-5m", "ETH-15m", "ETH-1h"];
-  $("series-toggles").innerHTML = all.map((k) =>
+  $("series-toggles").innerHTML = ALL_SERIES.map((k) =>
     `<button class="seg-btn ${enabled.has(k) ? "active" : ""}" data-series="${k}">${k}</button>`
   ).join("");
   document.querySelectorAll("#series-toggles .seg-btn").forEach((b) =>
@@ -775,7 +997,6 @@ async function loadControlStatus() {
       postControl(on ? "/api/control/disable-series" : "/api/control/enable-series",
         { series: k }, `${k} ${on ? "disabled" : "enabled"}`);
     }));
-  // Active parameter overrides.
   const ovr = s.param_overrides || [];
   $("param-overrides").innerHTML = ovr.length
     ? ovr.map((o) => `<span class="ovr">${o.series || "all"}: ${o.key} = ${o.value}</span>`).join("")
@@ -801,14 +1022,12 @@ function wireControls() {
     postControl("/api/control/paper-capital", { delta: "1000" }, "+$1k"));
   $("cap-minus").addEventListener("click", () =>
     postControl("/api/control/paper-capital", { delta: "-1000" }, "−$1k"));
-  // Risk-panel kill/reset (same endpoints as the overview controls).
   $("risk-kill-btn").addEventListener("click", () =>
     confirmAction("Kill ALL trading? This cancels every open order and halts the bot (latched).",
       () => postControl("/api/control/kill", undefined, "Kill issued")));
   $("risk-reset-btn").addEventListener("click", () =>
     confirmAction("Reset every breaker (including the daily stop-loss) and resume trading?",
       () => postControl("/api/control/reset", undefined, "Reset issued")));
-  // Control card: arming flow, daily-stop reset, parameter editor.
   $("reset-daily-btn").addEventListener("click", () =>
     confirmAction("Clear the daily stop-loss latch (leaving a manual kill in place)?",
       () => postControl("/api/control/reset-daily-stop", undefined, "Daily stop cleared")));
@@ -838,18 +1057,20 @@ function wireControls() {
 }
 
 // --------------------------------------------------------------------- wiring
-const VIEWS = ["overview", "series", "live", "fills", "risk"];
+const VIEWS = ["summary", "controls", "series", "live", "fills", "risk"];
 function switchView(view) {
   state.view = view;
   document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === view));
   VIEWS.forEach((v) => $("view-" + v).classList.toggle("hidden", v !== view));
-  if (view === "overview") drawEquityChart();
-  else refreshActiveView();
+  if (view === "controls") drawEquityChart();
+  refreshActiveView();
 }
 function switchMode(mode) {
   state.mode = mode;
   document.querySelectorAll("#mode-toggle .seg-btn").forEach((b) => b.classList.toggle("active", b.dataset.mode === mode));
+  state.cancels = []; state.orderSeen.clear();
   renderBadges(); renderCapital(); drawEquityChart();
+  loadSummaryTabs();
   refreshActiveView();
 }
 
@@ -861,6 +1082,20 @@ function init() {
     document.querySelectorAll("#window-toggle .seg-btn").forEach((x) => x.classList.toggle("active", x === b));
     loadSeries();
   }));
+  document.querySelectorAll("#sum-window .seg-btn").forEach((b) => b.addEventListener("click", () => {
+    state.summary.window = b.dataset.window;
+    document.querySelectorAll("#sum-window .seg-btn").forEach((x) => x.classList.toggle("active", x === b));
+    loadSummary();
+  }));
+  // Lazy-load each dropdown when it is first opened.
+  $("drop-fills").parentElement.addEventListener("toggle", (e) => { if (e.target.open) loadDropFills(); });
+  $("drop-cancels").parentElement.addEventListener("toggle", (e) => { if (e.target.open) renderDropCancels(); });
+  $("drop-positions").parentElement.addEventListener("toggle", (e) => { if (e.target.open) loadDropPositions(); });
+  $("drop-resolved").parentElement.addEventListener("toggle", (e) => { if (e.target.open) loadDropResolved(); });
+  $("status-info").addEventListener("click", (e) => {
+    e.stopPropagation();
+    showTip(e.target, decodeURIComponent(e.target.dataset.tip || ""));
+  });
   $("token-btn").addEventListener("click", () => {
     const cur = getToken();
     showAuthBanner(true);
@@ -879,14 +1114,18 @@ function init() {
     renderFills();
   });
   wireControls();
-  window.addEventListener("resize", () => { if (state.view === "overview") drawEquityChart(); });
+  window.addEventListener("resize", () => { if (state.view === "controls") drawEquityChart(); });
 
   // Client-side countdown ticker; fills re-poll to surface matured 5s markouts.
   setInterval(() => { if (state.view === "live") renderCountdown(); }, 1000);
   setInterval(() => { if (state.view === "fills") loadFills(); }, 5000);
+  // Periodic calm refresh of the summary (also catches matured markouts in drops).
+  setInterval(() => { if (state.view === "summary") { loadSummary(); refreshOpenDrops(); } }, 5000);
 
   loadParams();
   loadOverview();
+  loadSummaryTabs();
+  loadSummary();
   connectWS();
 }
 document.addEventListener("DOMContentLoaded", init);

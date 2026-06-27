@@ -27,7 +27,7 @@ use core_types::{
     Size, TimeInForce, TokenId, TopOfBook, WindowLifecycle,
 };
 use dashboard::{ControlRequest, DashboardHandle, ParamsView};
-use engine::{InventoryEffect, InventoryManager, QuoteParams};
+use engine::{InventoryEffect, InventoryManager, QuoteManagerParams, QuoteParams};
 use feed_binance::{BinanceArgs, BinanceSub};
 use feed_clob::{ClobArgs, ClobCommand, ClobStatus};
 use feed_rtds::{FeedSub, RtdsArgs};
@@ -136,6 +136,19 @@ pub(crate) fn params_view(config: &AppConfig) -> ParamsView {
             (
                 "engine.atm_band".to_owned(),
                 QuoteParams::default().atm_band.to_string(),
+            ),
+            // The "yank-it-back reflex" targets the live-activity strip compares
+            // the measured time-to-replace / time-to-cancel against (no config
+            // key; sourced from the engine defaults).
+            (
+                "engine.min_requote_interval_ms".to_owned(),
+                QuoteManagerParams::default()
+                    .min_requote_interval_ms
+                    .to_string(),
+            ),
+            (
+                "engine.cancel_rtt_secs".to_owned(),
+                QuoteParams::default().cancel_rtt_secs.to_string(),
             ),
         ],
     }

@@ -20,7 +20,7 @@ use venue_api::Wallet;
 use venue_paper::PaperLedgerSnapshot;
 
 use crate::state::DashboardData;
-use analytics::SortColumn;
+use analytics::{AdverseSelectionState, AnalyticsParams, ComparisonWindow, DayKey, SortColumn};
 
 // ---- venue snapshot DTOs (the three non-Serialize types) -------------------
 
@@ -699,6 +699,412 @@ pub(crate) fn sort_columns() -> Vec<SortColumnDto> {
         .collect()
 }
 
+// ---- resolved windows (the "recent resolved windows" dropdown) -------------
+
+/// One settled window split into the two dashboard buckets.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolvedWindowDto {
+    /// Window key (`Series@open_ms`).
+    pub window: String,
+    /// The series.
+    pub series: Series,
+    /// Winning outcome.
+    pub outcome: Outcome,
+    /// Bucket 1 — profit locked from completed pairs.
+    pub completed_pair_pnl: Dollars,
+    /// Bucket 2 — profit/loss on stuck legs (incl. taker fees).
+    pub stuck_leg_pnl: Dollars,
+    /// The realized ledger PnL (the two buckets sum to this).
+    pub realized_pnl: Dollars,
+    /// Pairs completed (held matched + merged).
+    pub pairs_completed: Size,
+    /// Stranded (unmatched) shares at close.
+    pub stranded_shares: Decimal,
+    /// Settlement time (unix millis).
+    pub ts_ms: i64,
+}
+
+/// Builds the recent-resolved-windows feed (newest first), each split into the
+/// two buckets via the same exact decomposition the analytics rollup uses. The
+/// rebate/counts are not needed for the two buckets, so they pass as zero.
+#[must_use]
+pub(crate) fn resolved_windows(
+    data: &DashboardData,
+    mode: Mode,
+    series: Option<Series>,
+    limit: usize,
+) -> Vec<ResolvedWindowDto> {
+    use analytics::WindowAttribution;
+    data.mode(mode)
+        .settlements
+        .iter()
+        .rev()
+        .filter(|s| series.is_none_or(|f| s.window.series == f))
+        .take(limit)
+        .map(|s| {
+            let a = WindowAttribution::from_summary(
+                s,
+                mode,
+                Dollars::ZERO,
+                Decimal::ZERO,
+                0,
+                0,
+                Dollars::ZERO,
+            );
+            ResolvedWindowDto {
+                window: s.window.to_string(),
+                series: s.window.series,
+                outcome: s.outcome,
+                completed_pair_pnl: pz(a.completed_pair_pnl()),
+                stuck_leg_pnl: pz(a.stuck_leg_pnl()),
+                realized_pnl: pz(a.realized_pnl),
+                pairs_completed: a.pairs_completed(),
+                stranded_shares: a.stranded_shares,
+                ts_ms: s.ts.as_millis(),
+            }
+        })
+        .collect()
+}
+
+// ---- summary (the calm landing screen) -------------------------------------
+
+/// The one-line plain-English health verdict the summary computes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthState {
+    /// Pairs are completing and the stuck-leg bucket is not bleeding.
+    Healthy,
+    /// Legs are getting stranded / quotes are being picked off.
+    Caution,
+    /// Not enough resolved windows yet to judge.
+    WarmingUp,
+}
+
+/// The at-a-glance health row.
+#[derive(Debug, Clone, Serialize)]
+pub struct HeadlineDto {
+    /// Paper starting capital (account-global; paper only).
+    pub starting_capital: Option<Dollars>,
+    /// Current equity (collateral total; account-global).
+    pub equity: Option<Dollars>,
+    /// Realized P/L for the current UTC day in the selected scope.
+    pub today_pl: Dollars,
+    /// Fraction of resolved windows that ended in profit, `None` with none.
+    pub win_rate: Option<f64>,
+    /// Resolved windows in the selected scope (drives the warming-up flag).
+    pub windows_traded: u32,
+}
+
+/// The computed status sentence + its reasoning (the tooltip text).
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusDto {
+    /// The verdict.
+    pub state: HealthState,
+    /// One-line plain-English status.
+    pub sentence: String,
+    /// How the verdict was decided (shown in a tooltip).
+    pub reason: String,
+}
+
+/// The two-bucket "why are we making/losing money" explainer.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExplainerDto {
+    /// Bucket 1 — profit locked from completed pairs (the fee-free maker edge).
+    pub completed_pair_pnl: Dollars,
+    /// Bucket 2 — profit/loss on legs that filled one side only (incl. taker fees).
+    pub stuck_leg_pnl: Dollars,
+    /// The realized total the two buckets sum to (the ledger figure).
+    pub total_pnl: Dollars,
+    /// Pairs the strategy completed (both sides filled).
+    pub pairs_completed: Size,
+    /// Unmatched shares left stranded at window close.
+    pub legs_stranded: Decimal,
+    /// Average cost to complete a pair (`avg_up + avg_down`), `None` with none.
+    pub avg_pair_cost: Option<Decimal>,
+    /// Average directional P/L per stranded share (before taker fees), `None`
+    /// when nothing was stranded.
+    pub avg_loss_per_stranded: Option<Dollars>,
+    /// Estimated maker rebate (a separate bonus, not in the ledger total).
+    pub rebate_estimate: Dollars,
+}
+
+/// The calm live-activity strip.
+#[derive(Debug, Clone, Serialize)]
+pub struct ActivityDto {
+    /// Orders placed in the last minute.
+    pub placed_1m: u64,
+    /// Orders cancelled in the last minute.
+    pub cancelled_1m: u64,
+    /// Fills in the last minute.
+    pub fills_1m: u64,
+    /// Orders resting on the book right now.
+    pub resting_now: u64,
+    /// Median cancel round-trip (ms); `null` in paper (unobservable there).
+    pub median_ttc_ms: Option<i64>,
+    /// Median cancel→replace gap (ms); `null` with no sample.
+    pub median_ttr_ms: Option<i64>,
+    /// Time-to-cancel target (ms) from config (`cancel_rtt_secs`).
+    pub ttc_target_ms: i64,
+    /// Time-to-replace target (ms) from config (`min_requote_interval_ms`).
+    pub ttr_target_ms: i64,
+    /// Whether the median TTC is within target (true when unobserved).
+    pub ttc_ok: bool,
+    /// Whether the median TTR is within target (true when unobserved).
+    pub ttr_ok: bool,
+}
+
+/// The `/api/summary` response — everything the calm landing screen needs.
+#[derive(Debug, Clone, Serialize)]
+pub struct SummaryDto {
+    /// Which trading mode.
+    pub mode: Mode,
+    /// The series scope (`None` = all enabled series combined).
+    pub series: Option<Series>,
+    /// The time-window selection the explainer covers.
+    pub window: ComparisonWindow,
+    /// At-a-glance health row.
+    pub headline: HeadlineDto,
+    /// The computed status sentence.
+    pub status: StatusDto,
+    /// The two-bucket explainer.
+    pub explainer: ExplainerDto,
+    /// The live-activity strip.
+    pub activity: ActivityDto,
+}
+
+/// The raw additive sums across the selected series aggregates.
+#[derive(Default)]
+struct Combined {
+    windows_traded: u32,
+    windows_profitable: u32,
+    net_pnl: Dollars,
+    locked_pair_pnl: Dollars,
+    inventory_pnl: Dollars,
+    taker_fees: Dollars,
+    estimated_rebate: Dollars,
+    pairs_completed: Size,
+    stranded_shares: Decimal,
+    pair_cost_sum: Decimal,
+    pair_cost_n: u32,
+    any_alarm: bool,
+}
+
+/// Folds the selected series' aggregates (over `window`) into the raw sums.
+fn combine(
+    data: &DashboardData,
+    mode: Mode,
+    series: Option<Series>,
+    window: ComparisonWindow,
+) -> Combined {
+    let ms = data.mode(mode);
+    let today = DayKey::from_ts(data.last_now);
+    let mut c = Combined::default();
+    for agg in ms.analytics.rollups().series_aggregates_over(window, today) {
+        if series.is_some_and(|s| s != agg.series) {
+            continue;
+        }
+        c.windows_traded += agg.windows_traded;
+        c.windows_profitable += agg.windows_profitable;
+        c.net_pnl = c.net_pnl + agg.net_realized;
+        c.locked_pair_pnl = c.locked_pair_pnl + agg.locked_pair_pnl;
+        c.inventory_pnl = c.inventory_pnl + agg.excess_pnl + agg.settlement_remainder;
+        c.taker_fees = c.taker_fees + agg.taker_fees;
+        c.estimated_rebate = c.estimated_rebate + agg.estimated_rebate;
+        c.pairs_completed = c.pairs_completed + agg.matched_pairs + agg.merged_pairs;
+        c.stranded_shares += agg.stranded_shares;
+        c.pair_cost_sum += agg.pair_cost_sum;
+        c.pair_cost_n += agg.pair_cost_n;
+        if ms.analytics.series_health(agg.series) == AdverseSelectionState::Alarm {
+            c.any_alarm = true;
+        }
+    }
+    c
+}
+
+/// Reads a flat param entry as `i64`, falling back to `default`.
+fn param_i64(data: &DashboardData, key: &str, default: i64) -> i64 {
+    data.params
+        .entries
+        .iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// The time-to-cancel target in ms, from `engine.cancel_rtt_secs` (seconds).
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "cancel RTT is a small positive seconds value, rounded before the cast"
+)]
+fn ttc_target_ms(data: &DashboardData) -> i64 {
+    let secs: f64 = data
+        .params
+        .entries
+        .iter()
+        .find(|(k, _)| k == "engine.cancel_rtt_secs")
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(0.2);
+    (secs * 1000.0).round() as i64
+}
+
+/// Formats dollars to cents for a status sentence.
+fn usd(d: Dollars) -> String {
+    format!("${}", pz(d).as_decimal().round_dp(2))
+}
+
+/// Maps a numerically-zero dollar value to positive zero: `rust_decimal` can
+/// carry a `-0` sign (e.g. from negating `$0` of fees) that would render as the
+/// jarring "-$0" the calm UI must never show.
+fn pz(d: Dollars) -> Dollars {
+    if d.as_decimal().is_zero() {
+        Dollars::ZERO
+    } else {
+        d
+    }
+}
+
+/// Computes the plain-English status verdict from the two buckets, the resolved
+/// window count, and the adverse-selection alarm. Pure and unit-tested.
+#[must_use]
+pub(crate) fn compute_status(
+    completed: Dollars,
+    stuck: Dollars,
+    windows_traded: u32,
+    min_sample: u32,
+    any_alarm: bool,
+) -> StatusDto {
+    let reason = format!(
+        "Decided from the stuck-leg P/L ({}) and the 5-second markout health ({}). \
+         Caution when stranded legs give back the pair profit, or when resting quotes \
+         are being picked off.",
+        usd(stuck),
+        if any_alarm { "alarm" } else { "ok" }
+    );
+
+    if windows_traded < min_sample {
+        return StatusDto {
+            state: HealthState::WarmingUp,
+            sentence: format!(
+                "Warming up — only {windows_traded} resolved window(s) so far (need {min_sample} to judge)."
+            ),
+            reason,
+        };
+    }
+
+    // "Giving the profit back": the stuck-leg bucket is negative and erases at
+    // least half of the completed-pair profit (or there is no pair cushion).
+    let half_completed = Dollars::new(completed.as_decimal() / Decimal::from(2));
+    let giving_back = stuck < Dollars::ZERO
+        && (completed <= Dollars::ZERO || stuck + half_completed <= Dollars::ZERO);
+
+    if any_alarm {
+        StatusDto {
+            state: HealthState::Caution,
+            sentence:
+                "Caution: resting quotes are being picked off — the 5-second markout is negative."
+                    .to_owned(),
+            reason,
+        }
+    } else if giving_back {
+        StatusDto {
+            state: HealthState::Caution,
+            sentence: format!(
+                "Caution: market is trending, legs are getting stranded — earned {} from completed pairs but gave back {} on stuck legs.",
+                usd(completed),
+                usd(-stuck)
+            ),
+            reason,
+        }
+    } else {
+        StatusDto {
+            state: HealthState::Healthy,
+            sentence: "Healthy: pairs are completing and spreads are positive.".to_owned(),
+            reason,
+        }
+    }
+}
+
+/// Builds the `/api/summary` response for a mode, optional series scope, and time
+/// window. The two explainer buckets sum to the realized total (the ledger).
+#[must_use]
+pub(crate) fn summary(
+    data: &DashboardData,
+    mode: Mode,
+    series: Option<Series>,
+    window: ComparisonWindow,
+) -> SummaryDto {
+    let ms = data.mode(mode);
+    let c = combine(data, mode, series, window);
+    let today = combine(data, mode, series, ComparisonWindow::Today);
+    let min_sample = AnalyticsParams::default().min_sample_windows;
+
+    let completed = c.locked_pair_pnl;
+    let stuck = c.inventory_pnl + c.taker_fees;
+
+    let avg_pair_cost = if c.pair_cost_n == 0 {
+        None
+    } else {
+        Some(c.pair_cost_sum / Decimal::from(c.pair_cost_n))
+    };
+    let avg_loss_per_stranded = if c.stranded_shares.is_zero() {
+        None
+    } else {
+        Some(pz(Dollars::new(
+            c.inventory_pnl.as_decimal() / c.stranded_shares,
+        )))
+    };
+    let win_rate = if c.windows_traded == 0 {
+        None
+    } else {
+        Some(f64::from(c.windows_profitable) / f64::from(c.windows_traded))
+    };
+
+    let now = data.last_now;
+    let ttr_target = param_i64(data, "engine.min_requote_interval_ms", 250);
+    let ttc_target = ttc_target_ms(data);
+    let median_ttc = ms.activity.median_time_to_cancel_ms(series);
+    let median_ttr = ms.activity.median_time_to_replace_ms(series);
+
+    SummaryDto {
+        mode,
+        series,
+        window,
+        headline: HeadlineDto {
+            starting_capital: match mode {
+                Mode::Paper => data.params.paper_capital,
+                Mode::Live => None,
+            },
+            equity: ms.wallet.as_ref().map(|w| w.collateral_total),
+            today_pl: pz(today.net_pnl),
+            win_rate,
+            windows_traded: c.windows_traded,
+        },
+        status: compute_status(completed, stuck, c.windows_traded, min_sample, c.any_alarm),
+        explainer: ExplainerDto {
+            completed_pair_pnl: pz(completed),
+            stuck_leg_pnl: pz(stuck),
+            total_pnl: pz(c.net_pnl),
+            pairs_completed: c.pairs_completed,
+            legs_stranded: c.stranded_shares,
+            avg_pair_cost,
+            avg_loss_per_stranded,
+            rebate_estimate: pz(c.estimated_rebate),
+        },
+        activity: ActivityDto {
+            placed_1m: ms.activity.placed_since(now, 60_000, series),
+            cancelled_1m: ms.activity.cancelled_since(now, 60_000, series),
+            fills_1m: ms.activity.fills_since(now, 60_000, series),
+            resting_now: ms.activity.resting(series),
+            median_ttc_ms: median_ttc,
+            median_ttr_ms: median_ttr,
+            ttc_target_ms: ttc_target,
+            ttr_target_ms: ttr_target,
+            ttc_ok: median_ttc.is_none_or(|m| m <= ttc_target),
+            ttr_ok: median_ttr.is_none_or(|m| m <= ttr_target),
+        },
+    }
+}
+
 // ---- helpers ---------------------------------------------------------------
 
 /// Parses a `Series@open_ms` window key back into a [`WindowId`].
@@ -1022,5 +1428,142 @@ mod tests {
     #[test]
     fn sort_columns_cover_all() {
         assert_eq!(sort_columns().len(), 13);
+    }
+
+    // ---- summary: status sentence -------------------------------------------
+
+    #[test]
+    fn status_is_warming_up_below_min_sample() {
+        let s = compute_status(Dollars::new(dec!(5)), Dollars::ZERO, 3, 30, false);
+        assert_eq!(s.state, HealthState::WarmingUp);
+        assert!(s.sentence.contains("Warming up"));
+    }
+
+    #[test]
+    fn status_is_healthy_when_legs_are_not_bleeding() {
+        // Enough windows, stuck-leg bucket positive, no alarm.
+        let s = compute_status(Dollars::new(dec!(20)), Dollars::new(dec!(3)), 50, 30, false);
+        assert_eq!(s.state, HealthState::Healthy);
+        assert!(s.sentence.contains("Healthy"));
+    }
+
+    #[test]
+    fn status_is_caution_when_stuck_legs_give_back_the_profit() {
+        // Earned 10 on pairs, gave back 8 on stuck legs (> half) → Caution.
+        let s = compute_status(
+            Dollars::new(dec!(10)),
+            Dollars::new(dec!(-8)),
+            50,
+            30,
+            false,
+        );
+        assert_eq!(s.state, HealthState::Caution);
+        assert!(s.sentence.contains("gave back"));
+        assert!(s.sentence.contains("$8"));
+        // A small negative that does not erase half the profit stays Healthy.
+        let ok = compute_status(
+            Dollars::new(dec!(10)),
+            Dollars::new(dec!(-1)),
+            50,
+            30,
+            false,
+        );
+        assert_eq!(ok.state, HealthState::Healthy);
+    }
+
+    #[test]
+    fn status_is_caution_on_adverse_selection_alarm() {
+        let s = compute_status(Dollars::new(dec!(10)), Dollars::new(dec!(2)), 50, 30, true);
+        assert_eq!(s.state, HealthState::Caution);
+        assert!(s.sentence.contains("picked off"));
+    }
+
+    // ---- summary: builder ----------------------------------------------------
+
+    /// Drives a balanced-book window to settlement and asserts the summary's
+    /// two buckets reconcile and the activity tiles populate.
+    #[test]
+    fn summary_reconciles_buckets_and_reports_activity() {
+        use core_types::{SettlementSummary, SideInventory};
+        let wid = btc_5m_window(0);
+        let market = tests_support::market(wid);
+        let mut data = DashboardData::new(ts(0));
+        data.project(
+            Mode::Paper,
+            &Event::Window {
+                market: Arc::clone(&market),
+                lifecycle: WindowLifecycle::Open,
+            },
+            ts(0),
+        );
+        // A placement and a maker fill feed the live-activity strip.
+        data.project(
+            Mode::Paper,
+            &Event::OrderUpdate(Arc::new(order(
+                wid,
+                "o1",
+                "1",
+                Side::Buy,
+                OrderState::Open,
+                dec!(0.48),
+                dec!(100),
+                dec!(0),
+            ))),
+            ts(1_000),
+        );
+        data.project(
+            Mode::Paper,
+            &fill_ev(wid, Outcome::Up, Liquidity::Maker, 1_000, "f1"),
+            ts(1_000),
+        );
+        // Resolve Up, then settle: 100 Up @ .48 + 100 Down @ .49, realized $3.
+        data.project(
+            Mode::Paper,
+            &Event::Window {
+                market,
+                lifecycle: WindowLifecycle::Resolved {
+                    outcome: Outcome::Up,
+                },
+            },
+            ts(300_000),
+        );
+        let settle = SettlementSummary::close(
+            wid,
+            Outcome::Up,
+            SideInventory {
+                shares: Size::new(dec!(100)).unwrap(),
+                cost: Dollars::new(dec!(48)),
+            },
+            SideInventory {
+                shares: Size::new(dec!(100)).unwrap(),
+                cost: Dollars::new(dec!(49)),
+            },
+            Size::ZERO,
+            Dollars::ZERO,
+            Dollars::new(dec!(3)),
+            ts(300_000),
+        );
+        data.project(
+            Mode::Paper,
+            &Event::Settlement(Arc::new(settle)),
+            ts(300_000),
+        );
+
+        let s = summary(&data, Mode::Paper, None, ComparisonWindow::All);
+        // The two buckets sum to the realized total (here all locked, $3).
+        assert_eq!(s.explainer.completed_pair_pnl, Dollars::new(dec!(3)));
+        assert_eq!(s.explainer.stuck_leg_pnl, Dollars::ZERO);
+        assert_eq!(
+            s.explainer.completed_pair_pnl + s.explainer.stuck_leg_pnl,
+            s.explainer.total_pnl
+        );
+        assert_eq!(s.explainer.total_pnl, Dollars::new(dec!(3)));
+        // 100 matched pairs completed.
+        assert_eq!(s.explainer.pairs_completed, Size::new(dec!(100)).unwrap());
+        assert_eq!(s.headline.win_rate, Some(1.0));
+        // Activity (now = 300_000): the placement/fill are >60s old, so the
+        // last-minute counts are 0, but a resting order remains.
+        assert_eq!(s.activity.resting_now, 1);
+        assert_eq!(s.activity.ttr_target_ms, 250); // default when unset
     }
 }

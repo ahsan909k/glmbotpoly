@@ -27,10 +27,12 @@
 //!
 //! - [`markout`] — per-passive-fill markouts at 1s/5s/30s/expiry against model fair.
 //! - [`attribution`] — per-window PnL decomposition that reconciles to the ledger.
+//! - [`activity`] — live order-activity (placed/cancelled/fills, resting, TTC/TTR).
 //! - [`health`] — the per-series adverse-selection alarm.
 //! - [`rollup`] — daily + per-series aggregates (the §10 comparison columns).
 //! - [`params`] — crate-local tuning (`config → params` boundary map deferred).
 
+pub mod activity;
 pub mod attribution;
 pub mod datekey;
 pub mod engine;
@@ -41,6 +43,7 @@ pub mod params;
 pub mod replay;
 pub mod rollup;
 
+pub use activity::OrderActivity;
 pub use attribution::{WindowAttrib, WindowAttribution};
 pub use datekey::DayKey;
 pub use engine::{Analytics, AnalyticsEffect};

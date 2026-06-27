@@ -79,6 +79,56 @@ async fn series_comparison_paper_then_live_and_resort() {
 }
 
 #[tokio::test]
+async fn summary_reconciles_buckets_and_scopes_by_series() {
+    let router = open_router(seeded_handle());
+
+    // All-series paper summary: one settled window, realized $3 all locked.
+    let (status, body) = get(&router, "/api/summary?mode=paper&window=all", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["mode"], "paper");
+    assert_eq!(body["explainer"]["completed_pair_pnl"], "3");
+    assert_eq!(body["explainer"]["stuck_leg_pnl"], "0");
+    assert_eq!(body["explainer"]["total_pnl"], "3");
+    assert_eq!(body["explainer"]["pairs_completed"], "100");
+    // Headline: account-global equity + paper capital, win rate, today's P/L.
+    assert_eq!(body["headline"]["equity"], "10000");
+    assert_eq!(body["headline"]["starting_capital"], "10000");
+    assert_eq!(body["headline"]["win_rate"], 1.0);
+    assert_eq!(body["headline"]["windows_traded"], 1);
+    assert_eq!(body["headline"]["today_pl"], "3");
+    // Only one resolved window (< min sample) ⇒ warming up.
+    assert_eq!(body["status"]["state"], "warming_up");
+    // Activity: one resting order; targets fall back to engine defaults.
+    assert_eq!(body["activity"]["resting_now"], 1);
+    assert_eq!(body["activity"]["ttr_target_ms"], 250);
+    assert_eq!(body["activity"]["ttc_target_ms"], 200);
+    // Paper has no PendingCancel ⇒ no time-to-cancel sample.
+    assert!(body["activity"]["median_ttc_ms"].is_null());
+
+    // Scoping to the (only) traded series gives the same numbers.
+    let (status, scoped) = get(
+        &router,
+        "/api/summary?mode=paper&series=BTC-5m&window=all",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(scoped["explainer"]["total_pnl"], "3");
+    assert_eq!(scoped["series"], "BTC-5m");
+
+    // Live namespace is empty-but-present.
+    let (status, live) = get(&router, "/api/summary?mode=live", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(live["explainer"]["total_pnl"], "0");
+    assert_eq!(live["headline"]["windows_traded"], 0);
+    assert!(live["headline"]["win_rate"].is_null());
+
+    // An unknown series is a 400.
+    let (status, _) = get(&router, "/api/summary?mode=paper&series=nonsense", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn windows_list_is_shared_with_per_mode_inventory() {
     let router = open_router(seeded_handle());
 
@@ -220,7 +270,9 @@ async fn static_ui_is_served_unauthenticated() {
     let (status, ct, body) = common::get_raw(&router, "/").await;
     assert_eq!(status, StatusCode::OK);
     assert!(ct.contains("text/html"));
-    assert!(body.contains("Polymarket Bot"));
+    assert!(body.contains("Trading Bot"));
+    // The calm summary landing is present.
+    assert!(body.contains("view-summary"));
 
     let (status, ct, _) = common::get_raw(&router, "/app.js").await;
     assert_eq!(status, StatusCode::OK);

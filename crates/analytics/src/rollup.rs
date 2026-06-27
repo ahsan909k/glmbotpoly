@@ -12,7 +12,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
-use core_types::{Decimal, Dollars, Mode, Series};
+use core_types::{Decimal, Dollars, Mode, Series, Size};
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 
@@ -232,6 +232,16 @@ pub struct DailyRollup {
     pub taker_fills: u64,
     /// `Σ price·size` over taker fills — the taker-budget-usage numerator.
     pub taker_notional: Dollars,
+    /// Matched pairs held at close, summed across windows (dashboard explainer).
+    pub matched_pairs: Size,
+    /// Pairs merged back to collateral, summed across windows.
+    pub merged_pairs: Size,
+    /// Stranded (unmatched) shares `|excess|`, summed across windows.
+    pub stranded_shares: Decimal,
+    /// `Σ pair_cost` over windows that held a pair (averaged via `pair_cost_n`).
+    pub pair_cost_sum: Decimal,
+    /// Count of windows that held a pair (the `pair_cost` denominator).
+    pub pair_cost_n: u32,
     /// Sum of finalized passive-fill 5s markouts.
     pub markout_5s_sum: f64,
     /// Sum of squares of those 5s markouts (population variance via `Σx²`).
@@ -263,6 +273,11 @@ impl DailyRollup {
             maker_fills: 0,
             taker_fills: 0,
             taker_notional: Dollars::ZERO,
+            matched_pairs: Size::ZERO,
+            merged_pairs: Size::ZERO,
+            stranded_shares: Decimal::ZERO,
+            pair_cost_sum: Decimal::ZERO,
+            pair_cost_n: 0,
             markout_5s_sum: 0.0,
             markout_5s_sumsq: 0.0,
             markout_5s_n: 0,
@@ -286,6 +301,13 @@ impl DailyRollup {
         self.maker_fills += a.maker_fills;
         self.taker_fills += a.taker_fills;
         self.taker_notional = self.taker_notional + a.taker_notional;
+        self.matched_pairs = self.matched_pairs + a.matched_pairs;
+        self.merged_pairs = self.merged_pairs + a.merged_pairs;
+        self.stranded_shares += a.stranded_shares;
+        if let Some(pc) = a.pair_cost {
+            self.pair_cost_sum += pc;
+            self.pair_cost_n += 1;
+        }
         for m in markout_5s {
             if !m.is_finite() {
                 continue; // defensive; finalized markouts are finite
@@ -366,6 +388,16 @@ pub struct SeriesAggregate {
     pub taker_fills: u64,
     /// `Σ price·size` over taker fills — the taker-budget-usage numerator.
     pub taker_notional: Dollars,
+    /// Matched pairs held at close, summed across windows.
+    pub matched_pairs: Size,
+    /// Pairs merged back to collateral, summed across windows.
+    pub merged_pairs: Size,
+    /// Stranded (unmatched) shares `|excess|`, summed across windows.
+    pub stranded_shares: Decimal,
+    /// `Σ pair_cost` over windows that held a pair.
+    pub pair_cost_sum: Decimal,
+    /// Count of windows that held a pair.
+    pub pair_cost_n: u32,
     /// Sum of 5s markouts.
     pub markout_5s_sum: f64,
     /// Sum of squares of 5s markouts.
@@ -396,6 +428,11 @@ impl SeriesAggregate {
             maker_fills: 0,
             taker_fills: 0,
             taker_notional: Dollars::ZERO,
+            matched_pairs: Size::ZERO,
+            merged_pairs: Size::ZERO,
+            stranded_shares: Decimal::ZERO,
+            pair_cost_sum: Decimal::ZERO,
+            pair_cost_n: 0,
             markout_5s_sum: 0.0,
             markout_5s_sumsq: 0.0,
             markout_5s_n: 0,
@@ -417,6 +454,11 @@ impl SeriesAggregate {
         self.maker_fills += d.maker_fills;
         self.taker_fills += d.taker_fills;
         self.taker_notional = self.taker_notional + d.taker_notional;
+        self.matched_pairs = self.matched_pairs + d.matched_pairs;
+        self.merged_pairs = self.merged_pairs + d.merged_pairs;
+        self.stranded_shares += d.stranded_shares;
+        self.pair_cost_sum += d.pair_cost_sum;
+        self.pair_cost_n += d.pair_cost_n;
         self.markout_5s_sum += d.markout_5s_sum;
         self.markout_5s_sumsq += d.markout_5s_sumsq;
         self.markout_5s_n += d.markout_5s_n;
@@ -465,6 +507,21 @@ impl SeriesAggregate {
             (self.taker_notional.as_decimal() / Decimal::from(self.windows_traded) / budget)
                 .to_f64()
         };
+        let inventory_pnl = self.excess_pnl + self.settlement_remainder;
+        let avg_pair_cost = if self.pair_cost_n == 0 {
+            None
+        } else {
+            Some(self.pair_cost_sum / Decimal::from(self.pair_cost_n))
+        };
+        // Directional PnL per stranded share (before taker fees); `None` when no
+        // shares were ever stranded.
+        let avg_stuck_leg_pnl = if self.stranded_shares.is_zero() {
+            None
+        } else {
+            Some(Dollars::new(
+                inventory_pnl.as_decimal() / self.stranded_shares,
+            ))
+        };
         SeriesComparisonRow {
             series: self.series,
             mode: self.mode,
@@ -473,7 +530,7 @@ impl SeriesAggregate {
             net_pnl: self.net_realized,
             pnl_per_window: per_window(self.net_realized, self.windows_traded),
             locked_pair_pnl: self.locked_pair_pnl,
-            inventory_pnl: self.excess_pnl + self.settlement_remainder,
+            inventory_pnl,
             fees_paid: -self.taker_fees, // report as a positive cost
             rebates_earned: self.estimated_rebate,
             avg_markout_5s: markout_5s.mean,
@@ -483,6 +540,10 @@ impl SeriesAggregate {
             maker_fill_fraction: fraction64(self.maker_fills, self.maker_fills + self.taker_fills),
             taker_notional: self.taker_notional,
             taker_budget_used_fraction,
+            pairs_completed: self.matched_pairs + self.merged_pairs,
+            stranded_shares: self.stranded_shares,
+            avg_pair_cost,
+            avg_stuck_leg_pnl,
             min_sample_warning: self.windows_traded < min_sample_windows,
             health,
         }
@@ -529,6 +590,19 @@ pub struct SeriesComparisonRow {
     /// budget; `None` when the budget is `0` or no windows traded. `1.0` means
     /// the average window spent its whole taker budget.
     pub taker_budget_used_fraction: Option<f64>,
+    /// Pairs the strategy completed (held matched pairs + merged pairs) — the
+    /// dashboard's "Pairs completed" count.
+    pub pairs_completed: Size,
+    /// Unmatched shares left stranded at close (`Σ |excess|`) — the dashboard's
+    /// "legs stranded" count.
+    pub stranded_shares: Decimal,
+    /// Average cost to complete a pair (`avg_up + avg_down`), `None` with no
+    /// paired window.
+    pub avg_pair_cost: Option<Decimal>,
+    /// Average directional PnL per stranded share (inventory PnL ÷ stranded
+    /// shares, before taker fees), `None` when nothing was stranded — the
+    /// dashboard's "average loss per stranded leg".
+    pub avg_stuck_leg_pnl: Option<Dollars>,
     /// Whether the series has traded too few windows to trust (§10), evaluated
     /// against the **selected** window's traded count.
     pub min_sample_warning: bool,
@@ -871,8 +945,34 @@ mod tests {
             maker_fills: 4,
             taker_fills: 1,
             taker_notional,
+            matched_pairs: Size::ZERO,
+            merged_pairs: Size::ZERO,
+            stranded_shares: Decimal::ZERO,
+            pair_cost: None,
             ts,
         }
+    }
+
+    /// Like [`attribution_notional`] but with the pairs/stranded fields set, for
+    /// the dashboard-explainer aggregate tests.
+    fn attribution_pairs(
+        realized: Decimal,
+        ts: TimestampMs,
+        matched: Decimal,
+        merged: Decimal,
+        stranded: Decimal,
+        pair_cost: Option<Decimal>,
+    ) -> WindowAttribution {
+        let mut a = attribution_notional(realized, ts, Dollars::ZERO);
+        a.matched_pairs = Size::new(matched).expect("matched");
+        a.merged_pairs = Size::new(merged).expect("merged");
+        a.stranded_shares = stranded;
+        a.pair_cost = pair_cost;
+        // Mirror the stranded shares into the inventory bucket so the
+        // avg-loss-per-stranded math has a non-zero numerator to divide.
+        a.excess_pnl = Dollars::new(-stranded); // pretend each stranded share lost $1
+        a.locked_pair_pnl = Dollars::new(realized) - a.excess_pnl;
+        a
     }
 
     #[test]
@@ -1130,6 +1230,62 @@ mod tests {
         let rowe = empty.to_row(30, Dollars::new(dec!(10)), AdverseSelectionState::Ok);
         assert_eq!(rowe.taker_budget_used_fraction, None);
         assert_eq!(rowe.maker_fill_fraction, 0.0);
+    }
+
+    #[test]
+    fn explainer_aggregates_pairs_stranded_and_averages() {
+        let mut store = RollupStore::new();
+        let ts = TimestampMs::from_millis(1_781_481_600_000);
+        // Window A: 100 matched + 10 merged pairs, 5 stranded, pair_cost 0.96.
+        store.fold(
+            &attribution_pairs(dec!(2), ts, dec!(100), dec!(10), dec!(5), Some(dec!(0.96))),
+            &[],
+        );
+        // Window B: 50 matched, 0 merged, 15 stranded, pair_cost 0.98.
+        store.fold(
+            &attribution_pairs(
+                dec!(1),
+                TimestampMs::from_millis(ts.as_millis() + 60_000),
+                dec!(50),
+                dec!(0),
+                dec!(15),
+                Some(dec!(0.98)),
+            ),
+            &[],
+        );
+        let row = store.series_aggregates()[0].to_row(
+            5,
+            Dollars::new(dec!(10)),
+            AdverseSelectionState::Ok,
+        );
+        // pairs completed = (100+10) + (50+0) = 160.
+        assert_eq!(row.pairs_completed, Size::new(dec!(160)).expect("pairs"));
+        // stranded shares = 5 + 15 = 20.
+        assert_eq!(row.stranded_shares, dec!(20));
+        // avg pair cost = (0.96 + 0.98) / 2 = 0.97.
+        assert_eq!(row.avg_pair_cost, Some(dec!(0.97)));
+        // inventory pnl = -(5) + -(15) = -20; per stranded share = -20/20 = -1.
+        assert_eq!(row.inventory_pnl, Dollars::new(dec!(-20)));
+        assert_eq!(row.avg_stuck_leg_pnl, Some(Dollars::new(dec!(-1))));
+    }
+
+    #[test]
+    fn explainer_averages_are_none_without_pairs_or_stranded() {
+        let mut store = RollupStore::new();
+        let ts = TimestampMs::from_millis(1_781_481_600_000);
+        // No pairs, no stranded shares.
+        store.fold(
+            &attribution_pairs(dec!(0), ts, dec!(0), dec!(0), dec!(0), None),
+            &[],
+        );
+        let row = store.series_aggregates()[0].to_row(
+            5,
+            Dollars::new(dec!(10)),
+            AdverseSelectionState::Ok,
+        );
+        assert_eq!(row.pairs_completed, Size::ZERO);
+        assert_eq!(row.avg_pair_cost, None);
+        assert_eq!(row.avg_stuck_leg_pnl, None);
     }
 
     #[test]

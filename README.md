@@ -331,23 +331,53 @@ data. This opens two extra WebSocket connections; the default run leaves the
 model off.
 
 **UI.** A static, phone-usable single page is served at `/` (`/app.css`,
-`/app.js`) — embedded in the binary, no build step, no external assets. Five tabs:
-- **Overview** — paper/live badges, a live equity curve, the paper-capital editor
-  (set absolute, or ±$1k), and a confirm-gated **Kill / Reset**.
-- **Series** — the §9.3 decision table (sortable, min-sample rows muted, green/red).
-- **Live** — chips for each active window; the selected window's Up/Down book
-  ladder with **our resting quotes highlighted**, fair-vs-mid, a seconds-remaining
+`/app.js`) — embedded in the binary, no build step, no external assets. The
+landing screen is a calm, explanatory **Summary**; the detailed operational views
+sit behind a clearly-secondary **Details** nav (so nothing safety-critical is
+lost). It live-updates over the WebSocket (with a visible **"Reconnecting…"**
+notice on disconnect and a 1 s countdown ticker) and reconnects on its own.
+
+- **Summary** (default) — per-series tabs (All + each enabled series) + a
+  Paper/Live toggle, then: an at-a-glance **health row** (starting capital,
+  current equity, today's P/L, win rate) and a one-line plain-English **status
+  sentence**; the **two-bucket explainer** (see "How to read it" below); a calm
+  **live-activity** strip (orders placed/cancelled/resting/filled per minute, and
+  the cancel-first reflex's median time-to-replace / time-to-cancel against their
+  config targets); and collapsed-by-default dropdowns for recent fills, recent
+  cancels, open positions, and recent resolved windows.
+- **Details → Series** — the §9.3 decision table (sortable, min-sample rows muted).
+- **Details → Live window** — chips for each active window; the selected window's
+  Up/Down book ladder with **our resting quotes highlighted**, fair-vs-mid, a
   countdown with the late-window gate zones marked (late-taker ≤30s, no-ATM ≤25s,
   cancel-all ≤5s), inventory + pair-cost, and recent prints.
-- **Fills** — the chronological blotter, filterable by series, each row **colored
-  by its 5-second markout** (green aged well, red picked off; "…" while pending)
-  with maker / taker / late-window attribution tags.
-- **Risk** — every breaker (tripped vs ok) + last-trip cause, the risk snapshot
-  (daily PnL, open notional, errors), feed-health ages, user-WS connectivity,
-  per-asset model health, and the **Kill / Reset** controls.
+- **Details → Fills** — the chronological blotter, filterable by series, each row
+  **colored by its 5-second markout** with maker / taker / late attribution tags.
+- **Details → Risk** — every breaker + last-trip cause, the risk snapshot, feed
+  health, user-WS connectivity, per-asset model health, and **Kill / Reset**.
+- **Details → Controls** — paper/live badges, the live equity curve, the
+  paper-capital editor (set absolute, or ±$1k), the §11 live-arming flow, the
+  per-series enable toggles, the safe-listed parameter editor, and **Kill / Reset**.
 
-It live-updates over the WebSocket (and a 1 s countdown ticker) and reconnects on
-its own.
+**How to read it — the two-bucket explainer.** The Summary answers "why did I earn
+for an hour then give the profit back?" A settled window's realized PnL splits
+**exactly** into two plain buckets that always sum to total profit/loss:
+
+- **Profit from completed pairs** — money locked from pairs where *both* sides
+  filled for under $1. This is the fee-free market-making edge; it should be green.
+- **Profit/loss from stuck legs** — money made or lost on legs that filled on one
+  side and never got a cheap matching fill before the window closed (plus the taker
+  fees paid chasing them). When the market **trends**, legs get stranded and this
+  bucket goes sharply **red** — that is exactly the "gave the profit back" cause,
+  and the status sentence flips to *Caution* when it does (or when the 5-second
+  markout shows quotes are being picked off). Beneath the buckets: how many pairs
+  completed vs how many legs were stranded, the average cost to complete a pair,
+  and the average loss per stranded leg.
+
+The live-activity **time-to-replace** tile (cancel → fresh quote on the same side)
+shows how fast the yank-it-back reflex actually is, green/red against the
+`min_requote_interval_ms` target; **time-to-cancel** (the true cancel round-trip)
+is shown in live mode and reads "—" in paper, where the simulated venue has no
+observable cancel round-trip.
 
 **Auth.** REST is `Authorization: Bearer <token>`; the WebSocket takes the token
 as a `?token=` query (browsers can't set a header on a `WebSocket`). The token is
@@ -364,6 +394,8 @@ present-but-empty until the live orchestrator lands. Endpoints:
 | Endpoint | What it returns |
 |---|---|
 | `GET /health` | machine-readable status (`ok`/`degraded`/`down`) + feed/breaker/model rollup (no auth) |
+| `GET /api/summary?mode&series&window=today\|7d\|all&days=N` | the calm landing: headline, status sentence, two-bucket explainer, live-activity strip (scoped to a series or all) |
+| `GET /api/settlements?mode&series&limit` | recent resolved windows, each split into the two buckets (completed pairs vs stuck legs) |
 | `GET /api/overview` | both modes' badges, equity curve, wallet/ledger, paper capital |
 | `GET /api/series-comparison?mode&window=today\|7d\|all&days=N&sort=<col>&dir=asc\|desc` | the §9.3 decision table (sortable) |
 | `GET /api/windows?mode` | active windows (shared book/model + this mode's inventory) |
@@ -428,18 +460,25 @@ parameter overrides, the gate-3 arm flag) that the future orchestrator reads.
 a window open to produce `p_up`), then verify by eye that each updates smoothly
 in real time:
 
-1. **Overview** — the equity curve advances; paper badge shows *running*.
-2. **Live** — active-window chips for the enabled series; pick one and watch the
+1. **Summary** (landing) — the headline tiles populate (equity, today's P/L, win
+   rate); the **two-bucket explainer** fills as windows settle and its two values
+   sum to the total; the status sentence reads *Healthy* / *Caution* / *Warming
+   up*; the live-activity tiles tick (placed/cancelled/resting/fills per minute,
+   time-to-replace green/red, time-to-cancel "—" in paper); the per-series tabs and
+   Paper/Live toggle re-scope it; the four dropdowns expand with detail. Kill the
+   bot (Details → Controls) and the *TRADING HALTED* notice shows above the nav.
+2. **Details → Controls** — the equity curve advances; paper badge shows *running*.
+3. **Details → Live window** — active-window chips for the enabled series; pick one and watch the
    Up/Down ladder churn, with at least one bid level highlighted as **ours**
    (the quoter's resting order); the countdown decrements each second and its bar
    crosses the three gate marks (late-taker ≤30 s, no-ATM ≤25 s, cancel-all ≤5 s)
    near close; **fair vs mid** shows a non-blank `p_up`, the Up mid, and their Δ,
    with a model-health pill; inventory + pair-cost and the scrolling prints fill.
-3. **Fills** — rows appear as the quoter trades; each is colored by its 5-second
-   markout (some green/red once matured, some "…" while pending) and tagged
-   maker / taker / late; the series filter narrows the list.
-4. **Risk** — breaker chips are green (ok); feed-health shows all-live (or a red
-   row during an RTDS hiccup); model health shows the per-asset tier; press
+4. **Details → Fills** — rows appear as the quoter trades; each is colored by its
+   5-second markout (some green/red once matured, some "…" while pending) and
+   tagged maker / taker / late; the series filter narrows the list.
+5. **Details → Risk** — breaker chips are green (ok); feed-health shows all-live (or
+   a red row during an RTDS hiccup); model health shows the per-asset tier; press
    **Kill** → the *TRADING HALTED* banner + a tripped `Manual` breaker, then
    **Reset** clears it.
 

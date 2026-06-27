@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
-use analytics::{Analytics, AnalyticsParams};
+use analytics::{Analytics, AnalyticsParams, OrderActivity};
 use core_types::{
     Asset, BookHealth, BookSnapshot, BookUnreliableReason, BreakerKind, ConditionId, ControlEvent,
     Dollars, Event, FeedHealth, Fill, InventorySnapshot, MarketInfo, Mode, ModelHealthEvent,
@@ -230,6 +230,9 @@ pub(crate) struct ModeState {
     /// Live 5s markouts for this mode's maker fills (capped to the fills ring so
     /// any displayed fill keeps its value).
     pub(crate) live_markout: LiveMarkout,
+    /// Trailing order-activity metrics (placed/cancelled/fills, resting, TTC/TTR)
+    /// for the "live activity" strip. Best-effort live state, fed from `project()`.
+    pub(crate) activity: OrderActivity,
 }
 
 impl ModeState {
@@ -239,6 +242,7 @@ impl ModeState {
             fills: Ring::new(FILLS_RING_CAP),
             orders: HashMap::new(),
             live_markout: LiveMarkout::new(FILLS_RING_CAP),
+            activity: OrderActivity::new(),
             inventory: HashMap::new(),
             settlements: Ring::new(SETTLEMENTS_RING_CAP),
             tripped: BTreeSet::new(),
@@ -481,6 +485,7 @@ impl DashboardData {
             },
             Event::OrderUpdate(u) => {
                 let ms = self.mode_mut(mode);
+                ms.activity.on_order(u, now);
                 if u.state.is_terminal() {
                     ms.orders.remove(&u.order_id);
                 } else {
@@ -496,6 +501,7 @@ impl DashboardData {
                 let ms = self.mode_mut(mode);
                 ms.fills.push(Arc::clone(f));
                 ms.live_markout.on_fill(f);
+                ms.activity.on_fill(f, now);
                 updates.push(WsUpdate::Fill {
                     mode,
                     ts_ms,

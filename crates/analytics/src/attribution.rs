@@ -43,8 +43,8 @@
 //! at any display precision and confined to the matched bucket.
 
 use core_types::{
-    Decimal, Dollars, Fill, Liquidity, Mode, Outcome, SettlementSummary, TimestampMs, WindowId,
-    taker_fee,
+    Decimal, Dollars, Fill, Liquidity, Mode, Outcome, SettlementSummary, Size, TimestampMs,
+    WindowId, taker_fee,
 };
 use serde::{Deserialize, Serialize};
 
@@ -158,6 +158,16 @@ pub struct WindowAttribution {
     /// [`trading_sum`](Self::trading_sum) / [`bucket_sum`](Self::bucket_sum) (the
     /// taker fee it incurs is already in `taker_fees`).
     pub taker_notional: Dollars,
+    /// Matched pairs still held at close (both sides filled): `min(up, down)`.
+    /// Dashboard display only — not a PnL bucket.
+    pub matched_pairs: Size,
+    /// Pairs merged back to collateral during the window (also "completed").
+    pub merged_pairs: Size,
+    /// Magnitude of the unmatched (stranded) shares at close: `|excess|`.
+    pub stranded_shares: Decimal,
+    /// Combined average cost of a held pair (`avg_up + avg_down`), `None` unless
+    /// both sides were held — the "average cost to complete a pair".
+    pub pair_cost: Option<Decimal>,
     /// Settlement time (window close).
     pub ts: TimestampMs,
 }
@@ -201,6 +211,10 @@ impl WindowAttribution {
             maker_fills,
             taker_fills,
             taker_notional,
+            matched_pairs: summary.matched_pairs,
+            merged_pairs: summary.merged_pairs,
+            stranded_shares: summary.excess.abs(),
+            pair_cost: summary.pair_cost,
             ts: summary.ts,
         }
     }
@@ -228,6 +242,31 @@ impl WindowAttribution {
     #[must_use]
     pub fn inventory_pnl(&self) -> Dollars {
         self.excess_pnl + self.settlement_remainder
+    }
+
+    /// Dashboard **bucket 1 — "Profit from completed pairs"**: the guaranteed,
+    /// fee-free `$1`-per-matched-pair maker edge.
+    #[must_use]
+    pub fn completed_pair_pnl(&self) -> Dollars {
+        self.locked_pair_pnl
+    }
+
+    /// Dashboard **bucket 2 — "Profit/loss from stuck legs"**: the unmatched
+    /// directional inventory (excess + intra-window trading) net of the taker
+    /// fees paid chasing it. With [`completed_pair_pnl`](Self::completed_pair_pnl)
+    /// these two buckets sum to [`realized_pnl`](Self::realized_pnl) **exactly**
+    /// (they re-label the four-bucket ledger identity — see
+    /// [`trading_sum`](Self::trading_sum)).
+    #[must_use]
+    pub fn stuck_leg_pnl(&self) -> Dollars {
+        self.inventory_pnl() + self.taker_fees
+    }
+
+    /// Pairs the strategy completed (both sides filled): held matched pairs plus
+    /// pairs merged back to collateral.
+    #[must_use]
+    pub fn pairs_completed(&self) -> Size {
+        self.matched_pairs + self.merged_pairs
     }
 
     /// Whether the window's ledger PnL was positive.
@@ -417,6 +456,76 @@ mod tests {
         assert_eq!(a.locked_pair_pnl, Dollars::new(dec!(10)));
         assert_eq!(a.settlement_remainder, Dollars::ZERO);
         assert_eq!(a.trading_sum(), a.realized_pnl);
+    }
+
+    // ---- two-bucket split (the dashboard explainer) --------------------------
+
+    #[test]
+    fn two_bucket_split_reconciles_to_realized() {
+        // up_excess_wins fixture: locked 10, excess 30, remainder 0, fees 0.
+        // bucket 1 (completed pairs) = locked = 10.
+        // bucket 2 (stuck legs)      = inventory (30) + fees (0) = 30.
+        let summary = SettlementSummary::close(
+            window(),
+            Outcome::Up,
+            side_inv(dec!(150), dec!(60)),
+            side_inv(dec!(100), dec!(50)),
+            Size::ZERO,
+            Dollars::ZERO,
+            Dollars::new(dec!(40)),
+            TimestampMs::from_millis(CLOSE_MS),
+        );
+        let a = WindowAttribution::from_summary(
+            &summary,
+            Mode::Paper,
+            Dollars::ZERO,
+            dec!(0.2),
+            0,
+            0,
+            Dollars::ZERO,
+        );
+        assert_eq!(a.completed_pair_pnl(), Dollars::new(dec!(10)));
+        assert_eq!(a.stuck_leg_pnl(), Dollars::new(dec!(30)));
+        // The two buckets sum to the ledger's realized PnL, exactly.
+        assert_eq!(a.completed_pair_pnl() + a.stuck_leg_pnl(), a.realized_pnl);
+        // Stranded shares: 50 Up excess. Matched pairs none held (summary has
+        // matched_pairs derived from the inventory): min(150,100)=100.
+        assert_eq!(a.stranded_shares, dec!(50));
+        assert_eq!(a.matched_pairs, sz(dec!(100)));
+        assert_eq!(a.pairs_completed(), sz(dec!(100)));
+    }
+
+    #[test]
+    fn two_bucket_split_folds_taker_fee_into_stuck_legs() {
+        // One taker BUY 100 Up @ 0.50, fee 1.75; resolve Up. realized 48.25.
+        // All 100 are Up excess (no Down), so they are "stuck" until settlement.
+        let summary = SettlementSummary::close(
+            window(),
+            Outcome::Up,
+            side_inv(dec!(100), dec!(50)),
+            side_inv(dec!(0), dec!(0)),
+            Size::ZERO,
+            Dollars::new(dec!(1.75)),
+            Dollars::new(dec!(48.25)),
+            TimestampMs::from_millis(CLOSE_MS),
+        );
+        let a = WindowAttribution::from_summary(
+            &summary,
+            Mode::Paper,
+            Dollars::ZERO,
+            dec!(0.2),
+            0,
+            1,
+            Dollars::new(dec!(50)),
+        );
+        // No matched pairs ⇒ no completed-pair edge; everything is the stuck leg
+        // net of the fee. The two buckets still sum to realized exactly.
+        assert_eq!(a.completed_pair_pnl(), Dollars::ZERO);
+        assert_eq!(
+            a.stuck_leg_pnl(),
+            a.inventory_pnl() + Dollars::new(dec!(-1.75))
+        );
+        assert_eq!(a.completed_pair_pnl() + a.stuck_leg_pnl(), a.realized_pnl);
     }
 
     // ---- fees and rebate -----------------------------------------------------
@@ -741,6 +850,16 @@ mod tests {
                 a.trading_sum(),
                 summary.realized_pnl,
                 "seed {seed}: trading sum"
+            );
+            // The dashboard's TWO-bucket split is the same identity re-labeled
+            // (locked + (excess+remainder) + fees). It sums to the ledger to
+            // money precision; the different Decimal *addition grouping* leaves
+            // only the same sub-money 28th-digit noise `excess_pnl` carries (the
+            // exact, clean-number case is pinned in `two_bucket_split_*`).
+            assert_eq!(
+                (a.completed_pair_pnl() + a.stuck_leg_pnl()).round_dp(18),
+                summary.realized_pnl.round_dp(18),
+                "seed {seed}: two-bucket sum"
             );
             // The remainder IS the independently-accumulated departed-share PnL.
             // Both involve the average-cost division but via different operation

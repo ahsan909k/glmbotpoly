@@ -4,14 +4,14 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="color-scheme" content="dark" />
-  <title>Polymarket Bot — Dashboard</title>
+  <title>Trading Bot — Dashboard</title>
   <link rel="stylesheet" href="/app.css" />
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
-      <span class="dot" id="conn-dot" title="WebSocket disconnected"></span>
-      <strong>Polymarket Bot</strong>
+      <span class="dot" id="conn-dot" title="Live updates disconnected"></span>
+      <strong>Trading Bot</strong>
     </div>
     <div class="topbar-right">
       <div class="seg" id="mode-toggle" role="tablist" aria-label="Trading mode">
@@ -28,17 +28,80 @@
     <button id="token-save">Save</button>
   </div>
 
-  <nav class="tabs">
-    <button class="tab active" data-view="overview">Overview</button>
+  <!-- always-visible reconnect + kill notices -->
+  <div class="notice reconnect hidden" id="reconnect-banner">Reconnecting to live updates…</div>
+  <div class="notice kill hidden" id="global-kill-banner">TRADING HALTED — kill switch engaged</div>
+
+  <nav class="nav">
+    <button class="tab primary active" data-view="summary">Summary</button>
+    <span class="nav-sep">Details</span>
     <button class="tab" data-view="series">Series</button>
-    <button class="tab" data-view="live">Live</button>
+    <button class="tab" data-view="live">Live window</button>
     <button class="tab" data-view="fills">Fills</button>
     <button class="tab" data-view="risk">Risk</button>
+    <button class="tab" data-view="controls">Controls</button>
   </nav>
 
   <main>
-    <!-- ===================== OVERVIEW ===================== -->
-    <section id="view-overview" class="view">
+    <!-- ===================== SUMMARY (default) ===================== -->
+    <section id="view-summary" class="view">
+      <div class="sum-tabs" id="sum-series-tabs"></div>
+
+      <!-- at-a-glance health row -->
+      <div class="headline" id="headline">
+        <div class="hl-tile"><label>Starting capital</label><span id="hl-start">—</span></div>
+        <div class="hl-tile"><label>Current equity</label><span id="hl-equity">—</span></div>
+        <div class="hl-tile big"><label>Today's profit / loss</label><span id="hl-today">—</span></div>
+        <div class="hl-tile"><label>Win rate</label><span id="hl-winrate">—</span></div>
+      </div>
+
+      <div class="status-banner" id="status-banner">
+        <span class="status-dot" id="status-dot"></span>
+        <span id="status-text">Waiting for data…</span>
+        <span class="info" id="status-info" title="">&#9432;</span>
+      </div>
+
+      <!-- the key explainer panel -->
+      <div class="card explainer">
+        <div class="card-head">
+          <h2>Why are we making or losing money?</h2>
+          <div class="seg sum-window" id="sum-window" aria-label="Time window">
+            <button class="seg-btn active" data-window="today">Today</button>
+            <button class="seg-btn" data-window="7d">7&nbsp;days</button>
+            <button class="seg-btn" data-window="all">All</button>
+          </div>
+        </div>
+        <div class="buckets">
+          <div class="bucket">
+            <label>Profit from completed pairs</label>
+            <span class="bucket-val" id="bk-completed">—</span>
+            <small>Both sides filled for under $1 — locked in, no fees.</small>
+          </div>
+          <div class="bucket">
+            <label>Profit / loss from stuck legs</label>
+            <span class="bucket-val" id="bk-stuck">—</span>
+            <small>One side filled and never got a cheap match before the window closed.</small>
+          </div>
+        </div>
+        <div class="bucket-sub" id="bucket-sub"></div>
+        <p class="explainer-note" id="explainer-note">The two buckets add up to total profit/loss.</p>
+      </div>
+
+      <!-- live activity strip -->
+      <div class="card activity">
+        <div class="card-head"><h2>Live activity</h2><span class="muted" id="activity-scope"></span></div>
+        <div class="act-tiles" id="act-tiles"></div>
+      </div>
+
+      <!-- collapsed-by-default detail dropdowns -->
+      <details class="drop"><summary>Recent fills</summary><div class="drop-body" id="drop-fills"></div></details>
+      <details class="drop"><summary>Recent cancels</summary><div class="drop-body" id="drop-cancels"></div></details>
+      <details class="drop"><summary>Open positions now</summary><div class="drop-body" id="drop-positions"></div></details>
+      <details class="drop"><summary>Recent resolved windows</summary><div class="drop-body" id="drop-resolved"></div></details>
+    </section>
+
+    <!-- ===================== CONTROLS (was overview) ===================== -->
+    <section id="view-controls" class="view hidden">
       <div class="cards">
         <div class="card badges-card">
           <div class="badge" id="badge-paper"><span class="badge-dot"></span> PAPER <em id="badge-paper-state">—</em></div>
@@ -81,7 +144,6 @@
           <span>Rebate accrued <em id="inc-reb-acc">—</em></span>
           <span>Rebate credited <em id="inc-reb-cr">—</em></span>
         </div>
-        <p class="hint hidden" id="capital-live-note"></p>
       </div>
 
       <div class="card control-card" id="control-card">

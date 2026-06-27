@@ -18,7 +18,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
-use core_types::{CommandOrigin, Decimal, Dollars, Mode};
+use core_types::{CommandOrigin, Decimal, Dollars, Mode, Series};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
@@ -102,6 +102,21 @@ struct FillsQuery {
     since_ms: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SummaryQuery {
+    mode: Option<String>,
+    series: Option<String>,
+    window: Option<String>,
+    days: Option<u16>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettledQuery {
+    mode: Option<String>,
+    series: Option<String>,
+    limit: Option<usize>,
+}
+
 fn parse_mode(s: Option<&str>) -> Result<Mode, ApiError> {
     match s {
         None | Some("paper") => Ok(Mode::Paper),
@@ -110,15 +125,26 @@ fn parse_mode(s: Option<&str>) -> Result<Mode, ApiError> {
     }
 }
 
-fn parse_window(q: &CompareQuery) -> Result<ComparisonWindow, ApiError> {
-    if let Some(n) = q.days {
+fn parse_window(window: Option<&str>, days: Option<u16>) -> Result<ComparisonWindow, ApiError> {
+    if let Some(n) = days {
         return Ok(ComparisonWindow::LastDays(n));
     }
-    match q.window.as_deref() {
+    match window {
         None | Some("all") => Ok(ComparisonWindow::All),
         Some("today") => Ok(ComparisonWindow::Today),
         Some("7d") => Ok(ComparisonWindow::LastDays(7)),
         Some(other) => Err(ApiError::BadRequest(format!("unknown window {other:?}"))),
+    }
+}
+
+/// `None`/`all`/empty → all series combined; otherwise the named series.
+fn parse_series(s: Option<&str>) -> Result<Option<Series>, ApiError> {
+    match s {
+        None | Some("all" | "") => Ok(None),
+        Some(other) => other
+            .parse::<Series>()
+            .map(Some)
+            .map_err(|_| ApiError::BadRequest(format!("unknown series {other:?}"))),
     }
 }
 
@@ -169,7 +195,7 @@ async fn series_comparison(
     Query(q): Query<CompareQuery>,
 ) -> Result<Json<SeriesComparisonDto>, ApiError> {
     let mode = parse_mode(q.mode.as_deref())?;
-    let window = parse_window(&q)?;
+    let window = parse_window(q.window.as_deref(), q.days)?;
     let sort = q.sort.as_deref().map(parse_sort).transpose()?;
     let dir = q.dir.clone();
     let dto = app.handle.with_data(|d| {
@@ -185,6 +211,31 @@ async fn series_comparison(
         }
     });
     Ok(Json(dto))
+}
+
+async fn summary(
+    State(app): State<AppState>,
+    Query(q): Query<SummaryQuery>,
+) -> Result<Json<dto::SummaryDto>, ApiError> {
+    let mode = parse_mode(q.mode.as_deref())?;
+    let window = parse_window(q.window.as_deref(), q.days)?;
+    let series = parse_series(q.series.as_deref())?;
+    Ok(Json(
+        app.handle
+            .with_data(|d| dto::summary(d, mode, series, window)),
+    ))
+}
+
+async fn settlements(
+    State(app): State<AppState>,
+    Query(q): Query<SettledQuery>,
+) -> Result<Json<Vec<dto::ResolvedWindowDto>>, ApiError> {
+    let mode = parse_mode(q.mode.as_deref())?;
+    let series = parse_series(q.series.as_deref())?;
+    let limit = q.limit.unwrap_or(50).min(256);
+    Ok(Json(app.handle.with_data(|d| {
+        dto::resolved_windows(d, mode, series, limit)
+    })))
 }
 
 async fn windows_list(
@@ -466,6 +517,8 @@ pub fn router(
     };
     let protected = Router::new()
         .route("/api/overview", get(overview))
+        .route("/api/summary", get(summary))
+        .route("/api/settlements", get(settlements))
         .route("/api/series-comparison", get(series_comparison))
         .route("/api/windows", get(windows_list))
         .route("/api/windows/{window}", get(window_detail))
