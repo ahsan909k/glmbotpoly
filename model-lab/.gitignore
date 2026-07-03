@@ -1,0 +1,15 @@
+# Python virtual environment
+.venv/
+venv/
+
+# Stage outputs (parquet tables, reports) — regenerated from the journal
+out/
+
+# Generated synthetic fixture data (reproducible via `python -m model_lab.fixtures`)
+model_lab/fixtures/
+
+# Byte-code / caches
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/

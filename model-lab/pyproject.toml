@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "model-lab"
+version = "0.1.0"
+description = "Offline research over the Polymarket Up/Down bot's journal (validation + microstructure)"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy==2.1.3",
+    "pandas==2.2.3",
+    "pyarrow==18.1.0",
+    "matplotlib==3.9.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.4"]
+
+[tool.setuptools.packages.find]
+include = ["model_lab*"]
+
+[tool.pytest.ini_options]
+# Import the package from the model-lab/ working directory without installing.
+pythonpath = ["."]
+testpaths = ["tests"]
