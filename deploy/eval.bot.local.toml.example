@@ -29,11 +29,11 @@ starting_capital = 50000                          # $50k bankroll (both phases)
 # Set placement/cancel latency AFTER the `bot latency` rebench on the VPS
 # (Phase 1.4): mean_ms = measured clob REST p50, jitter_ms = p95 − p50.
 [paper.placement_latency]
-mean_ms = 31        # PLACEHOLDER — overwrite with measured VPS p50
-jitter_ms = 12      # PLACEHOLDER — overwrite with measured VPS (p95 − p50)
+mean_ms = 24        # measured VPS clob REST p50 = 23.5 ms (rebench 2026-07-15)
+jitter_ms = 8       # one-sided-up; [24, 32] covers p95 26 → p99 29
 [paper.cancel_latency]
-mean_ms = 31        # PLACEHOLDER — overwrite with measured VPS p50
-jitter_ms = 12      # PLACEHOLDER — overwrite with measured VPS (p95 − p50)
+mean_ms = 24        # cancel round-trip is the same CLOB REST path
+jitter_ms = 8
 
 [risk]
 shadow_loss_stops = true      # PAPER EVAL: loss stops (DailyStop/WindowLoss) record + flag,
