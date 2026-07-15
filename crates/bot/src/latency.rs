@@ -28,6 +28,13 @@ pub fn execute(
     label: Option<&str>,
     out: Option<&Path>,
 ) -> anyhow::Result<ExitCode> {
+    // The harness WS probes dial `tokio_tungstenite` directly (not through
+    // `feed_util::WsTransport`), so nothing else installs a rustls
+    // `CryptoProvider` on this path. With both `ring` (feeds) and `aws-lc-rs`
+    // (the Polymarket SDK) linked, rustls cannot auto-pick a default and the WS
+    // probe panics. Pin ring up front (idempotent; `bot run` does the same via
+    // the feeds).
+    feed_util::ensure_crypto_provider();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

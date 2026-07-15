@@ -28,4 +28,5 @@ pub use error::FeedError;
 pub use machine::{KeyStatus, StreamKey};
 pub use transport::{
     Connection, TapDir, TapFrame, TapTransport, Transport, TransportError, WsFrame, WsTransport,
+    ensure_crypto_provider,
 };

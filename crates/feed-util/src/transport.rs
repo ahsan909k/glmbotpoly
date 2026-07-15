@@ -74,7 +74,12 @@ pub struct WsConnection {
 /// reqwest uses) exactly once. Without it, a binary whose dependency graph
 /// doesn't otherwise select a provider panics at the first TLS connect.
 /// `install_default` failing means someone else installed one first — fine.
-fn ensure_crypto_provider() {
+///
+/// Public so callers that open a rustls WS connection *outside* [`WsTransport`]
+/// (e.g. the `bot latency` harness, which dials `tokio_tungstenite` directly)
+/// can install the provider before their first TLS handshake and avoid the
+/// "could not automatically determine the process-level CryptoProvider" panic.
+pub fn ensure_crypto_provider() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
