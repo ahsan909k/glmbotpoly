@@ -14,8 +14,9 @@ use core_types::{
     PriceSource, Series, Side, Size, TickKind, TickSize, TokenId, TopOfBook, WindowId,
     WindowLifecycle,
 };
-use engine::RiskStateSnapshot;
-use serde::Serialize;
+use engine::{FillDriver, RiskStateSnapshot};
+use rust_decimal::prelude::ToPrimitive;
+use serde::{Deserialize, Serialize};
 use venue_api::Wallet;
 use venue_paper::PaperLedgerSnapshot;
 
@@ -840,9 +841,11 @@ pub(crate) fn model_taker(data: &DashboardData) -> ModelTakerDto {
         .collect();
     series.sort_by(|a, b| a.series.cmp(&b.series));
 
+    // The model taker is paper-only in this bot; read the paper namespace's matrix.
     let mut pnl_by_driver: Vec<DriverPnlDto> = data
+        .mode(Mode::Paper)
         .driver_pnl
-        .totals
+        .totals()
         .iter()
         .map(|((s, d), t)| DriverPnlDto {
             series: s.to_string(),
@@ -853,7 +856,11 @@ pub(crate) fn model_taker(data: &DashboardData) -> ModelTakerDto {
             realized_pnl: t.realized_pnl.to_string(),
         })
         .collect();
-    pnl_by_driver.sort_by(|a, b| a.series.cmp(&b.series).then_with(|| a.driver.cmp(&b.driver)));
+    pnl_by_driver.sort_by(|a, b| {
+        a.series
+            .cmp(&b.series)
+            .then_with(|| a.driver.cmp(&b.driver))
+    });
 
     ModelTakerDto {
         active: data.model_taker.active,
@@ -876,6 +883,591 @@ pub(crate) fn params(data: &DashboardData) -> ParamsDto {
                 value: value.clone(),
             })
             .collect(),
+    }
+}
+
+// ---- the 4 drivers × 6 series grid -----------------------------------------
+
+/// The four owned strategies, in display order.
+const DRIVERS: [FillDriver; 4] = [
+    FillDriver::MakerCore,
+    FillDriver::Momentum,
+    FillDriver::Late,
+    FillDriver::Model,
+];
+
+/// The six trading series (BTC/ETH × 5m/15m/1h), in display order — the fixed
+/// grid the PnL matrix and STATUS strip enumerate so every cell is defined.
+fn all_series() -> [Series; 6] {
+    use core_types::{Asset, WindowDuration};
+    [
+        Series {
+            asset: Asset::Btc,
+            duration: WindowDuration::M5,
+        },
+        Series {
+            asset: Asset::Btc,
+            duration: WindowDuration::M15,
+        },
+        Series {
+            asset: Asset::Btc,
+            duration: WindowDuration::H1,
+        },
+        Series {
+            asset: Asset::Eth,
+            duration: WindowDuration::M5,
+        },
+        Series {
+            asset: Asset::Eth,
+            duration: WindowDuration::M15,
+        },
+        Series {
+            asset: Asset::Eth,
+            duration: WindowDuration::H1,
+        },
+    ]
+}
+
+// ---- PnL matrix (per-driver × per-series) ----------------------------------
+
+/// One `(series, driver)` cell of the realized-PnL matrix.
+#[derive(Debug, Clone, Serialize)]
+pub struct PnlCellDto {
+    /// Series key.
+    pub series: String,
+    /// Driver label (`maker-core` | `momentum` | `late` | `model`).
+    pub driver: String,
+    /// Realized PnL, marked to each window's outcome (Decimal string).
+    pub realized_pnl: String,
+    /// Resolved (settled) fills.
+    pub trades: u32,
+    /// Resolved fills that won.
+    pub wins: u32,
+    /// Win fraction over resolved fills; `null` with none.
+    pub win_pct: Option<f64>,
+}
+
+/// A per-driver or per-series subtotal.
+#[derive(Debug, Clone, Serialize)]
+pub struct PnlTotalDto {
+    /// The row (driver) or column (series) key this total is for.
+    pub key: String,
+    /// Realized PnL summed across the other axis (Decimal string).
+    pub realized_pnl: String,
+    /// Resolved fills summed.
+    pub trades: u32,
+    /// Winning fills summed.
+    pub wins: u32,
+    /// Win fraction over resolved fills; `null` with none.
+    pub win_pct: Option<f64>,
+}
+
+/// The `/api/pnl-matrix` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct PnlMatrixDto {
+    /// Which trading mode.
+    pub mode: Mode,
+    /// The time window (Today folds a single UTC day; the others fold all
+    /// retained days — the matrix keeps ~31 days).
+    pub window: ComparisonWindow,
+    /// One cell per `(series, driver)` present, sorted by (series, driver).
+    pub cells: Vec<PnlCellDto>,
+    /// Per-driver totals across series (rows).
+    pub row_totals: Vec<PnlTotalDto>,
+    /// Per-series totals across drivers (columns).
+    pub col_totals: Vec<PnlTotalDto>,
+}
+
+fn win_pct(wins: u32, trades: u32) -> Option<f64> {
+    if trades == 0 {
+        None
+    } else {
+        Some(f64::from(wins) / f64::from(trades))
+    }
+}
+
+/// Builds the per-driver × per-series realized-PnL matrix for a mode + window.
+#[must_use]
+pub(crate) fn pnl_matrix(
+    data: &DashboardData,
+    mode: Mode,
+    window: ComparisonWindow,
+) -> PnlMatrixDto {
+    let matrix = data.mode(mode).driver_pnl.matrix();
+    let cells_map = match window {
+        ComparisonWindow::Today => matrix.totals_for_day(DayKey::from_ts(data.last_now)),
+        // The matrix retains ~31 days; treat 7d/all alike as the retained totals.
+        _ => matrix.totals(),
+    };
+
+    let mut cells = Vec::new();
+    let mut row: std::collections::HashMap<FillDriver, (Decimal, u32, u32)> =
+        std::collections::HashMap::new();
+    let mut col: std::collections::BTreeMap<Series, (Decimal, u32, u32)> =
+        std::collections::BTreeMap::new();
+    for series in all_series() {
+        for driver in DRIVERS {
+            let cell = cells_map
+                .get(&(series, driver))
+                .copied()
+                .unwrap_or_default();
+            if cell.resolved_fills == 0 && cell.realized_pnl == Dollars::ZERO {
+                continue; // skip empty cells (the grid is filled client-side)
+            }
+            cells.push(PnlCellDto {
+                series: series.to_string(),
+                driver: driver_label(driver).to_owned(),
+                realized_pnl: cell.realized_pnl.as_decimal().to_string(),
+                trades: cell.resolved_fills,
+                wins: cell.winning_fills,
+                win_pct: win_pct(cell.winning_fills, cell.resolved_fills),
+            });
+            let r = row.entry(driver).or_default();
+            r.0 += cell.realized_pnl.as_decimal();
+            r.1 += cell.resolved_fills;
+            r.2 += cell.winning_fills;
+            let c = col.entry(series).or_default();
+            c.0 += cell.realized_pnl.as_decimal();
+            c.1 += cell.resolved_fills;
+            c.2 += cell.winning_fills;
+        }
+    }
+    let row_totals = DRIVERS
+        .into_iter()
+        .filter_map(|d| row.get(&d).map(|(p, t, w)| (d, *p, *t, *w)))
+        .map(|(d, p, t, w)| PnlTotalDto {
+            key: driver_label(d).to_owned(),
+            realized_pnl: p.to_string(),
+            trades: t,
+            wins: w,
+            win_pct: win_pct(w, t),
+        })
+        .collect();
+    let col_totals = col
+        .into_iter()
+        .map(|(s, (p, t, w))| PnlTotalDto {
+            key: s.to_string(),
+            realized_pnl: p.to_string(),
+            trades: t,
+            wins: w,
+            win_pct: win_pct(w, t),
+        })
+        .collect();
+    PnlMatrixDto {
+        mode,
+        window,
+        cells,
+        row_totals,
+        col_totals,
+    }
+}
+
+// ---- STATUS strip (no silent states) ---------------------------------------
+
+/// The one state a `(driver, series)` cell resolves to — exactly one, never null.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CellState {
+    /// Trading normally.
+    Active,
+    /// Standing down (driver standing down, series disabled, or model reason).
+    StandingDown,
+    /// A shadow loss-stop WOULD have tripped (recorded, not enforced) — distinct
+    /// from a real halt.
+    ShadowTripped,
+    /// Halted by an operational global breaker, or a per-window loss halt.
+    Halted,
+}
+
+/// One STATUS-strip cell — always a definite [`CellState`] plus a human detail.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusCellDto {
+    /// Series key.
+    pub series: String,
+    /// Driver label.
+    pub driver: String,
+    /// The resolved state (never null).
+    pub state: CellState,
+    /// Plain-English reason / which stop / which breaker.
+    pub detail: String,
+    /// Crossing time for a shadow stop (unix ms), when applicable.
+    pub ts_ms: Option<i64>,
+    /// The observed loss / worst-case for a shadow stop (Decimal string), when applicable.
+    pub value: Option<String>,
+}
+
+/// The `/api/status-strip` response — every `(driver, series)` cell.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusStripDto {
+    /// Which trading mode.
+    pub mode: Mode,
+    /// One cell per (driver, series), row-major (series outer, driver inner).
+    pub cells: Vec<StatusCellDto>,
+}
+
+fn driver_standing_down(status: Option<crate::state::DriverStatus>, driver: FillDriver) -> bool {
+    status.is_some_and(|s| match driver {
+        FillDriver::MakerCore => s.maker_core_standing_down,
+        FillDriver::Momentum => s.momentum_standing_down,
+        FillDriver::Late => s.late_standing_down,
+        FillDriver::Model => s.model_standing_down,
+    })
+}
+
+/// Resolves one `(driver, series)` cell to exactly one state, by precedence:
+/// HALTED > SHADOW_TRIPPED > STANDING_DOWN > ACTIVE.
+fn status_cell(
+    data: &DashboardData,
+    mode: Mode,
+    driver: FillDriver,
+    series: Series,
+) -> StatusCellDto {
+    let ms = data.mode(mode);
+    let base = |state: CellState, detail: String, ts_ms: Option<i64>, value: Option<String>| {
+        StatusCellDto {
+            series: series.to_string(),
+            driver: driver_label(driver).to_owned(),
+            state,
+            detail,
+            ts_ms,
+            value,
+        }
+    };
+    // 1) HALTED — a global operational breaker halts everything; a per-window
+    //    loss halt halts that series.
+    if let Some(risk) = ms.risk_snapshot.as_ref() {
+        if !risk.tripped.is_empty() {
+            let names: Vec<String> = risk.tripped.iter().map(|b| format!("{b:?}")).collect();
+            return base(
+                CellState::Halted,
+                format!("breakers: {}", names.join(", ")),
+                None,
+                None,
+            );
+        }
+        if risk.halted_windows_list.iter().any(|w| w.series == series) {
+            return base(
+                CellState::Halted,
+                "per-window loss halt".to_owned(),
+                None,
+                None,
+            );
+        }
+        // 2) SHADOW_TRIPPED — a would-be loss stop for this series (WindowLoss) or
+        //    a global DailyStop shadow.
+        if let Some(s) = risk
+            .shadow_tripped
+            .iter()
+            .find(|s| s.window.is_none_or(|w| w.series == series))
+        {
+            return base(
+                CellState::ShadowTripped,
+                format!("shadow {:?}", s.kind),
+                Some(s.ts.as_millis()),
+                Some(s.value.as_decimal().to_string()),
+            );
+        }
+    }
+    // 3) STANDING_DOWN — series disabled, driver standing down, or (model) reason.
+    let series_disabled = data
+        .control_state
+        .as_ref()
+        .is_some_and(|c| !c.enabled_series.iter().any(|k| k == series.key()));
+    if series_disabled {
+        return base(
+            CellState::StandingDown,
+            "series disabled".to_owned(),
+            None,
+            None,
+        );
+    }
+    if driver_standing_down(ms.driver_status, driver) {
+        return base(
+            CellState::StandingDown,
+            "standing down".to_owned(),
+            None,
+            None,
+        );
+    }
+    if driver == FillDriver::Model
+        && let Some(st) = data.model_taker.by_series.get(&series)
+        && !st.last_reason.is_empty()
+        && st.last_reason != "fired"
+    {
+        return base(CellState::StandingDown, st.last_reason.clone(), None, None);
+    }
+    // 4) ACTIVE.
+    base(CellState::Active, "active".to_owned(), None, None)
+}
+
+/// Builds the STATUS strip for a mode — every `(driver, series)` cell, each with
+/// exactly one non-null state.
+#[must_use]
+pub(crate) fn status_strip(data: &DashboardData, mode: Mode) -> StatusStripDto {
+    let mut cells = Vec::with_capacity(24);
+    for series in all_series() {
+        for driver in DRIVERS {
+            cells.push(status_cell(data, mode, driver, series));
+        }
+    }
+    StatusStripDto { mode, cells }
+}
+
+// ---- benchmark (ours vs competitor fact-sheet) -----------------------------
+
+const COMPETITORS_JSON: &str = include_str!("../competitors.json");
+
+/// One competitor's documented benchmark fact-sheet (from `competitors.json`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CompetitorDto {
+    /// Account handle.
+    pub handle: String,
+    /// `primary` | `secondary`.
+    pub role: String,
+    /// `maker` | `taker`.
+    pub kind: String,
+    /// Whether our reconstruction of the account reconciled to its official PnL.
+    pub anchor_consistent: bool,
+    /// Fraction of orders resting at the touch.
+    pub at_touch_frac: Option<f64>,
+    /// Median per-window capital ($).
+    pub per_window_capital_median_usd: Option<f64>,
+    /// p90 per-window capital ($).
+    pub per_window_capital_p90_usd: Option<f64>,
+    /// Windows traded per day.
+    pub windows_per_day: Option<f64>,
+    /// Official account PnL ($).
+    pub official_pnl_usd: Option<f64>,
+    /// Merges per active day.
+    pub merges_per_active_day: Option<f64>,
+    /// Capital turns per day.
+    pub turns_per_day: Option<f64>,
+    /// Capital recycled ($).
+    pub recycled_usd: Option<f64>,
+    /// Median fill size ($ notional).
+    pub fill_size_median_usd: Option<f64>,
+    /// p90 fill size ($ notional).
+    pub fill_size_p90_usd: Option<f64>,
+    /// p95 cancel round-trip (ms) — `null` (their Data API records only fills).
+    pub cancel_p95_ms: Option<f64>,
+    /// Pair-completion fraction — `null` (unobservable for their accounts).
+    pub pair_completion_frac: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CompetitorFile {
+    competitors: Vec<CompetitorDto>,
+}
+
+fn competitors() -> Vec<CompetitorDto> {
+    serde_json::from_str::<CompetitorFile>(COMPETITORS_JSON)
+        .map(|f| f.competitors)
+        .unwrap_or_default()
+}
+
+/// Our own like-for-like benchmark metrics.
+#[derive(Debug, Clone, Serialize)]
+pub struct OursBenchmarkDto {
+    /// The series scope (`null` = all series combined).
+    pub series: Option<String>,
+    /// Windows traded in scope.
+    pub windows_traded: u32,
+    /// Average passive-fill 5s markout (probability units).
+    pub avg_markout_5s: Option<f64>,
+    /// Average passive-fill 30s markout (probability units).
+    pub avg_markout_30s: Option<f64>,
+    /// Pairs completed (matched held + merged), in pairs.
+    pub pairs_completed: String,
+    /// Shares stranded (unmatched at close).
+    pub stranded_shares: String,
+    /// Pair-completion fraction: pairs / (pairs + stranded/2), `null` with none.
+    pub pair_completion_frac: Option<f64>,
+    /// Pairs merged back to collateral (the merge-velocity numerator).
+    pub merged_pairs: String,
+    /// Fraction of placements resting at or better than the touch.
+    pub at_touch_frac: Option<f64>,
+    /// p95 cancel round-trip (ms) — `null` in paper (unobservable).
+    pub cancel_p95_ms: Option<i64>,
+    /// Median of our fill-size notional ($) — for the like-for-like vs nagi $4/$21.
+    pub fill_size_median_usd: Option<String>,
+    /// p90 of our fill-size notional ($).
+    pub fill_size_p90_usd: Option<String>,
+}
+
+/// The `/api/benchmark` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct BenchmarkDto {
+    /// Which trading mode.
+    pub mode: Mode,
+    /// Our metrics.
+    pub ours: OursBenchmarkDto,
+    /// The competitor fact-sheets.
+    pub competitors: Vec<CompetitorDto>,
+}
+
+/// The `q`-quantile ($) of the maker fill-size notionals, nearest-rank.
+fn fill_size_quantile(mut notionals: Vec<Decimal>, q: f64) -> Option<Decimal> {
+    if notionals.is_empty() {
+        return None;
+    }
+    notionals.sort_unstable();
+    let n = notionals.len();
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "fill count is bounded by the fills ring; nearest-rank index is in range"
+    )]
+    let idx = ((q * n as f64).ceil() as usize)
+        .saturating_sub(1)
+        .min(n - 1);
+    Some(notionals[idx])
+}
+
+/// Builds the benchmark tile (ours vs the competitor fact-sheet) for a mode and
+/// optional series scope.
+#[must_use]
+pub(crate) fn benchmark(data: &DashboardData, mode: Mode, series: Option<Series>) -> BenchmarkDto {
+    let ms = data.mode(mode);
+    // Aggregate the matching series aggregates (additive accumulators).
+    let mut windows = 0u32;
+    let (mut m5s, mut m5n, mut m30s, mut m30n) = (0.0f64, 0u64, 0.0f64, 0u64);
+    let (mut matched, mut merged, mut stranded) = (Size::ZERO, Size::ZERO, Decimal::ZERO);
+    for agg in ms.analytics.rollups().series_aggregates() {
+        if series.is_some_and(|f| f != agg.series) {
+            continue;
+        }
+        windows += agg.windows_traded;
+        m5s += agg.markout_5s_sum;
+        m5n += agg.markout_5s_n;
+        m30s += agg.markout_30s_sum;
+        m30n += agg.markout_30s_n;
+        matched = matched + agg.matched_pairs;
+        merged = merged + agg.merged_pairs;
+        stranded += agg.stranded_shares;
+    }
+    let pairs = matched + merged;
+    #[allow(clippy::cast_precision_loss, reason = "markout sample count bounded")]
+    let avg_markout_5s = (m5n > 0).then(|| m5s / m5n as f64);
+    #[allow(clippy::cast_precision_loss, reason = "markout sample count bounded")]
+    let avg_markout_30s = (m30n > 0).then(|| m30s / m30n as f64);
+    // pair-completion fraction: completed / (completed + half the stranded legs).
+    let pair_completion_frac = {
+        let p = pairs.as_decimal();
+        let denom = p + stranded / Decimal::from(2);
+        (denom > Decimal::ZERO)
+            .then(|| (p / denom).to_f64())
+            .flatten()
+    };
+    // at-touch fraction over placements with a book reference.
+    let at_touch_frac = {
+        let (mut hit, mut total) = (0u64, 0u64);
+        for (s, (h, t)) in &ms.at_touch {
+            if series.is_none_or(|f| f == *s) {
+                hit += *h;
+                total += *t;
+            }
+        }
+        #[allow(clippy::cast_precision_loss, reason = "placement count bounded")]
+        (total > 0).then(|| hit as f64 / total as f64)
+    };
+    // Our maker fill-size notionals ($) for the like-for-like vs nagi.
+    let notionals: Vec<Decimal> = ms
+        .fills
+        .iter()
+        .filter(|f| f.liquidity == Liquidity::Maker)
+        .filter(|f| series.is_none_or(|s| f.window.series == s))
+        .map(|f| f.price.as_decimal() * f.size.as_decimal())
+        .collect();
+    let fill_size_median_usd = fill_size_quantile(notionals.clone(), 0.50).map(|d| d.to_string());
+    let fill_size_p90_usd = fill_size_quantile(notionals, 0.90).map(|d| d.to_string());
+
+    BenchmarkDto {
+        mode,
+        ours: OursBenchmarkDto {
+            series: series.map(|s| s.to_string()),
+            windows_traded: windows,
+            avg_markout_5s,
+            avg_markout_30s,
+            pairs_completed: pairs.as_decimal().to_string(),
+            stranded_shares: stranded.to_string(),
+            pair_completion_frac,
+            merged_pairs: merged.as_decimal().to_string(),
+            at_touch_frac,
+            cancel_p95_ms: ms.activity.p95_time_to_cancel_ms(series),
+            fill_size_median_usd,
+            fill_size_p90_usd,
+        },
+        competitors: competitors(),
+    }
+}
+
+// ---- contention counters (§10/§11) -----------------------------------------
+
+/// One arbitration-block row: which loser was suppressed by which winner.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArbitrationRowDto {
+    /// Series key.
+    pub series: String,
+    /// The suppressed (losing) driver.
+    pub loser: String,
+    /// The winning driver.
+    pub winner: String,
+    /// Cumulative block count.
+    pub count: u64,
+}
+
+/// One placement-veto row: how many placements the risk gate refused.
+#[derive(Debug, Clone, Serialize)]
+pub struct VetoRowDto {
+    /// The reject-detail label.
+    pub detail: String,
+    /// Series key.
+    pub series: String,
+    /// Cumulative veto count.
+    pub count: u64,
+}
+
+/// The `/api/contention` response — cross-taker arbitration blocks + risk vetoes.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContentionDto {
+    /// Which trading mode.
+    pub mode: Mode,
+    /// Arbitration blocks, ranked by count desc.
+    pub arbitration: Vec<ArbitrationRowDto>,
+    /// Placement vetoes, ranked by count desc.
+    pub vetoes: Vec<VetoRowDto>,
+}
+
+/// Builds the contention panel for a mode (both tallies ranked by count).
+#[must_use]
+pub(crate) fn contention(data: &DashboardData, mode: Mode) -> ContentionDto {
+    let c = &data.mode(mode).contention;
+    let mut arbitration: Vec<ArbitrationRowDto> = c
+        .arbitration
+        .iter()
+        .map(|((series, loser, winner), count)| ArbitrationRowDto {
+            series: series.to_string(),
+            loser: (*loser).to_owned(),
+            winner: (*winner).to_owned(),
+            count: *count,
+        })
+        .collect();
+    arbitration.sort_by(|a, b| b.count.cmp(&a.count).then(a.series.cmp(&b.series)));
+    let mut vetoes: Vec<VetoRowDto> = c
+        .vetoes
+        .iter()
+        .map(|((detail, series), count)| VetoRowDto {
+            detail: (*detail).to_owned(),
+            series: series.to_string(),
+            count: *count,
+        })
+        .collect();
+    vetoes.sort_by(|a, b| b.count.cmp(&a.count).then(a.detail.cmp(&b.detail)));
+    ContentionDto {
+        mode,
+        arbitration,
+        vetoes,
     }
 }
 

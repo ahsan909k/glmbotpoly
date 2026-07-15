@@ -1,0 +1,59 @@
+{
+  "note": "Curated from the model-lab competitor operating-manuals (2026-07-14). Numbers are documented account fact-sheets, not live-updating. cancel_p95 and pair_completion are null: the competitor Polymarket Data API records only fills, so these are unobservable for their accounts (render 'n/a').",
+  "competitors": [
+    {
+      "handle": "gabigol",
+      "role": "primary",
+      "kind": "maker",
+      "anchor_consistent": true,
+      "at_touch_frac": 0.58,
+      "per_window_capital_median_usd": 60,
+      "per_window_capital_p90_usd": 317,
+      "windows_per_day": 448,
+      "official_pnl_usd": 290620,
+      "merges_per_active_day": null,
+      "turns_per_day": null,
+      "recycled_usd": null,
+      "fill_size_median_usd": null,
+      "fill_size_p90_usd": null,
+      "cancel_p95_ms": null,
+      "pair_completion_frac": null
+    },
+    {
+      "handle": "nagi777",
+      "role": "secondary",
+      "kind": "maker",
+      "anchor_consistent": false,
+      "at_touch_frac": 0.54,
+      "per_window_capital_median_usd": null,
+      "per_window_capital_p90_usd": null,
+      "windows_per_day": null,
+      "official_pnl_usd": null,
+      "merges_per_active_day": 2828,
+      "turns_per_day": 65,
+      "recycled_usd": 1310000,
+      "fill_size_median_usd": 4,
+      "fill_size_p90_usd": 21,
+      "cancel_p95_ms": null,
+      "pair_completion_frac": null
+    },
+    {
+      "handle": "b27b",
+      "role": "secondary",
+      "kind": "maker",
+      "anchor_consistent": true,
+      "at_touch_frac": 0.55,
+      "per_window_capital_median_usd": null,
+      "per_window_capital_p90_usd": null,
+      "windows_per_day": null,
+      "official_pnl_usd": null,
+      "merges_per_active_day": 1036,
+      "turns_per_day": 74,
+      "recycled_usd": 4550000,
+      "fill_size_median_usd": null,
+      "fill_size_p90_usd": null,
+      "cancel_p95_ms": null,
+      "pair_completion_frac": null
+    }
+  ]
+}

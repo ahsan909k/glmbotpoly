@@ -254,6 +254,18 @@ pub struct DailyRollup {
     pub markout_5s_max: f64,
     /// 5s-markout histogram (bin layout per [`MARKOUT_BIN_EDGES`]).
     pub markout_5s_hist: [u32; MARKOUT_BIN_COUNT],
+    /// Sum of finalized passive-fill 30s markouts.
+    pub markout_30s_sum: f64,
+    /// Sum of squares of those 30s markouts.
+    pub markout_30s_sumsq: f64,
+    /// Count of finalized passive-fill 30s markouts.
+    pub markout_30s_n: u64,
+    /// Smallest 30s markout seen (`+INF` sentinel until any sample).
+    pub markout_30s_min: f64,
+    /// Largest 30s markout seen (`-INF` sentinel until any sample).
+    pub markout_30s_max: f64,
+    /// 30s-markout histogram (bin layout per [`MARKOUT_BIN_EDGES`]).
+    pub markout_30s_hist: [u32; MARKOUT_BIN_COUNT],
 }
 
 impl DailyRollup {
@@ -284,10 +296,16 @@ impl DailyRollup {
             markout_5s_min: f64::INFINITY,
             markout_5s_max: f64::NEG_INFINITY,
             markout_5s_hist: [0; MARKOUT_BIN_COUNT],
+            markout_30s_sum: 0.0,
+            markout_30s_sumsq: 0.0,
+            markout_30s_n: 0,
+            markout_30s_min: f64::INFINITY,
+            markout_30s_max: f64::NEG_INFINITY,
+            markout_30s_hist: [0; MARKOUT_BIN_COUNT],
         }
     }
 
-    fn fold(&mut self, a: &WindowAttribution, markout_5s: &[f64]) {
+    fn fold(&mut self, a: &WindowAttribution, markout_5s: &[f64], markout_30s: &[f64]) {
         self.windows_traded += 1;
         if a.is_profitable() {
             self.windows_profitable += 1;
@@ -319,6 +337,17 @@ impl DailyRollup {
             self.markout_5s_hist[markout_bin(*m)] += 1;
             self.markout_5s_n += 1;
         }
+        for m in markout_30s {
+            if !m.is_finite() {
+                continue; // defensive; finalized markouts are finite
+            }
+            self.markout_30s_sum += *m;
+            self.markout_30s_sumsq += *m * *m;
+            self.markout_30s_min = self.markout_30s_min.min(*m);
+            self.markout_30s_max = self.markout_30s_max.max(*m);
+            self.markout_30s_hist[markout_bin(*m)] += 1;
+            self.markout_30s_n += 1;
+        }
     }
 
     /// Ledger PnL per traded window, `0` when none traded.
@@ -339,6 +368,12 @@ impl DailyRollup {
         mean(self.markout_5s_sum, self.markout_5s_n)
     }
 
+    /// Average passive-fill 30s markout, `None` with no passive 30s sample.
+    #[must_use]
+    pub fn avg_markout_30s(&self) -> Option<f64> {
+        mean(self.markout_30s_sum, self.markout_30s_n)
+    }
+
     /// The full 5s-markout distribution for this day.
     #[must_use]
     pub fn markout_distribution(&self) -> MarkoutDistribution {
@@ -349,6 +384,19 @@ impl DailyRollup {
             self.markout_5s_min,
             self.markout_5s_max,
             self.markout_5s_hist.map(u64::from),
+        )
+    }
+
+    /// The full 30s-markout distribution for this day.
+    #[must_use]
+    pub fn markout_distribution_30s(&self) -> MarkoutDistribution {
+        MarkoutDistribution::from_parts(
+            self.markout_30s_sum,
+            self.markout_30s_sumsq,
+            self.markout_30s_n,
+            self.markout_30s_min,
+            self.markout_30s_max,
+            self.markout_30s_hist.map(u64::from),
         )
     }
 
@@ -410,6 +458,18 @@ pub struct SeriesAggregate {
     pub markout_5s_max: f64,
     /// 5s-markout histogram (bin layout per [`MARKOUT_BIN_EDGES`]).
     pub markout_5s_hist: [u32; MARKOUT_BIN_COUNT],
+    /// Sum of 30s markouts.
+    pub markout_30s_sum: f64,
+    /// Sum of squares of 30s markouts.
+    pub markout_30s_sumsq: f64,
+    /// Count of 30s markouts.
+    pub markout_30s_n: u64,
+    /// Smallest 30s markout (`+INF` until any sample).
+    pub markout_30s_min: f64,
+    /// Largest 30s markout (`-INF` until any sample).
+    pub markout_30s_max: f64,
+    /// 30s-markout histogram (bin layout per [`MARKOUT_BIN_EDGES`]).
+    pub markout_30s_hist: [u32; MARKOUT_BIN_COUNT],
 }
 
 impl SeriesAggregate {
@@ -439,6 +499,12 @@ impl SeriesAggregate {
             markout_5s_min: f64::INFINITY,
             markout_5s_max: f64::NEG_INFINITY,
             markout_5s_hist: [0; MARKOUT_BIN_COUNT],
+            markout_30s_sum: 0.0,
+            markout_30s_sumsq: 0.0,
+            markout_30s_n: 0,
+            markout_30s_min: f64::INFINITY,
+            markout_30s_max: f64::NEG_INFINITY,
+            markout_30s_hist: [0; MARKOUT_BIN_COUNT],
         }
     }
 
@@ -471,6 +537,18 @@ impl SeriesAggregate {
         {
             *slot += *c;
         }
+        self.markout_30s_sum += d.markout_30s_sum;
+        self.markout_30s_sumsq += d.markout_30s_sumsq;
+        self.markout_30s_n += d.markout_30s_n;
+        self.markout_30s_min = self.markout_30s_min.min(d.markout_30s_min);
+        self.markout_30s_max = self.markout_30s_max.max(d.markout_30s_max);
+        for (slot, c) in self
+            .markout_30s_hist
+            .iter_mut()
+            .zip(d.markout_30s_hist.iter())
+        {
+            *slot += *c;
+        }
     }
 
     /// The 5s-markout distribution aggregated across this series' days.
@@ -483,6 +561,19 @@ impl SeriesAggregate {
             self.markout_5s_min,
             self.markout_5s_max,
             self.markout_5s_hist.map(u64::from),
+        )
+    }
+
+    /// The 30s-markout distribution aggregated across this series' days.
+    #[must_use]
+    pub fn markout_distribution_30s(&self) -> MarkoutDistribution {
+        MarkoutDistribution::from_parts(
+            self.markout_30s_sum,
+            self.markout_30s_sumsq,
+            self.markout_30s_n,
+            self.markout_30s_min,
+            self.markout_30s_max,
+            self.markout_30s_hist.map(u64::from),
         )
     }
 
@@ -499,6 +590,7 @@ impl SeriesAggregate {
         health: AdverseSelectionState,
     ) -> SeriesComparisonRow {
         let markout_5s = self.markout_distribution();
+        let markout_30s = self.markout_distribution_30s();
         let budget = taker_budget_per_window.as_decimal();
         let taker_budget_used_fraction = if budget <= Decimal::ZERO || self.windows_traded == 0 {
             None
@@ -535,6 +627,8 @@ impl SeriesAggregate {
             rebates_earned: self.estimated_rebate,
             avg_markout_5s: markout_5s.mean,
             markout_5s,
+            avg_markout_30s: markout_30s.mean,
+            markout_30s,
             maker_fills: self.maker_fills,
             taker_fills: self.taker_fills,
             maker_fill_fraction: fraction64(self.maker_fills, self.maker_fills + self.taker_fills),
@@ -578,6 +672,11 @@ pub struct SeriesComparisonRow {
     pub avg_markout_5s: Option<f64>,
     /// Full 5s-markout distribution (moments + histogram + approx percentiles).
     pub markout_5s: MarkoutDistribution,
+    /// Average passive-fill 30s markout, `None` with no sample. Convenience mirror
+    /// of `markout_30s.mean` (the benchmark tile's longer-horizon fill quality).
+    pub avg_markout_30s: Option<f64>,
+    /// Full 30s-markout distribution (moments + histogram + approx percentiles).
+    pub markout_30s: MarkoutDistribution,
     /// Maker fills.
     pub maker_fills: u64,
     /// Taker fills.
@@ -792,14 +891,26 @@ impl RollupStore {
         Self::default()
     }
 
-    /// Folds a settled window's attribution (and its passive 5s markouts) into
-    /// the `(series, day)` daily roll-up.
+    /// Folds a settled window's attribution and its passive 5s markouts into the
+    /// `(series, day)` daily roll-up (no 30s markouts — thin wrapper over
+    /// [`fold_markouts`](Self::fold_markouts)).
     pub fn fold(&mut self, a: &WindowAttribution, markout_5s: &[f64]) {
+        self.fold_markouts(a, markout_5s, &[]);
+    }
+
+    /// Folds a settled window's attribution and its passive 5s **and** 30s
+    /// markouts into the `(series, day)` daily roll-up.
+    pub fn fold_markouts(
+        &mut self,
+        a: &WindowAttribution,
+        markout_5s: &[f64],
+        markout_30s: &[f64],
+    ) {
         let day = DayKey::from_ts(a.ts);
         self.daily
             .entry((a.window.series, day))
             .or_insert_with(|| DailyRollup::new(a.mode, a.window.series, day))
-            .fold(a, markout_5s);
+            .fold(a, markout_5s, markout_30s);
     }
 
     /// The daily roll-up for a `(series, day)`, if any.
@@ -1191,6 +1302,48 @@ mod tests {
         // Mean/stddev additive up to f64 grouping (single-fold vs split sums).
         assert!((da.mean.expect("mean a") - db.mean.expect("mean b")).abs() < 1e-12);
         assert!((da.stddev.expect("std a") - db.stddev.expect("std b")).abs() < 1e-12);
+    }
+
+    #[test]
+    fn markout_30s_accumulates_and_is_additive_across_days() {
+        let samples5 = [-0.02, 0.03];
+        let samples30 = [-0.20, -0.04, 0.001, 0.04, 0.20];
+        // One day with all the 30s samples.
+        let mut a = RollupStore::new();
+        a.fold_markouts(
+            &attribution(dec!(1), DayKey::from_days(100).start_ms()),
+            &samples5,
+            &samples30,
+        );
+        // Two days, 30s split 2 + 3.
+        let mut b = RollupStore::new();
+        b.fold_markouts(
+            &attribution(dec!(1), DayKey::from_days(100).start_ms()),
+            &samples5,
+            &samples30[..2],
+        );
+        b.fold_markouts(
+            &attribution(dec!(1), DayKey::from_days(99).start_ms()),
+            &[],
+            &samples30[2..],
+        );
+        let da = a.series_aggregates()[0];
+        let db = b.series_aggregates()[0];
+        // 30s distribution is exactly additive on histogram / count / min-max.
+        let ma = da.markout_distribution_30s();
+        let mb = db.markout_distribution_30s();
+        assert_eq!(ma.n, 5);
+        assert_eq!(ma.histogram, mb.histogram);
+        assert_eq!(ma.n, mb.n);
+        assert_eq!(ma.min, mb.min);
+        assert_eq!(ma.max, mb.max);
+        // The 5s stream is unaffected by the 30s split.
+        assert_eq!(da.markout_5s_n, 2);
+        // The row surfaces both horizons.
+        let row = da.to_row(1, Dollars::new(dec!(10)), AdverseSelectionState::Ok);
+        assert_eq!(row.markout_30s.n, 5);
+        assert!((row.avg_markout_30s.expect("30s mean") - ma.mean.expect("mean")).abs() < 1e-12);
+        assert_eq!(row.markout_5s.n, 2);
     }
 
     // ---- new: taker-budget usage & maker mix --------------------------------

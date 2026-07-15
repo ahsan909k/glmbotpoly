@@ -63,6 +63,7 @@ const state = {
   orderSeen: new Map(),               // order_id → {placed, series, side, price}
   params: { noAtm: 25, noPassive: 5, lateTau: 30, atmBand: 0.10 },
   paramsLoaded: false,
+  pnlWindow: "all",                   // PnL-matrix time window (today/7d/all)
 };
 const EQUITY_CAP = 5000;
 const CANCELS_CAP = 80;
@@ -138,6 +139,12 @@ function windowSecs(seriesKey) {
 }
 function isActiveLifecycle(lc) { return lc === "Open" || lc === "Closing"; }
 function px3(p) { return num(p).toFixed(3); }
+// Escape server-provided strings before interpolating into innerHTML / attributes.
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
 
 // =========================================================== SUMMARY (landing)
 function summarySeriesParam() { return state.summary.series ? `&series=${state.summary.series}` : ""; }
@@ -691,6 +698,7 @@ function loadAll() {
   if (!state.paramsLoaded) loadParams();
   loadOverview();
   loadSummaryTabs();
+  loadStatusStrip();
   refreshActiveView();
 }
 
@@ -965,6 +973,198 @@ function renderRisk() {
     : `<div class="health-item ok"><span>all books reliable</span><span>✓</span></div>`;
 }
 
+// ============================================ STATUS STRIP (global, always on)
+// One pill per (driver × series) = 24 cells; never a silent state.
+const DRIVER_ABBR = { "maker-core": "core", "momentum": "mom", "late": "late", "model": "mdl" };
+const SERIES_ABBR = { "BTC-5m": "B5", "BTC-15m": "B15", "BTC-1h": "B1h", "ETH-5m": "E5", "ETH-15m": "E15", "ETH-1h": "E1h" };
+function stripStateClass(st) {
+  return st === "halted" ? "halted"
+    : st === "shadow_tripped" ? "shadow"
+    : st === "standing_down" ? "standdown"
+    : "active";
+}
+async function loadStatusStrip() {
+  try { renderStatusStrip(await api(`/api/status-strip?mode=${state.mode}`)); }
+  catch (e) { /* best-effort — keep the last render */ }
+}
+function renderStatusStrip(s) {
+  const el = $("status-strip");
+  if (!el) return;
+  const cells = (s && s.cells) || [];
+  if (!cells.length) { el.innerHTML = `<span class="st-empty">no driver status yet</span>`; return; }
+  el.innerHTML = cells.map((c) => {
+    const cls = stripStateClass(c.state);
+    const drv = DRIVER_ABBR[c.driver] || c.driver;
+    const ser = SERIES_ABBR[c.series] || c.series;
+    let title = `${c.driver} · ${c.series} · ${c.state}`;
+    if (c.detail) title += ` — ${c.detail}`;
+    if (c.state === "shadow_tripped") {
+      if (c.value != null) title += ` · value ${num(c.value).toFixed(3)}`;
+      if (c.ts_ms) title += ` @ ${fmtClock(c.ts_ms)}`;
+    }
+    return `<span class="st-pill ${cls}" title="${esc(title)}"><b>${esc(drv)}</b>${esc(ser)}</span>`;
+  }).join("");
+}
+
+// ========================================================= PnL MATRIX (tab)
+// Rows = drivers, columns = series; last row/column = totals.
+const MX_DRIVERS = ["maker-core", "momentum", "late", "model"];
+async function loadPnlMatrix() {
+  try {
+    renderPnlMatrix(await api(`/api/pnl-matrix?mode=${state.mode}&window=${state.pnlWindow}`));
+    showAuthBanner(false);
+  } catch (e) { if (e.message !== "unauthorized") toast("pnl: " + e.message, true); }
+}
+function pnlSub(winPct, trades) {
+  const wp = (winPct == null) ? "—" : (winPct * 100).toFixed(0) + "%";
+  return `<div class="mx-sub">${wp} · ${num(trades)}</div>`;
+}
+function pnlTotalTd(t) {
+  return t
+    ? `<td class="mx-total">${moneyCell(t.realized_pnl, true)}${pnlSub(t.win_pct, t.trades)}</td>`
+    : `<td class="mx-total">—</td>`;
+}
+function renderPnlMatrix(m) {
+  const head = $("pnl-head"), body = $("pnl-body");
+  const cells = (m && m.cells) || [];
+  $("pnl-empty").classList.toggle("hidden", cells.length > 0);
+  const rowT = {}, colT = {};
+  for (const r of ((m && m.row_totals) || [])) rowT[r.key] = r;
+  for (const c of ((m && m.col_totals) || [])) colT[c.key] = c;
+  const idx = {};
+  for (const c of cells) idx[c.driver + "|" + c.series] = c;
+  head.innerHTML = `<th class="col-series">Driver \\ Series</th>` +
+    ALL_SERIES.map((s) => `<th>${s}</th>`).join("") + `<th>Total</th>`;
+  let html = "";
+  for (const drv of MX_DRIVERS) {
+    html += `<tr><td class="col-series">${drv}</td>`;
+    for (const s of ALL_SERIES) {
+      const c = idx[drv + "|" + s];
+      html += c
+        ? `<td>${moneyCell(c.realized_pnl, true)}${pnlSub(c.win_pct, c.trades)}</td>`
+        : `<td class="mx-empty">—</td>`;
+    }
+    html += pnlTotalTd(rowT[drv]) + `</tr>`;
+  }
+  // grand-total row (per-series column totals + overall total)
+  let gp = 0, gt = 0, gw = 0;
+  for (const drv of MX_DRIVERS) {
+    const t = rowT[drv];
+    if (t) { gp += num(t.realized_pnl); gt += num(t.trades); gw += num(t.wins); }
+  }
+  html += `<tr class="mx-total-row"><td class="col-series">Total</td>`;
+  for (const s of ALL_SERIES) html += pnlTotalTd(colT[s]);
+  html += `<td class="mx-total">${moneyCell(gp, true)}${pnlSub(gt > 0 ? gw / gt : null, gt)}</td></tr>`;
+  body.innerHTML = html;
+}
+
+// ========================================================== BENCHMARK (tab)
+// Ours vs each competitor, one metric per row. null → "n/a".
+const BENCH_NA = `<span class="b-na">n/a</span>`;
+function bPct(f) { return (f == null) ? BENCH_NA : (num(f) * 100).toFixed(0) + "%"; }
+function bMark(f) { return (f == null) ? BENCH_NA : markoutCell(num(f)); }
+function bInt(v) { return (v == null) ? BENCH_NA : num(v).toLocaleString(); }
+function bUsd(v) { return (v == null) ? BENCH_NA : fmtUsd(v, false); }
+function bUsdSigned(v) { return (v == null) ? BENCH_NA : moneyCell(v, true); }
+function bMs(v) { return (v == null) ? BENCH_NA : Math.round(num(v)) + " ms"; }
+function bDec(v, dp) { return (v == null) ? BENCH_NA : num(v).toFixed(dp); }
+const BENCH_ROWS = [
+  { label: "At-touch %", ours: (o) => o.at_touch_frac, comp: (c) => c.at_touch_frac, fmt: bPct },
+  { label: "Fill size — median $", ours: (o) => o.fill_size_median_usd, comp: (c) => c.fill_size_median_usd, fmt: bUsd },
+  { label: "Fill size — p90 $", ours: (o) => o.fill_size_p90_usd, comp: (c) => c.fill_size_p90_usd, fmt: bUsd },
+  { label: "Cancel p95 (ms)", ours: (o) => o.cancel_p95_ms, comp: (c) => c.cancel_p95_ms, fmt: bMs },
+  { label: "Pair completion %", ours: (o) => o.pair_completion_frac, comp: (c) => c.pair_completion_frac, fmt: bPct },
+  { label: "5s markout", ours: (o) => o.avg_markout_5s, comp: () => null, fmt: bMark },
+  { label: "30s markout", ours: (o) => o.avg_markout_30s, comp: () => null, fmt: bMark },
+  { label: "Pairs completed", ours: (o) => o.pairs_completed, comp: () => null, fmt: bInt },
+  { label: "Stranded shares", ours: (o) => o.stranded_shares, comp: () => null, fmt: bInt },
+  { label: "Merged pairs", ours: (o) => o.merged_pairs, comp: () => null, fmt: bInt },
+  { label: "Merges / active day", ours: () => null, comp: (c) => c.merges_per_active_day, fmt: (v) => bDec(v, 1) },
+  { label: "Capital turns / day", ours: () => null, comp: (c) => c.turns_per_day, fmt: (v) => bDec(v, 1) },
+  { label: "Recycled $", ours: () => null, comp: (c) => c.recycled_usd, fmt: bUsd },
+  { label: "Windows traded", ours: (o) => o.windows_traded, comp: () => null, fmt: bInt },
+  { label: "Windows / day", ours: () => null, comp: (c) => c.windows_per_day, fmt: (v) => bDec(v, 1) },
+  { label: "Per-window capital — median $", ours: () => null, comp: (c) => c.per_window_capital_median_usd, fmt: bUsd },
+  { label: "Per-window capital — p90 $", ours: () => null, comp: (c) => c.per_window_capital_p90_usd, fmt: bUsd },
+  { label: "Official PnL $", ours: () => null, comp: (c) => c.official_pnl_usd, fmt: bUsdSigned },
+];
+async function loadBenchmark() {
+  try {
+    renderBenchmark(await api(`/api/benchmark?mode=${state.mode}`));
+    showAuthBanner(false);
+  } catch (e) { if (e.message !== "unauthorized") toast("benchmark: " + e.message, true); }
+}
+function renderBenchmark(b) {
+  const head = $("bench-head"), body = $("bench-body");
+  if (!b || !b.ours) {
+    head.innerHTML = ""; body.innerHTML = "";
+    $("bench-empty").classList.remove("hidden");
+    return;
+  }
+  $("bench-empty").classList.add("hidden");
+  // primary account first, then secondary — stable within each group.
+  const comps = (b.competitors || []).slice()
+    .sort((a, c) => (a.role === "primary" ? 0 : 1) - (c.role === "primary" ? 0 : 1));
+  let h = `<th class="col-series">Metric</th><th>Ours</th>`;
+  for (const c of comps) {
+    const primary = c.role === "primary" ? `<span class="bench-primary">PRIMARY</span>` : "";
+    const meta = [
+      c.kind ? esc(c.kind) : null,
+      c.anchor_consistent === false ? "anchor ✗" : (c.anchor_consistent === true ? "anchor ✓" : null),
+    ].filter(Boolean).join(" · ");
+    h += `<th>${esc(c.handle)}${primary}${meta ? `<div class="bench-meta">${meta}</div>` : ""}</th>`;
+  }
+  head.innerHTML = h;
+  body.innerHTML = BENCH_ROWS.map((row) => {
+    let tds = `<td class="col-series">${row.label}</td><td>${row.fmt(row.ours(b.ours))}</td>`;
+    for (const c of comps) tds += `<td>${row.fmt(row.comp(c))}</td>`;
+    return `<tr>${tds}</tr>`;
+  }).join("");
+}
+
+// ========================================================= CONTENTION (tab)
+async function loadContention() {
+  try {
+    renderContention(await api(`/api/contention?mode=${state.mode}`));
+    showAuthBanner(false);
+  } catch (e) { if (e.message !== "unauthorized") toast("contention: " + e.message, true); }
+}
+function renderContention(c) {
+  const arb = (c && c.arbitration) || [];
+  const veto = (c && c.vetoes) || [];
+  $("contention-arb").innerHTML = arb.length
+    ? arb.map((r) =>
+        `<div class="rank-row"><span class="rank-text">${esc(r.loser)} suppressed by ${esc(r.winner)} on ${esc(r.series)}</span><span class="rank-count">${num(r.count)}×</span></div>`
+      ).join("")
+    : `<div class="rank-empty">none yet</div>`;
+  $("contention-veto").innerHTML = veto.length
+    ? veto.map((r) =>
+        `<div class="rank-row"><span class="rank-text">${esc(r.detail)} on ${esc(r.series)}</span><span class="rank-count">${num(r.count)}×</span></div>`
+      ).join("")
+    : `<div class="rank-empty">none yet</div>`;
+}
+
+// ============================================================= DIGEST (tab)
+async function loadDigest() {
+  try {
+    renderDigest(await api("/api/digest"));
+    showAuthBanner(false);
+  } catch (e) { if (e.message !== "unauthorized") toast("digest: " + e.message, true); }
+}
+function renderDigest(d) {
+  const body = $("digest-body"), dateEl = $("digest-date"), empty = $("digest-empty");
+  if (!d || !d.present) {
+    body.classList.add("hidden");
+    dateEl.textContent = "";
+    empty.classList.remove("hidden");
+    return;
+  }
+  empty.classList.add("hidden");
+  body.classList.remove("hidden");
+  dateEl.textContent = d.date || "";
+  body.textContent = d.markdown || "";   // textContent — safe, preserves formatting
+}
+
 // debounced live/fills refreshers (high-frequency WS frames)
 let liveRefreshTimer = null;
 function scheduleLiveRefresh() {
@@ -990,6 +1190,10 @@ function refreshActiveView() {
   else if (state.view === "live") loadWindows();
   else if (state.view === "fills") loadFills();
   else if (state.view === "risk") loadRisk();
+  else if (state.view === "pnlmatrix") loadPnlMatrix();
+  else if (state.view === "benchmark") loadBenchmark();
+  else if (state.view === "contention") loadContention();
+  else if (state.view === "digest") loadDigest();
 }
 
 // ----------------------------------------------------------------- websocket
@@ -1165,7 +1369,7 @@ function wireControls() {
 }
 
 // --------------------------------------------------------------------- wiring
-const VIEWS = ["summary", "controls", "series", "live", "fills", "risk"];
+const VIEWS = ["summary", "controls", "series", "live", "fills", "risk", "pnlmatrix", "benchmark", "contention", "digest"];
 function switchView(view) {
   state.view = view;
   document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === view));
@@ -1179,6 +1383,7 @@ function switchMode(mode) {
   state.cancels = []; state.orderSeen.clear();
   renderBadges(); renderCapital(); drawEquityChart();
   loadSummaryTabs();
+  loadStatusStrip();
   refreshActiveView();
 }
 
@@ -1194,6 +1399,11 @@ function init() {
     state.summary.window = b.dataset.window;
     document.querySelectorAll("#sum-window .seg-btn").forEach((x) => x.classList.toggle("active", x === b));
     loadSummary();
+  }));
+  document.querySelectorAll("#pnl-window .seg-btn").forEach((b) => b.addEventListener("click", () => {
+    state.pnlWindow = b.dataset.window;
+    document.querySelectorAll("#pnl-window .seg-btn").forEach((x) => x.classList.toggle("active", x === b));
+    loadPnlMatrix();
   }));
   // Lazy-load each dropdown when it is first opened.
   $("drop-fills").parentElement.addEventListener("toggle", (e) => { if (e.target.open) loadDropFills(); });
@@ -1229,11 +1439,21 @@ function init() {
   setInterval(() => { if (state.view === "fills") loadFills(); }, 5000);
   // Periodic calm refresh of the summary (also catches matured markouts in drops).
   setInterval(() => { if (state.view === "summary") { loadSummary(); refreshOpenDrops(); } }, 5000);
+  // The status strip is global (visible on every view) — refresh it on its own cadence.
+  setInterval(loadStatusStrip, 5000);
+  // Calm refresh of the added operational tabs while each is active.
+  setInterval(() => {
+    if (state.view === "pnlmatrix") loadPnlMatrix();
+    else if (state.view === "benchmark") loadBenchmark();
+    else if (state.view === "contention") loadContention();
+    else if (state.view === "digest") loadDigest();
+  }, 5000);
 
   loadParams();
   loadOverview();
   loadSummaryTabs();
   loadSummary();
+  loadStatusStrip();
   connectWS();
 }
 document.addEventListener("DOMContentLoaded", init);

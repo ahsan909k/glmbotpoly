@@ -16,7 +16,7 @@ workspace = true
 # `venue-paper` + a `tokio` test-time runtime (`test-util` provides
 # `start_paused`/`advance` for faster-than-real-time, byte-deterministic replay).
 # Off by default — `cargo build -p analytics`/`-p bot` never compile any of it.
-replay = ["dep:engine", "dep:venue-paper", "dep:venue-api", "dep:tokio"]
+replay = ["dep:venue-paper", "dep:venue-api", "dep:tokio"]
 
 [dependencies]
 journal = { path = "../journal" }
@@ -32,11 +32,13 @@ thiserror = { workspace = true }
 # dashboard REST snapshot / WS push (the consuming wiring is deferred).
 serde = { workspace = true }
 
+# `engine::FillDriver` keys the per-driver PnL matrix (a live-only annotation
+# passed explicitly, never replay-derived — so it does not touch the sans-IO
+# `Analytics` fold). Arrows still point inward: engine does not depend on
+# analytics (CLAUDE.md §4). The `config → params` map stays at the bot boundary.
+engine = { path = "../engine" }
 # Replay-harness-only deps (feature `replay`): re-run the full engine + the
-# seed-stable paper venue over a recorded tape. Arrows still point inward —
-# engine/venue-paper/venue-api do not depend on analytics (CLAUDE.md §4); the
-# `config → params` mapping stays at the bot boundary, so no `config` dep here.
-engine = { path = "../engine", optional = true }
+# seed-stable paper venue over a recorded tape.
 venue-paper = { path = "../venue-paper", optional = true }
 venue-api = { path = "../venue-api", optional = true }
 tokio = { workspace = true, optional = true, features = [

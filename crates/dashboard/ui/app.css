@@ -324,3 +324,53 @@ th.col-time, td.col-time { text-align: left; }
 
 /* shadow model observer tile (observation only) */
 .card.shadow .shadow-meta { font-size: 12px; margin: 2px 0 10px; }
+
+/* ============================================================ ADDED VIEWS */
+
+/* ---- always-visible driver × series status strip (no silent states) ---- */
+.status-strip {
+  position: sticky; top: 95px; z-index: 18;
+  display: flex; flex-wrap: wrap; gap: 4px;
+  padding: 6px 10px; background: var(--panel); border-bottom: 1px solid var(--line);
+  max-height: 22vh; overflow-y: auto; -webkit-overflow-scrolling: touch;
+}
+.st-pill {
+  display: inline-flex; align-items: center; gap: 3px;
+  font-size: 10px; line-height: 1; padding: 3px 6px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--panel-2); color: var(--muted);
+  white-space: nowrap; font-variant-numeric: tabular-nums; cursor: default;
+}
+.st-pill b { font-weight: 700; }
+.st-pill.active { color: var(--pos); border-color: rgba(46,204,113,.40); background: rgba(46,204,113,.10); }
+.st-pill.standdown { color: var(--warn); border-color: rgba(240,169,59,.35); background: rgba(240,169,59,.08); }
+.st-pill.shadow { color: var(--warn); border-color: rgba(240,169,59,.60); background: rgba(240,169,59,.18); }
+.st-pill.halted { color: #fff; border-color: var(--danger); background: rgba(226,59,78,.85); }
+.st-empty { color: var(--muted); font-size: 12px; padding: 3px 4px; }
+
+/* ---- PnL matrix + benchmark tables ---- */
+#pnl-table thead th, #bench-table thead th { cursor: default; }
+#pnl-table td, #bench-table td { vertical-align: top; }
+.mx-sub { color: var(--muted); font-size: 10px; font-weight: 400; margin-top: 2px; }
+.mx-empty { color: var(--muted); }
+.mx-total { font-weight: 700; background: rgba(255,255,255,.03); }
+tbody tr.mx-total-row td { border-top: 2px solid var(--line); background: rgba(255,255,255,.04); }
+tbody tr.mx-total-row td.col-series { background: var(--panel-2); }
+.b-na { color: var(--muted); }
+.bench-primary { display: inline-block; margin-left: 6px; font-size: 9px; font-weight: 800; letter-spacing: .04em; color: var(--accent); vertical-align: middle; }
+.bench-meta { color: var(--muted); font-size: 10px; font-weight: 400; margin-top: 2px; text-transform: none; letter-spacing: 0; }
+
+/* ---- contention ranked lists ---- */
+.rank-list { display: flex; flex-direction: column; gap: 6px; }
+.rank-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 8px 10px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; font-size: 13px; }
+.rank-text { color: var(--fg); }
+.rank-count { color: var(--warn); font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.rank-empty { color: var(--muted); font-size: 13px; padding: 8px 2px; }
+
+/* ---- daily digest ---- */
+.digest-date { color: var(--muted); font-size: 12px; }
+pre.digest {
+  margin: 0; white-space: pre-wrap; word-break: break-word; overflow-x: auto;
+  font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--fg); background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 8px; padding: 12px 14px; max-height: 72vh;
+}

@@ -41,7 +41,7 @@ use core_types::{
     BreakerKind, ControlEvent, Dollars, Event, MarketInfo, MarketLifecycleEvent, Mode, OrderId,
     PriceSource, RiskEvent, Series, TimestampMs, WindowId, WindowLifecycle,
 };
-use dashboard::{ControlRequest, DashboardHandle, ModelTakerTick, ShadowTick};
+use dashboard::{ControlRequest, DashboardHandle, DriverStatus, ModelTakerTick, ShadowTick};
 use discovery::DiscoveryService;
 use engine::{
     InventoryEffect, InventoryManager, LateWindowTakerParams, ModelPrediction, ModelTakeOutcome,
@@ -69,6 +69,7 @@ use crate::boot::journal_params;
 use crate::control::{ControlPlane, Decision, RuntimeControlState, VenueAction};
 use crate::dashboard::params_view;
 use crate::depth_capture::{self, DepthCaptureParams};
+use crate::driver_attrib_record::{DriverAttribRecord, DriverAttribRecorder};
 use crate::feed::{binance_params, clob_params, depth_params, rtds_params, shadow_params};
 use crate::model_runtime::ModelRuntime;
 use crate::model_taker_record::{ModelTakerDecision, ModelTakerRecorder};
@@ -90,6 +91,11 @@ const MODEL_TAKER_DIR: &str = "data/model-taker";
 const SHADOW_STOPS_DIR: &str = "data/shadow-stops";
 /// Channel capacity for the (low-rate) shadow-stop recorder.
 const SHADOW_STOPS_CHANNEL_CAP: usize = 4_096;
+/// Directory for the driver-attribution side channel (`driver-attrib-*.jsonl.gz`),
+/// the digest's per-driver PnL source (fills tagged with their placing strategy).
+const DRIVER_ATTRIB_DIR: &str = "data/driver-attrib";
+/// Channel capacity for the driver-attribution recorder (one record per fill).
+const DRIVER_ATTRIB_CHANNEL_CAP: usize = 16_384;
 /// Window-announcement (→ clob) and market-lifecycle (clob → scheduler) capacity.
 const WINDOW_CAP: usize = 64;
 /// Control-request channel capacity (dashboard → loop).
@@ -751,6 +757,20 @@ async fn run(
         None
     };
 
+    // Driver-attribution recorder (§10): one record per fill, tagged with the
+    // strategy that placed it — the digest's per-driver PnL source. Non-critical;
+    // research-only, a write failure never touches the engine or a venue.
+    let driver_attrib_recorder = match DriverAttribRecorder::spawn(
+        PathBuf::from(DRIVER_ATTRIB_DIR),
+        DRIVER_ATTRIB_CHANNEL_CAP,
+    ) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            tracing::warn!(target: "run", error = %e, "driver-attrib recorder disabled (dir unwritable)");
+            None
+        }
+    };
+
     // Timers.
     let mut sample = interval(SAMPLE_PERIOD);
     let mut heartbeat = interval(MODEL_HEARTBEAT);
@@ -1015,7 +1035,7 @@ async fn run(
                 if let Some(ve) = maybe {
                     handle_venue_event(
                         &ve, &venue, &mut risk, &mut inventory, &mut working,
-                        &recorder, &handle, wall_now(),
+                        &recorder, &handle, driver_attrib_recorder.as_ref(), wall_now(),
                     ).await;
                     // A fill may have crossed a per-window loss cap in shadow mode.
                     drain_shadow_stops(&mut risk, shadow_stops_recorder.as_ref(), wall_now());
@@ -1076,6 +1096,20 @@ async fn run(
                 handle.set_wallet(Mode::Paper, wallet, now);
                 handle.set_paper_ledger(Mode::Paper, venue.ledger_snapshot(), now);
                 handle.set_risk(Mode::Paper, risk.state_snapshot(), now);
+                // §10 STATUS strip: the four strategies' standing-down flags.
+                handle.set_driver_status(
+                    Mode::Paper,
+                    DriverStatus {
+                        maker_core_standing_down: risk.quoter_standing_down(),
+                        momentum_standing_down: risk.momentum_standing_down(),
+                        late_standing_down: risk.late_standing_down(),
+                        model_standing_down: risk.model_standing_down(),
+                    },
+                    now,
+                );
+                // §10 contention counters (drain-and-report the arbitration blocks
+                // + placement vetoes accumulated since the last sample).
+                handle.set_contention(Mode::Paper, &risk.contention_snapshot(), now);
             }
             _ = rss_tick.tick() => {
                 let cutoff = TimestampMs::from_millis(
@@ -1193,6 +1227,16 @@ async fn run(
             "shadow-stop journal flushed"
         );
     }
+    // Flush + finalize the driver-attribution side channel.
+    if let Some(rec) = driver_attrib_recorder {
+        let stats = rec.finish();
+        tracing::info!(
+            target: "run",
+            written = stats.written,
+            dropped = stats.dropped,
+            "driver-attrib journal flushed"
+        );
+    }
     tracing::info!(target: "run", "bot run shut down cleanly");
     Ok(())
 }
@@ -1296,6 +1340,7 @@ async fn handle_venue_event(
     working: &mut HashSet<OrderId>,
     recorder: &Recorder,
     handle: &DashboardHandle,
+    driver_attrib: Option<&DriverAttribRecorder>,
     now: TimestampMs,
 ) {
     risk.on_venue_event(ve, venue, now).await;
@@ -1318,7 +1363,11 @@ async fn handle_venue_event(
             let event = Event::Fill(Arc::clone(f));
             recorder.record(&event);
             handle.project(Mode::Paper, &event, now);
-            handle.record_driver_fill(driver, f, now);
+            handle.record_driver_fill(Mode::Paper, driver, f, now);
+            // Persist the driver-tagged fill to the digest's side channel.
+            if let (Some(rec), Some(d)) = (driver_attrib, driver) {
+                rec.record(DriverAttribRecord::build(d, f));
+            }
             for effect in inventory.on_event(&event) {
                 publish_inventory_effect(handle, recorder, effect, now);
             }

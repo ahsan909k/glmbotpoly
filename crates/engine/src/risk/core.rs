@@ -101,6 +101,10 @@ pub(crate) struct RiskCore {
     tripped: BTreeSet<BreakerKind>,
     halted_windows: HashSet<WindowId>,
 
+    // bounded trailing ring of global-breaker trip times (the "trips in the last
+    // hour" rate). Pruned to the trailing hour on every trip and every tick.
+    trip_times: VecDeque<TimestampMs>,
+
     // feed staleness
     binance_mid_last: HashMap<Asset, TimestampMs>,
     stale_feeds: HashSet<(PriceSource, Asset, TickKind)>,
@@ -151,6 +155,9 @@ pub(crate) struct RiskCore {
 
 const DAY_MS: i64 = 86_400_000;
 
+/// The trailing window for the `trips_last_hour` rate (1 hour in ms).
+const TRIPS_WINDOW_MS: i64 = 3_600_000;
+
 fn mid_of(top: &TopOfBook) -> Option<f64> {
     match (top.bid, top.ask) {
         (Some(b), Some(a)) => ((b.price.as_decimal() + a.price.as_decimal())
@@ -175,6 +182,7 @@ impl RiskCore {
             series_caps,
             tripped: BTreeSet::new(),
             halted_windows: HashSet::new(),
+            trip_times: VecDeque::new(),
             binance_mid_last: HashMap::new(),
             stale_feeds: HashSet::new(),
             stale_books: HashSet::new(),
@@ -245,10 +253,14 @@ impl RiskCore {
     }
 
     pub(crate) fn snapshot(&self) -> RiskStateSnapshot {
+        let mut halted_windows_list: Vec<WindowId> = self.halted_windows.iter().copied().collect();
+        halted_windows_list.sort_unstable();
         RiskStateSnapshot {
             tripped: self.tripped.iter().copied().collect(),
             window_loss_active: !self.halted_windows.is_empty(),
             halted_windows: self.halted_windows.len(),
+            halted_windows_list,
+            trips_last_hour: u32::try_from(self.trip_times.len()).unwrap_or(u32::MAX),
             open_notional: self.open_notional,
             open_notional_cap: self.max_open_notional,
             daily_pnl: self.daily_realized,
@@ -259,11 +271,45 @@ impl RiskCore {
         }
     }
 
+    /// Records one global-breaker trip at `now` and prunes the ring to the
+    /// trailing hour (so [`snapshot`](Self::snapshot) reports `trips_last_hour`
+    /// simply as the ring length).
+    fn record_trip(&mut self, now: TimestampMs) {
+        self.trip_times.push_back(now);
+        self.prune_trip_times(now);
+    }
+
+    /// Drops trip timestamps older than the trailing-hour window relative to
+    /// `now`.
+    fn prune_trip_times(&mut self, now: TimestampMs) {
+        while let Some(&front) = self.trip_times.front() {
+            if now.as_millis().saturating_sub(front.as_millis()) > TRIPS_WINDOW_MS {
+                self.trip_times.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Global-breaker trips observed within the trailing hour ending at `now`
+    /// (exact count; the ring is kept pruned so `snapshot` can read its length).
+    #[cfg(test)]
+    pub(crate) fn trips_last_hour(&self, now: TimestampMs) -> u32 {
+        let n = self
+            .trip_times
+            .iter()
+            .filter(|t| now.as_millis().saturating_sub(t.as_millis()) <= TRIPS_WINDOW_MS)
+            .count();
+        u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
     // ---- breaker helpers ----------------------------------------------------
 
-    /// Trip a global breaker (evacuate): announce + cancel-all, once.
-    fn trip_global(&mut self, b: BreakerKind, out: &mut Vec<RiskOutput>) {
+    /// Trip a global breaker (evacuate): announce + cancel-all, once. Records the
+    /// trip in the trailing-hour ring.
+    fn trip_global(&mut self, b: BreakerKind, now: TimestampMs, out: &mut Vec<RiskOutput>) {
         if self.tripped.insert(b) {
+            self.record_trip(now);
             out.push(RiskOutput::Announce(RiskEvent::BreakerTripped {
                 breaker: b,
             }));
@@ -343,7 +389,7 @@ impl RiskCore {
                 if !self.ended_windows.contains(window) {
                     if *reason == BookUnreliableReason::Disconnected {
                         self.ws_down_windows.insert(*window);
-                        self.recompute_ws(&mut out);
+                        self.recompute_ws(now, &mut out);
                     } else {
                         self.stale_books.insert(*window);
                         self.recompute_feed_stale(now, &mut out);
@@ -354,7 +400,7 @@ impl RiskCore {
                 let was_ws = self.ws_down_windows.remove(window);
                 let was_book = self.stale_books.remove(window);
                 if was_ws {
-                    self.recompute_ws(&mut out);
+                    self.recompute_ws(now, &mut out);
                 }
                 if was_book {
                     self.recompute_feed_stale(now, &mut out);
@@ -424,7 +470,7 @@ impl RiskCore {
             }
             Event::Control(core_types::ControlEvent::Kill) => {
                 self.manual_latched = true;
-                self.trip_global(BreakerKind::Manual, &mut out);
+                self.trip_global(BreakerKind::Manual, now, &mut out);
             }
             Event::Control(core_types::ControlEvent::Reset) => {
                 self.manual_latched = false;
@@ -518,7 +564,7 @@ impl RiskCore {
     ) {
         self.ended_windows.insert(window);
         if self.ws_down_windows.remove(&window) {
-            self.recompute_ws(out);
+            self.recompute_ws(now, out);
         }
         if self.stale_books.remove(&window) {
             self.recompute_feed_stale(now, out);
@@ -556,7 +602,7 @@ impl RiskCore {
             }
             VenueEvent::Connectivity { connected } => {
                 self.user_ws_down = !connected;
-                self.recompute_ws(&mut out);
+                self.recompute_ws(now, &mut out);
             }
         }
         out
@@ -566,6 +612,7 @@ impl RiskCore {
     /// error-window eviction, the engine-restart cooldown).
     pub(crate) fn on_tick(&mut self, now: TimestampMs) -> Vec<RiskOutput> {
         let mut out = Vec::new();
+        self.prune_trip_times(now);
         self.recompute_feed_stale(now, &mut out);
         self.recompute_sanity(now, &mut out);
         self.recompute_error_rate(now, &mut out);
@@ -593,15 +640,15 @@ impl RiskCore {
 
     fn recompute_feed_stale(&mut self, now: TimestampMs, out: &mut Vec<RiskOutput>) {
         if self.feed_stale_now(now) {
-            self.trip_global(BreakerKind::FeedStale, out);
+            self.trip_global(BreakerKind::FeedStale, now, out);
         } else {
             self.clear_global(BreakerKind::FeedStale, out);
         }
     }
 
-    fn recompute_ws(&mut self, out: &mut Vec<RiskOutput>) {
+    fn recompute_ws(&mut self, now: TimestampMs, out: &mut Vec<RiskOutput>) {
         if !self.ws_down_windows.is_empty() || self.user_ws_down {
-            self.trip_global(BreakerKind::WsDisconnect, out);
+            self.trip_global(BreakerKind::WsDisconnect, now, out);
         } else {
             self.clear_global(BreakerKind::WsDisconnect, out);
         }
@@ -629,7 +676,7 @@ impl RiskCore {
             }
         }
         if any_over_dwell {
-            self.trip_global(BreakerKind::FairVsMid, out);
+            self.trip_global(BreakerKind::FairVsMid, now, out);
         } else {
             self.clear_global(BreakerKind::FairVsMid, out);
         }
@@ -645,7 +692,7 @@ impl RiskCore {
         }
         let count = u32::try_from(self.infra_errors.len()).unwrap_or(u32::MAX);
         if count >= self.error_max {
-            self.trip_global(BreakerKind::ErrorRate, out);
+            self.trip_global(BreakerKind::ErrorRate, now, out);
         } else if count == 0 {
             self.clear_global(BreakerKind::ErrorRate, out);
         }
@@ -657,7 +704,7 @@ impl RiskCore {
                 if now.as_millis().saturating_sub(last.as_millis())
                     <= self.engine_restart_cooldown_ms =>
             {
-                self.trip_global(BreakerKind::EngineRestart, out);
+                self.trip_global(BreakerKind::EngineRestart, now, out);
             }
             Some(_) => {
                 self.engine_restart_last = None;
@@ -750,7 +797,7 @@ impl RiskCore {
                 self.shadow_tripped.push(s);
                 out.push(RiskOutput::ShadowStop(s));
             } else {
-                self.trip_global(BreakerKind::DailyStop, out);
+                self.trip_global(BreakerKind::DailyStop, ts, out);
             }
         }
     }
@@ -1610,6 +1657,38 @@ mod tests {
         assert!(snap.any_tripped());
         assert!(snap.is_tripped(BreakerKind::Manual));
         assert!(snap.globally_halted);
+    }
+
+    #[test]
+    fn trips_last_hour_counts_recent_global_trips() {
+        let mut c = core();
+        open_window(&mut c);
+        assert_eq!(c.snapshot().trips_last_hour, 0);
+        // Two distinct global trips: WsDisconnect (user-WS down) then Manual.
+        let _ = c.on_venue_event(&VenueEvent::Connectivity { connected: false }, ts(OPEN_MS));
+        let _ = c.on_event(&Event::Control(ControlEvent::Kill), ts(OPEN_MS + 1000));
+        assert_eq!(c.snapshot().trips_last_hour, 2);
+        assert_eq!(c.trips_last_hour(ts(OPEN_MS + 1000)), 2);
+        // A tick more than an hour past both trips ages the trip *events* out of the
+        // ring (the latched breakers stay tripped; only the rate resets).
+        let _ = c.on_tick(ts(OPEN_MS + 3_600_002 + 1000));
+        assert_eq!(c.snapshot().trips_last_hour, 0);
+    }
+
+    #[test]
+    fn snapshot_lists_the_halted_windows() {
+        let mut c = core();
+        open_window(&mut c);
+        // 100 Up @ 0.40 = $40 worst-case vs the $25 series cap ⇒ window loss halt.
+        let _ = c.on_venue_event(
+            &fill(Outcome::Up, Side::Buy, dec!(0.40), dec!(100)),
+            ts(OPEN_MS),
+        );
+        let snap = c.snapshot();
+        assert_eq!(snap.halted_windows, 1);
+        assert_eq!(snap.halted_windows_list, vec![window()]);
+        // Window loss is per-window, not a global trip, so it does not add a rate.
+        assert_eq!(snap.trips_last_hour, 0);
     }
 
     #[test]

@@ -20,11 +20,12 @@ use analytics::{Analytics, AnalyticsParams, OrderActivity};
 use core_types::{
     Asset, BookHealth, BookSnapshot, BookUnreliableReason, BreakerKind, ConditionId, ControlEvent,
     Dollars, Event, FeedHealth, Fill, InventorySnapshot, MarketInfo, Mode, ModelHealthEvent,
-    ModelSnapshot, OrderId, OrderUpdate, Outcome, Price, PriceSource, RiskEvent, SettlementSummary,
-    Side, Size, TickKind, TickSize, TimestampMs, TokenId, TopOfBook, WindowId, WindowLifecycle,
+    ModelSnapshot, OrderId, OrderUpdate, Outcome, Price, PriceSource, RiskEvent, Series,
+    SettlementSummary, Side, Size, TickKind, TickSize, TimestampMs, TokenId, TopOfBook, WindowId,
+    WindowLifecycle,
 };
-use engine::RiskStateSnapshot;
-use venue_api::Wallet;
+use engine::{ContentionSnapshot, RiskStateSnapshot, TakerId};
+use venue_api::{RiskRejectDetail, Wallet};
 use venue_paper::PaperLedgerSnapshot;
 
 use crate::live_markout::{FairRing, LiveMarkout};
@@ -32,6 +33,81 @@ use crate::model_taker::{DriverPnlState, ModelTakerState, ModelTakerTick};
 use crate::shadow::{ShadowState, ShadowTick};
 use crate::ws::{BreakerEvent, WsUpdate};
 use engine::FillDriver;
+
+/// The four owned strategies' standing-down flags, pushed from the risk-sample
+/// tick (the strategies live in the engine; the dashboard cannot read them).
+/// Feeds the STATUS strip (§10) — a driver standing down is one of its states.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DriverStatus {
+    /// The maker-core quote manager is standing down.
+    pub maker_core_standing_down: bool,
+    /// The momentum taker is standing down.
+    pub momentum_standing_down: bool,
+    /// The late-window taker is standing down.
+    pub late_standing_down: bool,
+    /// The champion-model taker is standing down.
+    pub model_standing_down: bool,
+}
+
+/// Cumulative §10 contention counters, folded from the risk manager's
+/// drain-and-report [`ContentionSnapshot`] each risk tick.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ContentionState {
+    /// `(series, loser, winner)` → cumulative arbitration-block count.
+    pub(crate) arbitration: BTreeMap<(Series, &'static str, &'static str), u64>,
+    /// `(reject-detail, series)` → cumulative placement-veto count.
+    pub(crate) vetoes: BTreeMap<(&'static str, Series), u64>,
+}
+
+impl ContentionState {
+    fn fold(&mut self, snap: &ContentionSnapshot) {
+        for b in &snap.arbitration_blocks {
+            *self
+                .arbitration
+                .entry((b.series, taker_label(b.loser), taker_label(b.winner)))
+                .or_default() += b.count;
+        }
+        for v in &snap.risk_vetoes {
+            *self
+                .vetoes
+                .entry((veto_label(v.detail), v.series))
+                .or_default() += v.count;
+        }
+    }
+}
+
+/// A stable label for a taker in the contention panel.
+pub(crate) fn taker_label(t: TakerId) -> &'static str {
+    match t {
+        TakerId::Momentum => "momentum",
+        TakerId::Model => "model",
+    }
+}
+
+/// A stable label for a placement-veto reason in the contention panel.
+pub(crate) fn veto_label(d: RiskRejectDetail) -> &'static str {
+    match d {
+        RiskRejectDetail::Halted => "halted",
+        RiskRejectDetail::WindowHalted => "window_halted",
+        RiskRejectDetail::OpenNotionalCap => "open_notional_cap",
+    }
+}
+
+/// Whether a placement rests at or better than the current best touch on its
+/// token — the benchmark tile's "at-touch" competitiveness signal. `None` when
+/// there is no book reference yet (then the placement is not counted).
+fn placement_at_touch(shared: &SharedView, u: &OrderUpdate) -> Option<bool> {
+    let (wid, outcome) = shared.locate_token(&u.token_id)?;
+    let view = shared.windows.get(&wid)?;
+    let top = match outcome {
+        Outcome::Up => view.up_top,
+        Outcome::Down => view.down_top,
+    }?;
+    match u.side {
+        Side::Buy => top.bid.map(|b| u.price >= b.price),
+        Side::Sell => top.ask.map(|a| u.price <= a.price),
+    }
+}
 
 /// Fills retained per mode for the blotter.
 pub(crate) const FILLS_RING_CAP: usize = 1_000;
@@ -247,6 +323,19 @@ pub(crate) struct ModeState {
     /// Trailing order-activity metrics (placed/cancelled/fills, resting, TTC/TTR)
     /// for the "live activity" strip. Best-effort live state, fed from `project()`.
     pub(crate) activity: OrderActivity,
+    /// PnL attribution by driver (the shared [`DriverMatrix`] + activity), fed by
+    /// `record_driver_fill` + window settlement. Per-mode (§10 PnL matrix).
+    ///
+    /// [`DriverMatrix`]: analytics::DriverMatrix
+    pub(crate) driver_pnl: DriverPnlState,
+    /// The four strategies' standing-down flags (pushed from the risk tick); feeds
+    /// the STATUS strip. `None` until the first push.
+    pub(crate) driver_status: Option<DriverStatus>,
+    /// Cumulative §10 contention counters (arbitration blocks + placement vetoes).
+    pub(crate) contention: ContentionState,
+    /// Per-series at-touch counter `(at_or_better_touch, total_with_reference)`
+    /// over order placements — the benchmark tile's at-touch fraction.
+    pub(crate) at_touch: HashMap<Series, (u64, u64)>,
 }
 
 impl ModeState {
@@ -257,6 +346,10 @@ impl ModeState {
             orders: HashMap::new(),
             live_markout: LiveMarkout::new(FILLS_RING_CAP),
             activity: OrderActivity::new(),
+            driver_pnl: DriverPnlState::default(),
+            driver_status: None,
+            contention: ContentionState::default(),
+            at_touch: HashMap::new(),
             inventory: HashMap::new(),
             settlements: Ring::new(SETTLEMENTS_RING_CAP),
             tripped: BTreeSet::new(),
@@ -300,8 +393,6 @@ pub(crate) struct DashboardData {
     pub(crate) shadow: ShadowState,
     /// Model-taker fires tile (fed by `set_model_taker`). Paper-only in this bot.
     pub(crate) model_taker: ModelTakerState,
-    /// PnL attribution by driver (fed by `record_driver_fill` + window settlement).
-    pub(crate) driver_pnl: DriverPnlState,
     pub(crate) server_started: TimestampMs,
     pub(crate) last_now: TimestampMs,
 }
@@ -316,7 +407,6 @@ impl DashboardData {
             control_state: None,
             shadow: ShadowState::default(),
             model_taker: ModelTakerState::default(),
-            driver_pnl: DriverPnlState::default(),
             server_started: now,
             last_now: now,
         }
@@ -556,8 +646,19 @@ impl DashboardData {
                 }
             },
             Event::OrderUpdate(u) => {
+                // A placement is a not-yet-seen order becoming working; count its
+                // at-touch competitiveness (disjoint borrow: shared read first).
+                let at_touch = placement_at_touch(&self.shared, u);
                 let ms = self.mode_mut(mode);
+                let is_placement = !ms.orders.contains_key(&u.order_id) && !u.state.is_terminal();
                 ms.activity.on_order(u, now);
+                if let (true, Some(hit)) = (is_placement, at_touch) {
+                    let e = ms.at_touch.entry(u.window.series).or_insert((0, 0));
+                    e.1 += 1;
+                    if hit {
+                        e.0 += 1;
+                    }
+                }
                 if u.state.is_terminal() {
                     ms.orders.remove(&u.order_id);
                 } else {
@@ -586,12 +687,13 @@ impl DashboardData {
                     .insert(inv.window, Arc::clone(inv));
             }
             Event::Settlement(s) => {
-                self.mode_mut(mode).settlements.push(SettledWindow {
+                let ms = self.mode_mut(mode);
+                ms.settlements.push(SettledWindow {
                     summary: Arc::clone(s),
                     resolved_at: now,
                 });
-                // Mark this window's driver-tagged fills to the resolved outcome.
-                self.driver_pnl.settle(s.window, s.outcome);
+                // Mark this mode's driver-tagged fills to the resolved outcome.
+                ms.driver_pnl.settle(s.window, s.outcome);
             }
             Event::Risk(re) => {
                 let ms = self.mode_mut(mode);
@@ -711,25 +813,44 @@ impl DashboardData {
         self.model_taker.record(tick);
     }
 
-    /// Buffers a driver-tagged fill for the PnL-by-driver accumulator (marked at
-    /// settlement). An untagged fill (`driver == None`) is skipped.
+    /// Buffers a driver-tagged fill for `mode`'s PnL-by-driver accumulator (marked
+    /// at settlement). An untagged fill (`driver == None`) is skipped.
     pub(crate) fn record_driver_fill(
         &mut self,
+        mode: Mode,
         driver: Option<FillDriver>,
         fill: &Fill,
         now: TimestampMs,
     ) {
         self.last_now = now;
         if let Some(driver) = driver {
-            self.driver_pnl.record_fill(
+            self.mode_mut(mode).driver_pnl.record_fill(
                 fill.window,
                 driver,
                 fill.outcome,
                 fill.size,
                 fill.price,
                 fill.fee,
+                fill.ts_venue,
             );
         }
+    }
+
+    /// Records the four strategies' standing-down flags for `mode`'s STATUS strip.
+    pub(crate) fn set_driver_status(&mut self, mode: Mode, status: DriverStatus, now: TimestampMs) {
+        self.last_now = now;
+        self.mode_mut(mode).driver_status = Some(status);
+    }
+
+    /// Folds a drained §10 contention snapshot into `mode`'s cumulative counters.
+    pub(crate) fn set_contention(
+        &mut self,
+        mode: Mode,
+        snapshot: &ContentionSnapshot,
+        now: TimestampMs,
+    ) {
+        self.last_now = now;
+        self.mode_mut(mode).contention.fold(snapshot);
     }
 
     pub(crate) fn set_params(&mut self, params: ParamsView, now: TimestampMs) {

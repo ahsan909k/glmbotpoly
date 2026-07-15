@@ -168,6 +168,14 @@ impl OrderActivity {
     pub fn median_time_to_replace_ms(&self, series: Option<Series>) -> Option<i64> {
         median_dur(&self.replace_durations, series)
     }
+
+    /// 95th-percentile cancel round-trip in ms (live only; `None` in paper or
+    /// with no sample), optionally for one series — the benchmark tile's
+    /// "cancel-p95" (renders n/a in paper, where the round-trip is unobservable).
+    #[must_use]
+    pub fn p95_time_to_cancel_ms(&self, series: Option<Series>) -> Option<i64> {
+        percentile_dur(&self.cancel_durations, series, 0.95)
+    }
 }
 
 /// Pushes a trailing-window count entry and prunes by age then hard cap.
@@ -223,6 +231,31 @@ fn median_dur(ring: &VecDeque<(Series, i64)>, series: Option<Series>) -> Option<
     } else {
         (v[n / 2 - 1] + v[n / 2]) / 2
     })
+}
+
+/// The `q`-quantile (`q` in `[0, 1]`) of a duration ring, optionally filtered by
+/// series; `None` if no matching sample. Nearest-rank on the sorted samples.
+fn percentile_dur(ring: &VecDeque<(Series, i64)>, series: Option<Series>, q: f64) -> Option<i64> {
+    let mut v: Vec<i64> = ring
+        .iter()
+        .filter(|(s, _)| series.is_none_or(|f| *s == f))
+        .map(|(_, d)| *d)
+        .collect();
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_unstable();
+    let n = v.len();
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "sample count is small; nearest-rank index is well within range"
+    )]
+    let idx = ((q * n as f64).ceil() as usize)
+        .saturating_sub(1)
+        .min(n - 1);
+    Some(v[idx])
 }
 
 #[cfg(test)]
@@ -352,6 +385,40 @@ mod tests {
         }
         // Median of [50, 30, 70] = 50.
         assert_eq!(a.median_time_to_cancel_ms(None), Some(50));
+    }
+
+    #[test]
+    fn p95_time_to_cancel_uses_nearest_rank_and_is_none_in_paper() {
+        let mut a = OrderActivity::new();
+        // Live round-trips: 20 samples 10..=200ms.
+        for i in 1..=20 {
+            let id = format!("o{i}");
+            a.on_order(
+                &update(&id, Asset::Btc, Side::Buy, OrderState::Open),
+                ts(T0),
+            );
+            a.on_order(
+                &update(&id, Asset::Btc, Side::Buy, OrderState::PendingCancel),
+                ts(T0 + 1000),
+            );
+            a.on_order(
+                &update(&id, Asset::Btc, Side::Buy, OrderState::Canceled),
+                ts(T0 + 1000 + i * 10),
+            );
+        }
+        // ceil(0.95*20)=19 → index 18 → 19th value = 190ms.
+        assert_eq!(a.p95_time_to_cancel_ms(None), Some(190));
+        // Paper (no PendingCancel) → None.
+        let mut p = OrderActivity::new();
+        p.on_order(
+            &update("o", Asset::Btc, Side::Buy, OrderState::Open),
+            ts(T0),
+        );
+        p.on_order(
+            &update("o", Asset::Btc, Side::Buy, OrderState::Canceled),
+            ts(T0 + 500),
+        );
+        assert_eq!(p.p95_time_to_cancel_ms(None), None);
     }
 
     #[test]

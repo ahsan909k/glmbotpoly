@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use core_types::{Asset, TimestampMs, WindowId};
+use core_types::{Asset, Series, TimestampMs, WindowId};
 
 /// Which taker is speaking to the arbiter. Momentum and Model are the only two
 /// takers that arbitrate against each other (§8); the late-window taker is a
@@ -38,6 +38,21 @@ pub struct ArbitrationBlock {
     pub remaining_ms: i64,
 }
 
+/// One drained `(series, loser, winner) → count` arbitration-block tally, for the
+/// dashboard's contention panel (§10): how often the losing driver was suppressed
+/// by the winning driver on a series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArbitrationTally {
+    /// The series the conflict occurred on.
+    pub series: Series,
+    /// The suppressed (losing) driver.
+    pub loser: TakerId,
+    /// The driver that won and suppressed the loser.
+    pub winner: TakerId,
+    /// How many fires the loser was blocked for on this series.
+    pub count: u64,
+}
+
 /// Per-window fire ledger + per-asset precedence. [`RiskManager`] owns exactly one
 /// and passes `&`/`&mut` into the takers' `decide`/`fire`.
 ///
@@ -53,6 +68,9 @@ pub struct FireLedger {
     precedence: HashMap<Asset, TakerId>,
     /// `(window, driver)` → last fire wall-ms.
     last_fire: HashMap<(WindowId, TakerId), i64>,
+    /// `(series, loser, winner)` → cumulative block count, drained by
+    /// [`drain_blocks`](FireLedger::drain_blocks) for the contention panel.
+    block_tally: HashMap<(Series, TakerId, TakerId), u64>,
 }
 
 impl FireLedger {
@@ -63,6 +81,7 @@ impl FireLedger {
             arbitration_window_ms,
             precedence,
             last_fire: HashMap::new(),
+            block_tally: HashMap::new(),
         }
     }
 
@@ -75,15 +94,16 @@ impl FireLedger {
             .unwrap_or(TakerId::Momentum)
     }
 
-    /// Read-only admission check (from `decide`). The winner for the window's asset
-    /// always passes; the loser is blocked while the winner fired this window
-    /// within the arbitration window.
+    /// Admission check (from `decide`). The winner for the window's asset always
+    /// passes; the loser is blocked while the winner fired this window within the
+    /// arbitration window. Takes `&mut self` because a block is tallied into the
+    /// contention counters (drained by [`drain_blocks`](FireLedger::drain_blocks)).
     ///
     /// # Errors
     /// [`ArbitrationBlock`] when `who` is the losing driver and the winning driver
     /// fired `window` less than `arbitration_window_ms` ago.
     pub fn check(
-        &self,
+        &mut self,
         who: TakerId,
         window: WindowId,
         now: TimestampMs,
@@ -95,6 +115,10 @@ impl FireLedger {
         if let Some(&last) = self.last_fire.get(&(window, winner)) {
             let elapsed = now.as_millis() - last;
             if elapsed < self.arbitration_window_ms {
+                *self
+                    .block_tally
+                    .entry((window.series, who, winner))
+                    .or_insert(0) += 1;
                 return Err(ArbitrationBlock {
                     winner,
                     remaining_ms: self.arbitration_window_ms - elapsed,
@@ -102,6 +126,20 @@ impl FireLedger {
             }
         }
         Ok(())
+    }
+
+    /// Drains the accumulated arbitration-block tallies (drain-and-report), one
+    /// entry per non-zero `(series, loser, winner)`.
+    pub fn drain_blocks(&mut self) -> Vec<ArbitrationTally> {
+        std::mem::take(&mut self.block_tally)
+            .into_iter()
+            .map(|((series, loser, winner), count)| ArbitrationTally {
+                series,
+                loser,
+                winner,
+                count,
+            })
+            .collect()
     }
 
     /// Records a successful fire (from `fire`, after the venue accepts the place).
@@ -190,6 +228,26 @@ mod tests {
         assert!(l.check(TakerId::Momentum, btc, ts(0)).is_ok());
         assert!(l.check(TakerId::Model, btc, ts(0)).is_ok()); // model loser but window 0 ⇒ ok
         assert!(l.check(TakerId::Momentum, eth, ts(0)).is_ok());
+    }
+
+    #[test]
+    fn blocks_are_tallied_and_drained() {
+        let mut l = fortress();
+        let btc = win(Asset::Btc, 0);
+        l.record(TakerId::Momentum, btc, ts(0));
+        // Two blocked model checks within the window accumulate a tally.
+        assert!(l.check(TakerId::Model, btc, ts(500)).is_err());
+        assert!(l.check(TakerId::Model, btc, ts(600)).is_err());
+        // An admitted check (winner) records nothing.
+        assert!(l.check(TakerId::Momentum, btc, ts(700)).is_ok());
+        let tallies = l.drain_blocks();
+        assert_eq!(tallies.len(), 1);
+        assert_eq!(tallies[0].loser, TakerId::Model);
+        assert_eq!(tallies[0].winner, TakerId::Momentum);
+        assert_eq!(tallies[0].series, btc.series);
+        assert_eq!(tallies[0].count, 2);
+        // Draining clears the tally.
+        assert!(l.drain_blocks().is_empty());
     }
 
     #[test]

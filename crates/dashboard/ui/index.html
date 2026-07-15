@@ -40,7 +40,14 @@
     <button class="tab" data-view="fills">Fills</button>
     <button class="tab" data-view="risk">Risk</button>
     <button class="tab" data-view="controls">Controls</button>
+    <button class="tab" data-view="pnlmatrix">PnL matrix</button>
+    <button class="tab" data-view="benchmark">Benchmark</button>
+    <button class="tab" data-view="contention">Contention</button>
+    <button class="tab" data-view="digest">Digest</button>
   </nav>
+
+  <!-- always-visible driver × series status strip (no silent states) -->
+  <div class="status-strip" id="status-strip" aria-label="Driver × series status"></div>
 
   <main>
     <!-- ===================== SUMMARY (default) ===================== -->
@@ -345,6 +352,60 @@
           <button class="btn warn" id="risk-reset-btn">Reset / daily-stop</button>
         </div>
         <p class="hint">Kill cancels every open order and halts trading (latched). Reset clears every breaker, including the daily stop-loss.</p>
+      </div>
+    </section>
+
+    <!-- ===================== PnL MATRIX ===================== -->
+    <section id="view-pnlmatrix" class="view hidden">
+      <div class="series-controls">
+        <div class="seg" id="pnl-window" aria-label="Time window">
+          <button class="seg-btn" data-window="today">Today</button>
+          <button class="seg-btn" data-window="7d">7d</button>
+          <button class="seg-btn active" data-window="all">All</button>
+        </div>
+        <span class="series-note">Realized PnL by driver × series, marked to each window's outcome. Green = profit, red = loss; win% · trades under each. Totals in the last row / column.</span>
+      </div>
+      <div class="table-wrap">
+        <table id="pnl-table">
+          <thead><tr id="pnl-head"></tr></thead>
+          <tbody id="pnl-body"></tbody>
+        </table>
+        <p class="empty hidden" id="pnl-empty">No settled PnL in this window yet.</p>
+      </div>
+    </section>
+
+    <!-- ===================== BENCHMARK ===================== -->
+    <section id="view-benchmark" class="view hidden">
+      <div class="series-controls">
+        <span class="series-note">Our microstructure vs tracked competitor accounts, like-for-like. Primary account labelled. "n/a" = not measured for that account.</span>
+      </div>
+      <div class="table-wrap">
+        <table id="bench-table">
+          <thead><tr id="bench-head"></tr></thead>
+          <tbody id="bench-body"></tbody>
+        </table>
+        <p class="empty hidden" id="bench-empty">No benchmark data yet.</p>
+      </div>
+    </section>
+
+    <!-- ===================== CONTENTION ===================== -->
+    <section id="view-contention" class="view hidden">
+      <div class="card">
+        <div class="card-head"><h2>Arbitration blocks</h2></div>
+        <div class="rank-list" id="contention-arb"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Placement vetoes</h2></div>
+        <div class="rank-list" id="contention-veto"></div>
+      </div>
+    </section>
+
+    <!-- ===================== DIGEST ===================== -->
+    <section id="view-digest" class="view hidden">
+      <div class="card">
+        <div class="card-head"><h2>Daily digest</h2><span class="digest-date" id="digest-date"></span></div>
+        <pre class="digest" id="digest-body"></pre>
+        <p class="empty hidden" id="digest-empty">No digest yet — written daily by a VPS cron.</p>
       </div>
     </section>
   </main>

@@ -339,7 +339,7 @@ impl MomentumTaker {
         &self,
         window: WindowId,
         now: TimestampMs,
-        arbiter: &FireLedger,
+        arbiter: &mut FireLedger,
         resting: Option<&dyn RestingLookup>,
     ) -> Result<Decision, NoTakeReason> {
         if self.standing_down {
@@ -739,7 +739,12 @@ mod tests {
     fn happy_path_decides_a_take() {
         let t = armed_up();
         let d = t
-            .decide(window(), ts(OPEN_MS + 900), &FireLedger::default(), None)
+            .decide(
+                window(),
+                ts(OPEN_MS + 900),
+                &mut FireLedger::default(),
+                None,
+            )
             .expect("a take");
         assert_eq!(d.outcome, Outcome::Up);
         assert_eq!(d.token_id, up_token());
@@ -756,7 +761,12 @@ mod tests {
         feed_down_move(&mut t);
         t.ingest(&book(down_token(), &[(dec!(0.80), dec!(50))]));
         let d = t
-            .decide(window(), ts(OPEN_MS + 900), &FireLedger::default(), None)
+            .decide(
+                window(),
+                ts(OPEN_MS + 900),
+                &mut FireLedger::default(),
+                None,
+            )
             .expect("a down take");
         assert_eq!(d.outcome, Outcome::Down);
         assert_eq!(d.token_id, down_token());
@@ -766,7 +776,7 @@ mod tests {
     fn no_active_window() {
         let t = taker();
         assert!(matches!(
-            t.decide(window(), ts(OPEN_MS), &FireLedger::default(), None),
+            t.decide(window(), ts(OPEN_MS), &mut FireLedger::default(), None),
             Err(NoTakeReason::NoActiveWindow)
         ));
     }
@@ -776,7 +786,7 @@ mod tests {
         let mut t = taker();
         t.ingest(&open_event());
         assert!(matches!(
-            t.decide(window(), ts(OPEN_MS), &FireLedger::default(), None),
+            t.decide(window(), ts(OPEN_MS), &mut FireLedger::default(), None),
             Err(NoTakeReason::NoModel)
         ));
     }
@@ -794,7 +804,12 @@ mod tests {
             t.test_state_mut(window()).last_model = Some(snap);
         }
         assert!(matches!(
-            t.decide(window(), ts(OPEN_MS + 900), &FireLedger::default(), None),
+            t.decide(
+                window(),
+                ts(OPEN_MS + 900),
+                &mut FireLedger::default(),
+                None
+            ),
             Err(NoTakeReason::WindowMismatch { .. })
         ));
     }
@@ -809,7 +824,12 @@ mod tests {
             t.ingest(&book(up_token(), &[(dec!(0.80), dec!(50))]));
             assert!(
                 matches!(
-                    t.decide(window(), ts(OPEN_MS + 900), &FireLedger::default(), None),
+                    t.decide(
+                        window(),
+                        ts(OPEN_MS + 900),
+                        &mut FireLedger::default(),
+                        None
+                    ),
                     Err(NoTakeReason::ModelNotReady { .. })
                 ),
                 "{health:?} should block"
@@ -824,7 +844,12 @@ mod tests {
         t.ingest(&ready_model(1.0, 1e-4)); // p_up at the domain edge
         feed_up_move(&mut t);
         assert!(matches!(
-            t.decide(window(), ts(OPEN_MS + 900), &FireLedger::default(), None),
+            t.decide(
+                window(),
+                ts(OPEN_MS + 900),
+                &mut FireLedger::default(),
+                None
+            ),
             Err(NoTakeReason::UnusableFair { .. })
         ));
 
@@ -833,7 +858,12 @@ mod tests {
         t2.ingest(&ready_model(0.85, 0.0)); // σ unusable
         feed_up_move(&mut t2);
         assert!(matches!(
-            t2.decide(window(), ts(OPEN_MS + 900), &FireLedger::default(), None),
+            t2.decide(
+                window(),
+                ts(OPEN_MS + 900),
+                &mut FireLedger::default(),
+                None
+            ),
             Err(NoTakeReason::UnusableVol { .. })
         ));
     }
@@ -843,7 +873,7 @@ mod tests {
         let t = armed_up();
         // now past close.
         assert!(matches!(
-            t.decide(window(), ts(CLOSE_MS + 1), &FireLedger::default(), None),
+            t.decide(window(), ts(CLOSE_MS + 1), &mut FireLedger::default(), None),
             Err(NoTakeReason::Expired { .. })
         ));
     }
@@ -860,7 +890,12 @@ mod tests {
         }
         t.ingest(&book(up_token(), &[(dec!(0.80), dec!(50))]));
         assert!(matches!(
-            t.decide(window(), ts(OPEN_MS + 900), &FireLedger::default(), None),
+            t.decide(
+                window(),
+                ts(OPEN_MS + 900),
+                &mut FireLedger::default(),
+                None
+            ),
             Err(NoTakeReason::NoConfirmedMove)
         ));
     }
@@ -883,7 +918,12 @@ mod tests {
         }
         t.ingest(&book(up_token(), &[(dec!(0.80), dec!(50))]));
         assert!(matches!(
-            t.decide(window(), ts(OPEN_MS + 900), &FireLedger::default(), None),
+            t.decide(
+                window(),
+                ts(OPEN_MS + 900),
+                &mut FireLedger::default(),
+                None
+            ),
             Err(NoTakeReason::NoConfirmedMove)
         ));
     }
@@ -893,14 +933,24 @@ mod tests {
         let mut t = armed_up();
         t.test_state_mut(window()).last_take_ms = Some(OPEN_MS + 800); // fired 100 ms ago < 5 s cooldown
         assert!(matches!(
-            t.decide(window(), ts(OPEN_MS + 900), &FireLedger::default(), None),
+            t.decide(
+                window(),
+                ts(OPEN_MS + 900),
+                &mut FireLedger::default(),
+                None
+            ),
             Err(NoTakeReason::InCooldown { .. })
         ));
         // After the cooldown elapses, the take is allowed again.
         t.test_state_mut(window()).last_take_ms = Some(OPEN_MS + 900 - 6_000);
         assert!(
-            t.decide(window(), ts(OPEN_MS + 900), &FireLedger::default(), None)
-                .is_ok()
+            t.decide(
+                window(),
+                ts(OPEN_MS + 900),
+                &mut FireLedger::default(),
+                None
+            )
+            .is_ok()
         );
     }
 
@@ -910,7 +960,12 @@ mod tests {
         // Spend the whole $10 budget directly.
         t.test_state_mut(window()).realized_spent = Dollars::new(dec!(10));
         assert!(matches!(
-            t.decide(window(), ts(OPEN_MS + 900), &FireLedger::default(), None),
+            t.decide(
+                window(),
+                ts(OPEN_MS + 900),
+                &mut FireLedger::default(),
+                None
+            ),
             Err(NoTakeReason::BudgetExhausted { .. })
         ));
     }
@@ -923,7 +978,12 @@ mod tests {
         feed_up_move(&mut t);
         // No book ingested.
         assert!(matches!(
-            t.decide(window(), ts(OPEN_MS + 900), &FireLedger::default(), None),
+            t.decide(
+                window(),
+                ts(OPEN_MS + 900),
+                &mut FireLedger::default(),
+                None
+            ),
             Err(NoTakeReason::NoBookForToken)
         ));
     }
@@ -936,7 +996,12 @@ mod tests {
         feed_up_move(&mut t);
         t.ingest(&book(up_token(), &[(dec!(0.86), dec!(50))])); // ask ≥ fair
         assert!(matches!(
-            t.decide(window(), ts(OPEN_MS + 900), &FireLedger::default(), None),
+            t.decide(
+                window(),
+                ts(OPEN_MS + 900),
+                &mut FireLedger::default(),
+                None
+            ),
             Err(NoTakeReason::BookAlreadyRepriced { .. })
         ));
     }
@@ -949,7 +1014,12 @@ mod tests {
         feed_up_move(&mut t);
         t.ingest(&book(up_token(), &[(dec!(0.50), dec!(100))])); // edge 0.022 < 0.0225
         assert!(matches!(
-            t.decide(window(), ts(OPEN_MS + 900), &FireLedger::default(), None),
+            t.decide(
+                window(),
+                ts(OPEN_MS + 900),
+                &mut FireLedger::default(),
+                None
+            ),
             Err(NoTakeReason::EdgeBelowFeePlusBuffer { .. })
         ));
     }
@@ -962,7 +1032,12 @@ mod tests {
         });
         assert!(t.is_standing_down());
         assert!(matches!(
-            t.decide(window(), ts(OPEN_MS + 900), &FireLedger::default(), None),
+            t.decide(
+                window(),
+                ts(OPEN_MS + 900),
+                &mut FireLedger::default(),
+                None
+            ),
             Err(NoTakeReason::StandingDown)
         ));
         t.on_risk(RiskEvent::BreakerCleared {
@@ -970,8 +1045,13 @@ mod tests {
         });
         assert!(!t.is_standing_down());
         assert!(
-            t.decide(window(), ts(OPEN_MS + 900), &FireLedger::default(), None)
-                .is_ok()
+            t.decide(
+                window(),
+                ts(OPEN_MS + 900),
+                &mut FireLedger::default(),
+                None
+            )
+            .is_ok()
         );
     }
 
@@ -1075,7 +1155,12 @@ mod tests {
         t.test_register_pending(window(), oid, Dollars::new(dec!(9.50)));
         // Only $0.50 effective budget left (< $1) ⇒ no second take.
         assert!(matches!(
-            t.decide(window(), ts(OPEN_MS + 900), &FireLedger::default(), None),
+            t.decide(
+                window(),
+                ts(OPEN_MS + 900),
+                &mut FireLedger::default(),
+                None
+            ),
             Err(NoTakeReason::BudgetExhausted { .. })
         ));
     }
@@ -1157,7 +1242,7 @@ mod tests {
             .decide(
                 window(),
                 ts(OPEN_MS + 900),
-                &FireLedger::default(),
+                &mut FireLedger::default(),
                 Some(&lookup),
             )
             .expect("not shielded by another window's quote");

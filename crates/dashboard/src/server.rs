@@ -117,6 +117,17 @@ struct SettledQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SeriesModeQuery {
+    mode: Option<String>,
+    series: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DigestQuery {
+    date: Option<String>,
+}
+
 fn parse_mode(s: Option<&str>) -> Result<Mode, ApiError> {
     match s {
         None | Some("paper") => Ok(Mode::Paper),
@@ -297,6 +308,100 @@ async fn shadow(State(app): State<AppState>) -> Json<dto::ShadowDto> {
 
 async fn model_taker(State(app): State<AppState>) -> Json<dto::ModelTakerDto> {
     Json(app.handle.with_data(dto::model_taker))
+}
+
+async fn pnl_matrix(
+    State(app): State<AppState>,
+    Query(q): Query<CompareQuery>,
+) -> Result<Json<dto::PnlMatrixDto>, ApiError> {
+    let mode = parse_mode(q.mode.as_deref())?;
+    let window = parse_window(q.window.as_deref(), q.days)?;
+    Ok(Json(
+        app.handle.with_data(|d| dto::pnl_matrix(d, mode, window)),
+    ))
+}
+
+async fn status_strip(
+    State(app): State<AppState>,
+    Query(q): Query<ModeQuery>,
+) -> Result<Json<dto::StatusStripDto>, ApiError> {
+    let mode = parse_mode(q.mode.as_deref())?;
+    Ok(Json(app.handle.with_data(|d| dto::status_strip(d, mode))))
+}
+
+async fn benchmark(
+    State(app): State<AppState>,
+    Query(q): Query<SeriesModeQuery>,
+) -> Result<Json<dto::BenchmarkDto>, ApiError> {
+    let mode = parse_mode(q.mode.as_deref())?;
+    let series = parse_series(q.series.as_deref())?;
+    Ok(Json(
+        app.handle.with_data(|d| dto::benchmark(d, mode, series)),
+    ))
+}
+
+async fn contention(
+    State(app): State<AppState>,
+    Query(q): Query<ModeQuery>,
+) -> Result<Json<dto::ContentionDto>, ApiError> {
+    let mode = parse_mode(q.mode.as_deref())?;
+    Ok(Json(app.handle.with_data(|d| dto::contention(d, mode))))
+}
+
+/// The `/api/digest` response — the latest (or requested) daily-digest markdown,
+/// written to `data/digests/<date>.md` by a VPS cron. Absent → a present:false
+/// placeholder (never an error).
+#[derive(Serialize)]
+struct DigestDto {
+    date: String,
+    present: bool,
+    markdown: String,
+}
+
+/// Only `YYYY-MM-DD`-shaped strings are allowed (no path traversal).
+fn is_safe_date(s: &str) -> bool {
+    s.len() == 10 && s.chars().all(|c| c.is_ascii_digit() || c == '-')
+}
+
+/// Finds the newest `data/digests/*.md` file, returning `(date_stem, contents)`.
+fn latest_digest() -> (String, String) {
+    let Ok(dir) = std::fs::read_dir("data/digests") else {
+        return (String::new(), String::new());
+    };
+    let newest = dir
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            let stem = p.file_stem()?.to_str()?.to_owned();
+            (p.extension().and_then(|x| x.to_str()) == Some("md") && is_safe_date(&stem))
+                .then_some(stem)
+        })
+        .max();
+    match newest {
+        Some(stem) => {
+            let md = std::fs::read_to_string(format!("data/digests/{stem}.md")).unwrap_or_default();
+            (stem, md)
+        }
+        None => (String::new(), String::new()),
+    }
+}
+
+async fn digest(Query(q): Query<DigestQuery>) -> Json<DigestDto> {
+    let (date, markdown) = match q.date {
+        Some(d) if is_safe_date(&d) => {
+            let md = std::fs::read_to_string(format!("data/digests/{d}.md")).unwrap_or_default();
+            (d, md)
+        }
+        // A malformed date reports nothing rather than reading an arbitrary path.
+        Some(_) => (String::new(), String::new()),
+        None => latest_digest(),
+    };
+    let present = !markdown.is_empty();
+    Json(DigestDto {
+        date,
+        present,
+        markdown,
+    })
 }
 
 async fn health(State(app): State<AppState>) -> Json<HealthReport> {
@@ -535,6 +640,11 @@ pub fn router(
         .route("/api/params", get(params))
         .route("/api/shadow", get(shadow))
         .route("/api/model-taker", get(model_taker))
+        .route("/api/pnl-matrix", get(pnl_matrix))
+        .route("/api/status-strip", get(status_strip))
+        .route("/api/benchmark", get(benchmark))
+        .route("/api/contention", get(contention))
+        .route("/api/digest", get(digest))
         .route("/api/control/kill", post(control_kill))
         .route("/api/control/reset", post(control_reset))
         .route(

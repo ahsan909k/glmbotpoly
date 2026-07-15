@@ -20,7 +20,9 @@ mod control;
 mod control_cli;
 mod dashboard;
 mod depth_capture;
+mod digest;
 mod discover;
+mod driver_attrib_record;
 mod fair;
 mod feed;
 mod ladder;
@@ -52,11 +54,13 @@ use crate::control_cli::ControlSub;
 use crate::feed::FeedSource;
 
 const USAGE: &str = "usage: bot [run|paper|paper-sim|live|venue-check|check-config|discover|schedule|feed|\
-                     compare|vol|ladder|fair|record|latency|dashboard|control|replay|sweep] \
+                     compare|vol|ladder|fair|record|latency|dashboard|control|replay|sweep|digest] \
                      [--config-dir <path>] \
                      [--label <name>] [--out <file>] [--raw <file>] [--source rtds|binance] \
                      [--series <KEY>] [--depth <N>] [--recycle-after <secs>] [--out-dir <dir>] \
-                     [--with-model]\n\
+                     [--with-model] [--date YYYY-MM-DD]\n\
+                     \n  digest [--date YYYY-MM-DD] [--out <file>]  (per-day operator digest from the \
+                     sqlite index + side channels; no live process)\
                      \n  control <status|kill|reset|reset-daily-stop|set-capital AMT|adjust-capital DELTA|\
                      enable-series KEY|disable-series KEY|set-param KEY VAL [--series KEY]|\
                      arm-live|confirm-arm PHRASE|disarm>  (HTTP client to the running dashboard)\
@@ -144,6 +148,13 @@ enum Command {
     /// `--taker-buffer`) on a recorded journal and print a ranked comparison.
     /// Requires `--features replay`.
     Sweep,
+    /// Write a per-day operator digest (per-driver PnL, maker fill quality,
+    /// breakers, would-be shadow loss-stops, settlements) folded from the sqlite
+    /// journal index + the driver-attribution and shadow-loss-stop side
+    /// channels. Read-only over the WAL sqlite + gzip — needs no live process.
+    /// `--date YYYY-MM-DD` (default today, UTC); `--out <file>` overrides the
+    /// output path (default `data/digests/{YYYY-MM-DD}.md`).
+    Digest,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -186,6 +197,8 @@ struct Cli {
     rank: Option<String>,
     /// `sweep`: fan grid points across worker threads.
     parallel: bool,
+    /// `digest` day to report (`YYYY-MM-DD`, default today UTC).
+    date: Option<String>,
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
@@ -208,12 +221,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
     let mut taker_buffer = None;
     let mut rank = None;
     let mut parallel = false;
+    let mut date = None;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "run" | "paper" | "paper-sim" | "live" | "venue-check" | "check-config"
             | "discover" | "schedule" | "feed" | "compare" | "vol" | "ladder" | "fair"
-            | "record" | "latency" | "dashboard" => {
+            | "record" | "latency" | "dashboard" | "digest" => {
                 if command.is_some() {
                     return Err(format!("more than one subcommand given (second: {arg:?})"));
                 }
@@ -233,6 +247,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
                     "record" => Command::Record,
                     "latency" => Command::Latency,
                     "dashboard" => Command::Dashboard,
+                    "digest" => Command::Digest,
                     _ => Command::CheckConfig,
                 });
             }
@@ -322,6 +337,12 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
                     .ok_or_else(|| "--window requires a value (today|<N>d|all)".to_owned())?;
                 window = Some(value);
             }
+            "--date" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--date requires a value (YYYY-MM-DD)".to_owned())?;
+                date = Some(value);
+            }
             "--min-edge" => {
                 let value = args
                     .next()
@@ -376,6 +397,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
                     out_dir = Some(PathBuf::from(value));
                 } else if let Some(value) = other.strip_prefix("--window=") {
                     window = Some(value.to_owned());
+                } else if let Some(value) = other.strip_prefix("--date=") {
+                    date = Some(value.to_owned());
                 } else if let Some(value) = other.strip_prefix("--min-edge=") {
                     min_edge = Some(value.to_owned());
                 } else if let Some(value) = other.strip_prefix("--gamma=") {
@@ -396,8 +419,18 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
     if label.is_some() && command != Command::Latency {
         return Err("--label only applies to the latency subcommand".to_owned());
     }
-    if out.is_some() && !matches!(command, Command::Latency | Command::Replay | Command::Sweep) {
-        return Err("--out only applies to the latency, replay, and sweep subcommands".to_owned());
+    if out.is_some()
+        && !matches!(
+            command,
+            Command::Latency | Command::Replay | Command::Sweep | Command::Digest
+        )
+    {
+        return Err(
+            "--out only applies to the latency, replay, sweep, and digest subcommands".to_owned(),
+        );
+    }
+    if date.is_some() && command != Command::Digest {
+        return Err("--date only applies to the digest subcommand".to_owned());
     }
     if window.is_some() && !matches!(command, Command::Replay | Command::Sweep) {
         return Err("--window only applies to the replay and sweep subcommands".to_owned());
@@ -464,6 +497,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
         taker_buffer,
         rank,
         parallel,
+        date,
     })
 }
 
@@ -847,7 +881,38 @@ fn run() -> anyhow::Result<ExitCode> {
                 bail!("the `sweep` subcommand requires building with --features replay");
             }
         }
+        Command::Digest => {
+            // No telemetry (like replay): the digest writes a markdown file and
+            // prints its path; tracing would only clutter that output.
+            let date = cli.date.as_deref().map(parse_date).transpose()?;
+            digest::execute(&config, date, cli.out.as_deref())?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
+}
+
+/// Parses a `YYYY-MM-DD` string into a [`time::Date`] (no formatting feature
+/// needed — split and validate the three components).
+fn parse_date(s: &str) -> anyhow::Result<time::Date> {
+    let mut parts = s.split('-');
+    let (Some(y), Some(m), Some(d), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        bail!("--date must be YYYY-MM-DD, got {s:?}");
+    };
+    let year: i32 = y
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--date has an invalid year in {s:?}"))?;
+    let month_num: u8 = m
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--date has an invalid month in {s:?}"))?;
+    let day: u8 = d
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--date has an invalid day in {s:?}"))?;
+    let month = time::Month::try_from(month_num)
+        .map_err(|_| anyhow::anyhow!("--date month must be 1..=12 in {s:?}"))?;
+    time::Date::from_calendar_date(year, month, day)
+        .map_err(|e| anyhow::anyhow!("--date {s:?} is not a valid calendar date: {e}"))
 }
 
 /// The acceptance-test series for `bot ladder` / `bot fair` when `--series` is
@@ -1387,6 +1452,33 @@ mod tests {
         assert!(parse(&["venue-check", "--series", "BTC-5m"]).is_err());
         assert!(parse(&["venue-check", "--raw", "x.jsonl"]).is_err());
         assert!(parse(&["venue-check", "paper"]).is_err());
+    }
+
+    #[test]
+    fn parses_digest_flags() {
+        // Bare digest: date + out default to None (resolved at dispatch).
+        let cli = parse(&["digest"]).unwrap();
+        assert_eq!(cli.command, Command::Digest);
+        assert_eq!(cli.date, None);
+        assert_eq!(cli.out, None);
+
+        // --date + --out both apply to digest, both flag forms.
+        let cli = parse(&["digest", "--date", "2026-06-15", "--out", "d.md"]).unwrap();
+        assert_eq!(cli.command, Command::Digest);
+        assert_eq!(cli.date.as_deref(), Some("2026-06-15"));
+        assert_eq!(cli.out, Some(PathBuf::from("d.md")));
+        let cli = parse(&["digest", "--date=2026-06-15", "--out=d.md"]).unwrap();
+        assert_eq!(cli.date.as_deref(), Some("2026-06-15"));
+        assert_eq!(cli.out, Some(PathBuf::from("d.md")));
+
+        // --date is digest-only; digest can't combine with a mode; other
+        // subcommands' flags don't apply; a missing value is rejected.
+        assert!(parse(&["paper", "--date", "x"]).is_err());
+        assert!(parse(&["digest", "--date"]).is_err());
+        assert!(parse(&["digest", "--source", "rtds"]).is_err());
+        assert!(parse(&["digest", "--depth", "8"]).is_err());
+        assert!(parse(&["paper", "digest"]).is_err());
+        assert!(parse(&["digest", "paper"]).is_err());
     }
 
     #[test]

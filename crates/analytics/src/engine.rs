@@ -176,8 +176,9 @@ impl Analytics {
             .remove(&summary.window)
             .unwrap_or_default();
         let s5s: Vec<f64> = fms.iter().filter_map(|f| f.s5.map(|p| p.value)).collect();
+        let s30s: Vec<f64> = fms.iter().filter_map(|f| f.s30.map(|p| p.value)).collect();
 
-        self.rollups.fold(&attribution, &s5s);
+        self.rollups.fold_markouts(&attribution, &s5s, &s30s);
 
         let series = summary.window.series;
         let monitor = self

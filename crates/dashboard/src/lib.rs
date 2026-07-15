@@ -49,5 +49,5 @@ pub use handle::DashboardHandle;
 pub use model_taker::ModelTakerTick;
 pub use server::{router, serve, serve_with_listener};
 pub use shadow::ShadowTick;
-pub use state::ParamsView;
+pub use state::{DriverStatus, ParamsView};
 pub use ws::{BreakerEvent, WsUpdate};

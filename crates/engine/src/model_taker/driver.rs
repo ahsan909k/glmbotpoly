@@ -284,7 +284,7 @@ impl ModelTaker {
         &self,
         pred: &ModelPrediction,
         now: TimestampMs,
-        arbiter: &FireLedger,
+        arbiter: &mut FireLedger,
         resting: Option<&dyn RestingLookup>,
     ) -> Result<Decision, NoModelTakeReason> {
         if self.standing_down {
@@ -565,15 +565,15 @@ mod tests {
     #[test]
     fn theta_rule_and_side() {
         let t = armed(Asset::Eth, 0);
-        let arb = FireLedger::default();
+        let mut arb = FireLedger::default();
         // p = 0.5 + theta ⇒ Up.
         let d = t
-            .decide(&pred(Asset::Eth, 0, 0.53, 2_000), ts(2_000), &arb, None)
+            .decide(&pred(Asset::Eth, 0, 0.53, 2_000), ts(2_000), &mut arb, None)
             .expect("a take");
         assert_eq!(d.outcome, Outcome::Up);
         // p = 0.5 + theta − ε ⇒ BelowTheta.
         let r = t
-            .decide(&pred(Asset::Eth, 0, 0.52, 2_000), ts(2_000), &arb, None)
+            .decide(&pred(Asset::Eth, 0, 0.52, 2_000), ts(2_000), &mut arb, None)
             .unwrap_err();
         assert!(matches!(r, NoModelTakeReason::BelowTheta { .. }));
     }
@@ -594,9 +594,9 @@ mod tests {
             1_000,
         );
         t.on_bus_event(&Event::Book(b));
-        let arb = FireLedger::default();
+        let mut arb = FireLedger::default();
         let d = t
-            .decide(&pred(Asset::Eth, 0, 0.10, 2_000), ts(2_000), &arb, None)
+            .decide(&pred(Asset::Eth, 0, 0.10, 2_000), ts(2_000), &mut arb, None)
             .expect("a take");
         assert_eq!(d.outcome, Outcome::Down);
     }
@@ -604,34 +604,49 @@ mod tests {
     #[test]
     fn gates_no_window_stale_model_coverage_expiry_book() {
         let t = armed(Asset::Eth, 0);
-        let arb = FireLedger::default();
+        let mut arb = FireLedger::default();
         // Wrong window.
         assert!(matches!(
-            t.decide(&pred(Asset::Eth, 999, 0.9, 2_000), ts(2_000), &arb, None),
+            t.decide(
+                &pred(Asset::Eth, 999, 0.9, 2_000),
+                ts(2_000),
+                &mut arb,
+                None
+            ),
             Err(NoModelTakeReason::NoWindowState)
         ));
         // Stale model.
         let mut sp = pred(Asset::Eth, 0, 0.9, 2_000);
         sp.model_stale = true;
         assert!(matches!(
-            t.decide(&sp, ts(2_000), &arb, None),
+            t.decide(&sp, ts(2_000), &mut arb, None),
             Err(NoModelTakeReason::ModelStale)
         ));
         // Low coverage.
         let mut lp = pred(Asset::Eth, 0, 0.9, 2_000);
         lp.finite_count = 10;
         assert!(matches!(
-            t.decide(&lp, ts(2_000), &arb, None),
+            t.decide(&lp, ts(2_000), &mut arb, None),
             Err(NoModelTakeReason::InsufficientCoverage { .. })
         ));
         // Expired (now past close at open+300_000).
         assert!(matches!(
-            t.decide(&pred(Asset::Eth, 0, 0.9, 301_000), ts(301_000), &arb, None),
+            t.decide(
+                &pred(Asset::Eth, 0, 0.9, 301_000),
+                ts(301_000),
+                &mut arb,
+                None
+            ),
             Err(NoModelTakeReason::Expired { .. })
         ));
         // Stale book (book ts open+1000, now open+10_000 ⇒ age 9s > 2s).
         assert!(matches!(
-            t.decide(&pred(Asset::Eth, 0, 0.9, 10_000), ts(10_000), &arb, None),
+            t.decide(
+                &pred(Asset::Eth, 0, 0.9, 10_000),
+                ts(10_000),
+                &mut arb,
+                None
+            ),
             Err(NoModelTakeReason::BookStale { .. })
         ));
     }
@@ -649,7 +664,7 @@ mod tests {
         };
         arb.record(TakerId::Momentum, win, ts(1_000));
         let r = t
-            .decide(&pred(Asset::Btc, 0, 0.9, 2_000), ts(2_000), &arb, None)
+            .decide(&pred(Asset::Btc, 0, 0.9, 2_000), ts(2_000), &mut arb, None)
             .unwrap_err();
         assert!(matches!(r, NoModelTakeReason::ArbitrationSuppressed { .. }));
     }

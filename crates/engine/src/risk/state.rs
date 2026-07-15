@@ -11,9 +11,9 @@
 //! [`RiskStateSnapshot`] is the cheap, allocation-light projection the dashboard
 //! reads for its risk panel (§10.5).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use core_types::{BreakerKind, Dollars, NewOrder, OrderQty, TimestampMs, WindowId};
+use core_types::{BreakerKind, Dollars, NewOrder, OrderQty, Series, TimestampMs, WindowId};
 use venue_api::{RiskRejectDetail, VenueError};
 
 /// A venue-error the guard observed on a port call, for the
@@ -45,6 +45,42 @@ pub(crate) struct GateState {
     /// Venue-error observations the guard appended; drained each turn by the
     /// driver into the core.
     pub(crate) observations: Vec<GuardObservation>,
+    /// Per-series tally of pre-trade placement vetoes, indexed by
+    /// [`veto_index`]: how many placements the gate refused per
+    /// (series, reject-detail). Drained by
+    /// [`RiskManager::contention_snapshot`](super::RiskManager::contention_snapshot).
+    pub(crate) veto_tally: HashMap<Series, [u64; VETO_KINDS]>,
+}
+
+/// The number of distinct [`RiskRejectDetail`] veto kinds tallied per series.
+pub(crate) const VETO_KINDS: usize = 3;
+
+/// The reject details in tally-index order (see [`veto_index`]).
+const VETO_DETAILS: [RiskRejectDetail; VETO_KINDS] = [
+    RiskRejectDetail::Halted,
+    RiskRejectDetail::OpenNotionalCap,
+    RiskRejectDetail::WindowHalted,
+];
+
+/// Maps a [`RiskRejectDetail`] to its slot in a per-series veto tally array.
+const fn veto_index(detail: RiskRejectDetail) -> usize {
+    match detail {
+        RiskRejectDetail::Halted => 0,
+        RiskRejectDetail::OpenNotionalCap => 1,
+        RiskRejectDetail::WindowHalted => 2,
+    }
+}
+
+/// One drained `(reject-detail, series) → count` placement-veto tally, for the
+/// dashboard's contention panel (§10/§11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VetoTally {
+    /// Why the placement was refused.
+    pub detail: RiskRejectDetail,
+    /// The series the refused order belonged to.
+    pub series: Series,
+    /// How many placements were refused for this `(detail, series)`.
+    pub count: u64,
 }
 
 impl GateState {
@@ -112,6 +148,30 @@ impl GateState {
             VenueError::Rejected(_) | VenueError::NotArmed => {}
         }
     }
+
+    /// Records one pre-trade placement veto (the guard calls this on the
+    /// `Err(detail)` branch), tallied by `(series, detail)`.
+    pub(crate) fn record_veto(&mut self, detail: RiskRejectDetail, series: Series) {
+        self.veto_tally.entry(series).or_default()[veto_index(detail)] += 1;
+    }
+
+    /// Drains the accumulated placement-veto tallies (drain-and-report, like the
+    /// shadow-stop drain), one entry per non-zero `(series, detail)`.
+    pub(crate) fn drain_vetoes(&mut self) -> Vec<VetoTally> {
+        let mut out = Vec::new();
+        for (series, counts) in std::mem::take(&mut self.veto_tally) {
+            for (i, &count) in counts.iter().enumerate() {
+                if count > 0 {
+                    out.push(VetoTally {
+                        detail: VETO_DETAILS[i],
+                        series,
+                        count,
+                    });
+                }
+            }
+        }
+        out
+    }
 }
 
 /// A loss-based stop that WOULD have tripped, recorded instead of enforced
@@ -145,6 +205,11 @@ pub struct RiskStateSnapshot {
     pub window_loss_active: bool,
     /// Number of windows currently loss-halted.
     pub halted_windows: usize,
+    /// The windows currently under a per-window loss halt (sorted, for a stable
+    /// projection). Empowers the status strip to name which series is HALTED.
+    pub halted_windows_list: Vec<WindowId>,
+    /// Global breaker trips observed in the trailing hour (a "how noisy" rate).
+    pub trips_last_hour: u32,
     /// Authoritative open notional across all windows.
     pub open_notional: Dollars,
     /// The open-notional ceiling.
@@ -265,6 +330,30 @@ mod tests {
             g.admit_batch(&orders),
             Err(RiskRejectDetail::OpenNotionalCap)
         );
+    }
+
+    #[test]
+    fn veto_tally_records_and_drains_by_series_and_detail() {
+        let mut g = gate(dec!(1000));
+        let s = window().series;
+        g.record_veto(RiskRejectDetail::Halted, s);
+        g.record_veto(RiskRejectDetail::Halted, s);
+        g.record_veto(RiskRejectDetail::OpenNotionalCap, s);
+        let vetoes = g.drain_vetoes();
+        assert_eq!(vetoes.len(), 2);
+        let halted = vetoes
+            .iter()
+            .find(|v| v.detail == RiskRejectDetail::Halted)
+            .expect("halted tally");
+        assert_eq!(halted.count, 2);
+        assert_eq!(halted.series, s);
+        let cap = vetoes
+            .iter()
+            .find(|v| v.detail == RiskRejectDetail::OpenNotionalCap)
+            .expect("cap tally");
+        assert_eq!(cap.count, 1);
+        // Draining clears the tally.
+        assert!(g.drain_vetoes().is_empty());
     }
 
     #[test]

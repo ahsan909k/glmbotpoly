@@ -35,6 +35,7 @@
 pub mod activity;
 pub mod attribution;
 pub mod datekey;
+pub mod driver_matrix;
 pub mod engine;
 pub mod health;
 pub mod markout;
@@ -46,6 +47,7 @@ pub mod rollup;
 pub use activity::OrderActivity;
 pub use attribution::{WindowAttrib, WindowAttribution};
 pub use datekey::DayKey;
+pub use driver_matrix::{DriverCell, DriverMatrix};
 pub use engine::{Analytics, AnalyticsEffect};
 pub use health::{AdverseSelectionMonitor, AdverseSelectionState, SeriesHealth};
 pub use markout::{

@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 
+use analytics::DriverMatrix;
 use core_types::{Dollars, Outcome, Price, Series, Size, TimestampMs, WindowId};
 use engine::FillDriver;
 use rust_decimal::Decimal;
@@ -20,8 +21,6 @@ use rust_decimal::Decimal;
 const RECENT_CAP: usize = 64;
 /// Window over which "fires/min" is measured (ms).
 pub(crate) const RATE_WINDOW_MS: i64 = 60_000;
-/// Max windows buffered awaiting settlement (bounds memory if one never resolves).
-const PENDING_WINDOWS_CAP: usize = 64;
 
 /// One model-taker decision handed to the dashboard (dashboard-owned).
 #[derive(Debug, Clone)]
@@ -92,21 +91,22 @@ impl ModelTakerState {
 }
 
 // ---------------------------------------------------------------------------
-// PnL attribution by driver
+// PnL attribution by driver (wraps the shared analytics::DriverMatrix)
 // ---------------------------------------------------------------------------
 
-/// One driver-tagged fill, buffered until its window settles.
-#[derive(Debug, Clone, Copy)]
-struct DriverFill {
-    driver: FillDriver,
-    outcome: Outcome,
-    shares: Size,
-    price: Price,
-    fee: Dollars,
+/// The immediate per-`(series, driver)` activity kept alongside the realized-PnL
+/// matrix — taker notional and fees are not in the matrix (which tracks realized
+/// PnL + win rate), so they are accumulated here for the model-taker tile.
+#[derive(Debug, Clone, Copy, Default)]
+struct DriverActivity {
+    fills: u64,
+    taker_notional: Decimal,
+    fees: Decimal,
 }
 
-/// Running per-(series, driver) totals.
-#[derive(Debug, Clone, Default)]
+/// One combined `(series, driver)` total for the model-taker tile: the activity
+/// counters plus the matrix's realized PnL and win rate.
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct DriverTotals {
     pub(crate) fills: u64,
     /// Taker notional (`Σ price·size`) — zero for the maker-core driver.
@@ -117,15 +117,20 @@ pub(crate) struct DriverTotals {
     pub(crate) realized_pnl: Decimal,
 }
 
-/// PnL-by-driver accumulator (buffers fills per window, marks them at settlement).
+/// PnL-by-driver accumulator: the shared [`DriverMatrix`] (realized PnL + win
+/// rate, marked at settlement) plus the immediate taker-notional/fee activity.
+/// Owned per-mode by the dashboard, so it is populated for either namespace
+/// independent of whether the model taker is running.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DriverPnlState {
-    pending: HashMap<WindowId, Vec<DriverFill>>,
-    pub(crate) totals: HashMap<(Series, FillDriver), DriverTotals>,
+    matrix: DriverMatrix,
+    activity: HashMap<(Series, FillDriver), DriverActivity>,
 }
 
 impl DriverPnlState {
-    /// Buffers a driver-tagged fill and updates the immediate activity totals.
+    /// Buffers a driver-tagged fill into the matrix (marked at settlement) and
+    /// updates the immediate activity totals.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_fill(
         &mut self,
         window: WindowId,
@@ -134,21 +139,11 @@ impl DriverPnlState {
         shares: Size,
         price: Price,
         fee: Dollars,
+        ts: TimestampMs,
     ) {
-        self.pending.entry(window).or_default().push(DriverFill {
-            driver,
-            outcome,
-            shares,
-            price,
-            fee,
-        });
-        // Bound memory: if a window never settles, evict the oldest buffered one.
-        if self.pending.len() > PENDING_WINDOWS_CAP
-            && let Some(oldest) = self.pending.keys().min_by_key(|w| w.open_time).copied()
-        {
-            self.pending.remove(&oldest);
-        }
-        let t = self.totals.entry((window.series, driver)).or_default();
+        self.matrix
+            .record_fill(window, driver, outcome, shares, price, fee, ts);
+        let t = self.activity.entry((window.series, driver)).or_default();
         t.fills += 1;
         if driver != FillDriver::MakerCore {
             t.taker_notional += price.as_decimal() * shares.as_decimal();
@@ -156,24 +151,38 @@ impl DriverPnlState {
         t.fees += fee.as_decimal();
     }
 
-    /// Marks a settled window's buffered fills to `outcome`, folding the realized
-    /// PnL into each driver's total, then drops the window's buffer.
+    /// Marks a settled window's buffered fills to `outcome` in the matrix.
     pub(crate) fn settle(&mut self, window: WindowId, outcome: Outcome) {
-        let Some(fills) = self.pending.remove(&window) else {
-            return;
-        };
-        for f in fills {
-            let won = f.outcome == outcome;
-            let payoff = if won { f.shares.as_decimal() } else { Decimal::ZERO };
-            let cost = f.shares.as_decimal() * f.price.as_decimal() + f.fee.as_decimal();
-            let marked = payoff - cost;
-            self.totals
-                .entry((window.series, f.driver))
-                .or_default()
-                .realized_pnl += marked;
-        }
+        self.matrix.settle(window, outcome);
     }
 
+    /// The underlying realized-PnL / win-rate matrix (for the §10 PnL matrix DTO).
+    pub(crate) fn matrix(&self) -> &DriverMatrix {
+        &self.matrix
+    }
+
+    /// Combined per-`(series, driver)` totals for the model-taker tile.
+    pub(crate) fn totals(&self) -> HashMap<(Series, FillDriver), DriverTotals> {
+        let cells = self.matrix.totals();
+        let mut out: HashMap<(Series, FillDriver), DriverTotals> = HashMap::new();
+        // Every key seen in either the activity or the settled matrix.
+        let keys: std::collections::HashSet<(Series, FillDriver)> =
+            self.activity.keys().chain(cells.keys()).copied().collect();
+        for key in keys {
+            let a = self.activity.get(&key).copied().unwrap_or_default();
+            let cell = cells.get(&key).copied().unwrap_or_default();
+            out.insert(
+                key,
+                DriverTotals {
+                    fills: a.fills,
+                    taker_notional: a.taker_notional,
+                    fees: a.fees,
+                    realized_pnl: cell.realized_pnl.as_decimal(),
+                },
+            );
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -202,7 +211,11 @@ mod tests {
             ts: TimestampMs::from_millis(1_000),
             p_up: 0.9,
             fired,
-            reason: if fired { "fired".into() } else { "below_theta".into() },
+            reason: if fired {
+                "fired".into()
+            } else {
+                "below_theta".into()
+            },
         }
     }
 
@@ -223,6 +236,7 @@ mod tests {
     fn driver_pnl_marks_at_settlement() {
         let mut d = DriverPnlState::default();
         let px = |v| Price::on_grid(v, TickSize::T001).unwrap();
+        let t = TimestampMs::from_millis(1_000);
         // Model buys 10 Up @ 0.80, fee 0.10; momentum buys 5 Down @ 0.30, fee 0.02.
         d.record_fill(
             window(),
@@ -231,6 +245,7 @@ mod tests {
             Size::new(dec!(10)).unwrap(),
             px(dec!(0.80)),
             Dollars::new(dec!(0.10)),
+            t,
         );
         d.record_fill(
             window(),
@@ -239,21 +254,27 @@ mod tests {
             Size::new(dec!(5)).unwrap(),
             px(dec!(0.30)),
             Dollars::new(dec!(0.02)),
+            t,
         );
         // Immediate activity totals.
-        let model = d.totals.get(&(series(), FillDriver::Model)).unwrap();
+        let totals = d.totals();
+        let model = totals.get(&(series(), FillDriver::Model)).unwrap();
         assert_eq!(model.taker_notional, dec!(8.0)); // 10·0.80
         assert_eq!(model.fills, 1);
 
         // Window resolves Up: model won, momentum lost.
         d.settle(window(), Outcome::Up);
-        let model = d.totals.get(&(series(), FillDriver::Model)).unwrap();
-        // payoff 10 − cost (8 + 0.10) = +1.90
+        let totals = d.totals();
+        let model = totals.get(&(series(), FillDriver::Model)).unwrap();
+        // payoff 10 − cost (8 + 0.10) = +1.90; won.
         assert_eq!(model.realized_pnl, dec!(1.90));
-        let mom = d.totals.get(&(series(), FillDriver::Momentum)).unwrap();
+        let mom = totals.get(&(series(), FillDriver::Momentum)).unwrap();
         // Down lost: payoff 0 − cost (1.5 + 0.02) = −1.52
         assert_eq!(mom.realized_pnl, dec!(-1.52));
-        // Buffer dropped.
-        assert!(d.pending.is_empty());
+        // Win rate is surfaced via the matrix (the PnL-matrix DTO).
+        let day = analytics::DayKey::from_ts(TimestampMs::from_millis(1_000));
+        let cell = d.matrix().cell(series(), FillDriver::Model, day).unwrap();
+        assert_eq!(cell.winning_fills, 1);
+        assert_eq!(cell.resolved_fills, 1);
     }
 }

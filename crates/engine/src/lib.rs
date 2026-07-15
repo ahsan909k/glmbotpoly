@@ -43,7 +43,7 @@ pub(crate) mod model_taker;
 pub(crate) mod quote_manager;
 pub(crate) mod taker;
 
-pub use arbitration::{ArbitrationBlock, FireLedger, TakerId};
+pub use arbitration::{ArbitrationBlock, ArbitrationTally, FireLedger, TakerId};
 pub use inventory::{
     ExcessConstraint, InventoryEffect, InventoryManager, InventoryParams, MergeIntent,
     WindowInventory, authorizes_passive_add_sides, excess_constraint_sides,
@@ -67,7 +67,10 @@ pub use quoting::{
     FinalSecondsViolation, NoQuoteReason, PassiveLevelRef, QuoteDecision, QuoteLevel, QuoteParams,
     QuoteSet, SuppressReason, Suppressed, calculate_quotes, check_final_seconds_invariant,
 };
-pub use risk::{FillDriver, RiskManager, RiskOutput, RiskParams, RiskStateSnapshot, ShadowStop};
+pub use risk::{
+    ContentionSnapshot, FillDriver, RiskManager, RiskOutput, RiskParams, RiskStateSnapshot,
+    ShadowStop, VetoTally,
+};
 pub use taker::{
     ConfirmedMove, MomentumTakerParams, NoTakeReason, SignalWindow, TakePlan, plan_take,
 };

@@ -158,6 +158,29 @@ pub fn fill_event(outcome: Outcome, price: Decimal, size: Decimal, ts_ms: i64) -
     }))
 }
 
+/// A bare [`Fill`] (not wrapped in an `Event`) for `record_driver_fill` tests.
+pub fn raw_fill(outcome: Outcome, price: Decimal, size: Decimal, ts_ms: i64) -> Fill {
+    let token = if outcome == Outcome::Up {
+        up_token()
+    } else {
+        down_token()
+    };
+    Fill {
+        order_id: OrderId::new("o-drv").unwrap(),
+        trade_id: None,
+        window: window_id(),
+        token_id: token,
+        outcome,
+        side: Side::Buy,
+        price: px(price),
+        size: sz(size),
+        liquidity: core_types::Liquidity::Taker,
+        fee: Dollars::new(dec!(0.1)),
+        ts_venue: ts(ts_ms),
+        ts_local: ts(ts_ms),
+    }
+}
+
 pub fn taker_fill_event(outcome: Outcome, ts_ms: i64, order_id: &str) -> Event {
     let token = if outcome == Outcome::Up {
         up_token()
@@ -329,6 +352,8 @@ pub fn risk_snapshot() -> RiskStateSnapshot {
         tripped: vec![BreakerKind::Manual],
         window_loss_active: false,
         halted_windows: 0,
+        halted_windows_list: Vec::new(),
+        trips_last_hour: 1,
         open_notional: Dollars::new(dec!(120)),
         open_notional_cap: Dollars::new(dec!(1000)),
         daily_pnl: Dollars::new(dec!(3)),

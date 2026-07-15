@@ -154,15 +154,38 @@ impl DashboardHandle {
         self.lock().set_model_taker(tick, now);
     }
 
-    /// Buffers one driver-tagged fill for PnL-by-driver (marked at settlement).
-    /// The orchestrator tags the fill via `RiskManager::driver_of`.
+    /// Buffers one driver-tagged fill for `mode`'s PnL-by-driver (marked at
+    /// settlement). The orchestrator tags the fill via `RiskManager::driver_of`.
     pub fn record_driver_fill(
         &self,
+        mode: Mode,
         driver: Option<engine::FillDriver>,
         fill: &core_types::Fill,
         now: TimestampMs,
     ) {
-        self.lock().record_driver_fill(driver, fill, now);
+        self.lock().record_driver_fill(mode, driver, fill, now);
+    }
+
+    /// Records the four strategies' standing-down flags for `mode`'s STATUS strip
+    /// (pushed from the orchestrator's risk-sample tick).
+    pub fn set_driver_status(
+        &self,
+        mode: Mode,
+        status: crate::state::DriverStatus,
+        now: TimestampMs,
+    ) {
+        self.lock().set_driver_status(mode, status, now);
+    }
+
+    /// Folds a drained §10 contention snapshot (arbitration blocks + placement
+    /// vetoes) into `mode`'s cumulative counters (pushed from the risk tick).
+    pub fn set_contention(
+        &self,
+        mode: Mode,
+        snapshot: &engine::ContentionSnapshot,
+        now: TimestampMs,
+    ) {
+        self.lock().set_contention(mode, snapshot, now);
     }
 
     /// Sets the displayed parameters view.

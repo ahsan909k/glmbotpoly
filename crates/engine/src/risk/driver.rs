@@ -29,12 +29,25 @@ use venue_api::{VenueEvent, VenuePort};
 use super::core::{RiskCore, RiskOutput};
 use super::guard::GuardedPort;
 use super::params::RiskParams;
-use super::state::{GateState, GuardObservation, RiskStateSnapshot, ShadowStop};
-use crate::arbitration::FireLedger;
+use super::state::{GateState, GuardObservation, RiskStateSnapshot, ShadowStop, VetoTally};
+use crate::arbitration::{ArbitrationTally, FireLedger};
 use crate::late_window::LateWindowTaker;
 use crate::model_taker::{ModelPrediction, ModelTakeOutcome, ModelTaker};
 use crate::quote_manager::{QuoteManager, RestingLookup, RestingView};
 use crate::taker::MomentumTaker;
+
+/// A point-in-time drain of the §10 contention counters: the cross-taker
+/// arbitration blocks and the pre-trade placement vetoes accumulated since the
+/// last call. Drain-and-report, like [`RiskManager::take_shadow_stops`].
+#[derive(Debug, Clone, Default)]
+pub struct ContentionSnapshot {
+    /// Arbitration blocks: which losing driver was suppressed by which winner,
+    /// per series (§8 momentum-vs-model precedence).
+    pub arbitration_blocks: Vec<ArbitrationTally>,
+    /// Pre-trade placement vetoes tallied by `(reject-detail, series)` — orders
+    /// the risk gate refused (halt / per-window halt / open-notional cap).
+    pub risk_vetoes: Vec<VetoTally>,
+}
 
 /// Which owned strategy placed an order — the driver a fill is attributed to
 /// (CLAUDE.md §10 PnL-by-driver). Resolved from the strategies' own order sets.
@@ -129,6 +142,23 @@ impl RiskManager {
     /// unless `shadow_loss_stops` is enabled.
     pub fn take_shadow_stops(&mut self) -> Vec<ShadowStop> {
         std::mem::take(&mut self.shadow_stops)
+    }
+
+    /// Drains the §10 contention counters — the cross-taker arbitration blocks
+    /// (from the fire ledger) and the pre-trade placement vetoes (from the risk
+    /// gate) accumulated since the last call. Mirrors
+    /// [`take_shadow_stops`](Self::take_shadow_stops); the orchestrator feeds it
+    /// to the dashboard's contention panel and the digest.
+    pub fn contention_snapshot(&mut self) -> ContentionSnapshot {
+        let risk_vetoes = self
+            .shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain_vetoes();
+        ContentionSnapshot {
+            arbitration_blocks: self.arbiter.drain_blocks(),
+            risk_vetoes,
+        }
     }
 
     /// The current breaker state for the dashboard risk panel (§10.5).

@@ -52,7 +52,11 @@ impl<P: VenuePort> VenuePort for GuardedPort<'_, P> {
         // await below.
         let decision = self.lock().admit(order);
         match decision {
-            Err(detail) => Err(VenueError::Rejected(RejectReason::RiskRejected(detail))),
+            Err(detail) => {
+                // Tally the veto for the §10 contention panel.
+                self.lock().record_veto(detail, order.window.series);
+                Err(VenueError::Rejected(RejectReason::RiskRejected(detail)))
+            }
             Ok(()) => {
                 let r = self.inner.place(order).await;
                 if let Err(e) = &r {
@@ -68,18 +72,27 @@ impl<P: VenuePort> VenuePort for GuardedPort<'_, P> {
         match decision {
             // Refuse the whole batch as positionally-aligned per-order rejections
             // (never sink it as one outer error).
-            Err(detail) => Ok(BatchPlaced {
-                results: orders
-                    .iter()
-                    .map(|o| {
-                        Err(PlaceRejection {
-                            client_id: o.client_id.clone(),
-                            reason: RejectReason::RiskRejected(detail),
-                            raw: format!("risk: {detail:?}"),
+            Err(detail) => {
+                // Tally one veto per refused order, by its series.
+                {
+                    let mut g = self.lock();
+                    for o in orders {
+                        g.record_veto(detail, o.window.series);
+                    }
+                }
+                Ok(BatchPlaced {
+                    results: orders
+                        .iter()
+                        .map(|o| {
+                            Err(PlaceRejection {
+                                client_id: o.client_id.clone(),
+                                reason: RejectReason::RiskRejected(detail),
+                                raw: format!("risk: {detail:?}"),
+                            })
                         })
-                    })
-                    .collect(),
-            }),
+                        .collect(),
+                })
+            }
             Ok(()) => {
                 let r = self.inner.place_batch(orders).await;
                 if let Err(e) = &r {
