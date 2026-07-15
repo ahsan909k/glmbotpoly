@@ -1,11 +1,12 @@
-# EVAL config overlay — Days 1–3 sizing ($150/window). Signed off 2026-07-15.
+# EVAL config overlay — Day-1 sizing ($150/window). Signed off 2026-07-15.
+# 4-DAY accelerated eval (compressed from 14 days; all verdicts preserved).
 #
 # Copy to /etc/bot/config/bot.local.toml at cutover (layered OVER
 # config/default.toml). Inspect the merged result before starting:
 #   sudo -u bot /opt/bot/bin/bot check-config --config-dir /etc/bot/config
 #
-# DAY-4 sizing bump (only if the day-3 gate passes): change the three lines
-# marked [DAY-4] below, then `sudo systemctl restart bot` (graceful drain).
+# DAY-2 sizing bump (only if the day-1 infra gate passes): change the three lines
+# marked [DAY-2] below, then `sudo systemctl restart bot` (graceful drain).
 # Every knob here is STRUCTURAL / restart-only — none is runtime `set-param`able.
 
 [log]
@@ -46,18 +47,18 @@ enable = true                 # champion-model observer (required by model_taker
 
 [model_taker]
 enable = true                 # champion dir10 model taker (per-window, all four M5/M15).
-budget_per_window = 10        # [DAY-4] -> 100
+budget_per_window = 10        # [DAY-2] -> 100
 
 [engine.defaults]
 clip_size_shares = 60                     # hard per-order cap (maker levels + taker clips ≤ 60).
 touch_size = 40                           # ~$152 two-sided instantaneous resting (≈ $19/order).
 ladder_size_per_level = 40
 ladder_levels = 3
-maker_deployment_budget_per_window = 150  # [DAY-4] -> 1000  (cumulative gross-buy $/window)
+maker_deployment_budget_per_window = 150  # [DAY-2] -> 1000  (cumulative gross-buy $/window)
 max_worst_case_loss_per_window = 95       # constant both phases (risk = net inventory, not churn)
 soft_cap_excess_shares = 200
 hard_cap_excess_shares = 400
-taker_budget_per_window = 10              # [DAY-4] -> 100  (momentum + late, cumulative $)
+taker_budget_per_window = 10              # [DAY-2] -> 100  (momentum + late, cumulative $)
 
 # Dashboard stays on loopback (default); reach it via the SSH tunnel:
 #   ssh -N -L 8080:localhost:8080 ubuntu@54.154.134.102

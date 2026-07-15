@@ -3,8 +3,8 @@
 Copy-pasteable sequence to move the VPS from the burn-in baseline to the eval
 build. Run as `ubuntu` on the box (`ssh -i "C:\Users\U S E R\Downloads\polybot-key.pem" ubuntu@54.154.134.102`).
 Each numbered step must succeed before the next. **This does NOT start the
-14-day clock** — that happens at EVAL START (step 10) only after every gate and
-the 24 h rehearsal are green.
+4-day eval clock** — that happens at EVAL START (step 10) only after every gate
+and the 12 h rehearsal are green.
 
 Branch to deploy: `per-window-refactor-20260715` (on `origin` + `glm`), which
 contains Phase 0 (per-window refactor), Phase 1 (rustls harness fix), Phase 2.0
