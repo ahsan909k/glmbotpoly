@@ -36,6 +36,8 @@ DEFAULT_HANDLES: list[str] = [
     "0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82",
     "0xa6896d11f76dfa2820662c1f441496f51553559",
     "nagi777",  # merge-heavy account — added for the operating-manual roster (fetch fresh).
+    "gabigol",  # @dontoverfit — reference-class maker on our BTC/ETH 5m+15m series (primary live-eval report card).
+    "0xf3531b23b504cf0aed4ff21325232b2a2d496685",  # xrang2731 — taker-only Diamond.
 ]
 
 _FULL_ADDR = re.compile(r"^0x[0-9a-fA-F]{40}$")

@@ -860,7 +860,8 @@ def main(argv: list[str] | None = None) -> int:
     resolved = [h for h in handles if h.get("address")]
     # b27b's handle in handles.json is its full address (it was supplied as an address).
     roster = {"0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82", "takerner", "bonereaper",
-              "wolf9478", "nagi777"}
+              "wolf9478", "nagi777", "gabigol",
+              "0xf3531b23b504cf0aed4ff21325232b2a2d496685"}
     want = {x.lower() for x in args.only} if args.only else roster
     resolved = [h for h in resolved
                 if h["handle"].lower() in want or h["address"].lower() in want]
