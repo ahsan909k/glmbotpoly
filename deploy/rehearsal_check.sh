@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# 12 h dress-rehearsal gate checker (GATE 2). Run on the VPS after ~12 h of the
-# full stack at Day-1 sizing ($150) — the accelerated 4-day eval's shakeout.
-# Bounds all journal queries by the rehearsal epoch (arg $1 = epoch ms, else
-# /var/lib/bot/data/eval/rehearsal_epoch's first field, else 12 h ago). Prints
-# PASS/FAIL per gate; exits non-zero if any FAIL. The trips/hr gate uses the
-# actual elapsed hours, so it adapts to whatever the real rehearsal duration is.
+# 24 h dress-rehearsal gate checker (GATE 2). Run on the VPS after ~24 h of the
+# full stack at Day-1 sizing ($150) — the shakeout before the accelerated 4-day
+# eval's clock starts. Bounds all journal queries by the rehearsal epoch (arg
+# $1 = epoch ms, else /var/lib/bot/data/eval/rehearsal_epoch's first field, else
+# 24 h ago). Prints PASS/FAIL per gate; exits non-zero if any FAIL. The trips/hr
+# gate uses the actual elapsed hours, so it adapts to the real rehearsal duration.
 # Read-only: opens the sqlite index read-only (WAL-safe alongside the running bot).
 set -uo pipefail
 
@@ -12,7 +12,7 @@ DB=/var/lib/bot/data/journal.sqlite
 EPOCH_FILE=/var/lib/bot/data/eval/rehearsal_epoch
 T0="${1:-}"
 if [ -z "$T0" ] && [ -f "$EPOCH_FILE" ]; then T0="$(awk '{print $1; exit}' "$EPOCH_FILE")"; fi
-if [ -z "$T0" ]; then T0=$(( ($(date -u +%s) - 43200) * 1000 )); fi   # 12 h fallback
+if [ -z "$T0" ]; then T0=$(( ($(date -u +%s) - 86400) * 1000 )); fi   # 24 h fallback
 q() { sqlite3 -readonly "$DB" "$1"; }
 FAILED=0
 pass() { printf 'PASS  %-26s %s\n' "$1" "${2:-}"; }
