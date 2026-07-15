@@ -15,13 +15,13 @@ dir = "/var/lib/bot/data/logs"
 [journal]
 dir = "/var/lib/bot/data/journal"                 # gzip segments (source of truth)
 sqlite_path = "/var/lib/bot/data/journal.sqlite"  # queryable index (+ -wal/-shm)
-depth_dir = "/var/lib/bot/data/depth"             # binance depth20 side-channel
-# Keep the whole eval in the sqlite index for a direct day-14 report; the nightly
-# S3-backup script prunes local raw segments >7 d that are confirmed in S3, so the
-# disk stays bounded while the structured index (small) covers the full window.
-# The daily digests archived to S3 are the authoritative eval record regardless.
-retention_max_age_ms = 2592000000                 # 30 days
-retention_max_total_bytes = 0                     # 0 = S3-backup handles segment disk
+depth_dir = "/var/lib/bot/data/depth"             # (unused when depth capture is off)
+# 10 d age over-covers the 4-day eval, so the sqlite index holds the whole run for
+# a direct day-4 report; the 30 GiB cap is a disk backstop (won't bind at ~2.5 GB/day
+# × 4 d); the nightly S3-backup prunes local raw segments >7 d confirmed in S3. The
+# daily digests archived to S3 are the authoritative eval record regardless.
+retention_max_age_ms = 864000000                  # 10 days
+retention_max_total_bytes = 32212254720           # 30 GiB disk backstop (>= 128 MiB)
 
 [paper]
 starting_capital = 50000                          # $50k bankroll (both phases)
@@ -42,8 +42,14 @@ daily_stop_loss = 1000        # 2% of $50k — SHADOW (computed, journaled, neve
 max_open_notional = 5000      # REAL backstop (~4× peak instantaneous deployment ~$1.2k).
 feed_staleness_grace_ms = 0   # strict §11 — colocated VPS, no grace.
 
+[feeds]
+binance_depth_capture = false   # research depth capture stays on the Windows box (division of labor).
+
 [shadow]
 enable = true                 # champion-model observer (required by model_taker).
+model_path = "/opt/bot/models/model_dir10_full.txt"
+model_meta_path = "/opt/bot/models/model_dir10_full.meta.json"
+shadow_dir = "/var/lib/bot/data/shadow"
 
 [model_taker]
 enable = true                 # champion dir10 model taker (per-window, all four M5/M15).
