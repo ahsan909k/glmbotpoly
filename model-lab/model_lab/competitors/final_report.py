@@ -195,6 +195,49 @@ def build_benchmark_tile_md(manuals: dict) -> list[str]:
     return L
 
 
+def build_competitors_json(manuals: dict) -> dict:
+    """Machine-readable benchmark references (final_report section 0) for the paper eval.
+
+    Anchor-CONSISTENT accounts carry trusted money (gabigol PRIMARY); SUSPECT accounts are
+    behavioral-only (money nulled). Derived from out/competitors/manuals/*.json.
+    """
+    cons, susp = _rank_refs(manuals)
+
+    def ref(h: str, role: str) -> dict:
+        m = manuals[h]; s = _ref_stats(m); disp = REF_DISPLAY.get(h, h)
+        trusted = not s["suspect"]
+        caveats = []
+        if disp in TRUNCATED_FETCH:
+            caveats.append(TRUNC_CAVEAT)
+        if disp in HOLD_TO_RESOLUTION:
+            caveats.append(HOLD_CAVEAT)
+        return {
+            "handle": disp, "address": m.get("address"), "name": m.get("profile", {}).get("name"),
+            "role": role, "anchor": "suspect" if s["suspect"] else "consistent",
+            "money_trusted": trusted,
+            "at_touch_frac": s["at_touch"], "crossing_frac": s["crossing"],
+            "per_window_capital_usd": {"p50": s["cap_p50"], "p90": s["cap_p90"]},
+            "capital_turns_per_day_p50": s["velocity"],
+            "windows_per_day": s["wpd"], "windows_traded": s["windows"], "uptime_days": s["days"],
+            "official_pnl_usd": s["official"] if trusted else None,
+            "reconstructed_our_series_usd": s["recon"] if trusted else None,
+            "caveats": caveats,
+        }
+
+    refs = [ref(h, "primary" if h == PRIMARY_REF else "secondary") for h in cons]
+    refs += [ref(h, "suspect") for h in susp]
+    return {
+        "schema_version": 1,
+        "primary": PRIMARY_REF,
+        "note": ("Benchmark references for the paper eval, from out/competitors/manuals/*.json "
+                 "(mirrors final_report section 0). Only anchor-CONSISTENT accounts carry trusted "
+                 "money (official_pnl_usd / reconstructed_our_series_usd); SUSPECT accounts are "
+                 "behavioral-only (money null). "
+                 + BENCH_NOTE.replace("<b>", "").replace("</b>", "")),
+        "references": refs,
+    }
+
+
 def build_md(rows: list[dict]) -> str:
     L = ["# Competitor operating manuals + strategy clones — final report", ""]
     L.append("**Verdict.** " + _verdict(rows).replace("<b>", "**").replace("</b>", "**"))
@@ -421,6 +464,8 @@ def main(argv: list[str] | None = None) -> int:
     odir.mkdir(parents=True, exist_ok=True)
     (odir / "final_report.html").write_text(build_html(rows), encoding="utf-8")
     (odir / "final_report.md").write_text(build_md(rows), encoding="utf-8")
+    (odir / "competitors.json").write_text(
+        json.dumps(build_competitors_json(_load_all_manuals()), indent=2), encoding="utf-8")
     n_clone = sum(1 for r in rows if r["clone"])
     n_man = sum(1 for r in rows if r["manual"])
     print(f"[final_report] {n_man} manuals + {n_clone} clones → {odir / 'final_report.html'} + .md")
