@@ -46,6 +46,16 @@ want max_open_notional                   5000  'max_open_notional (5000, HARD ba
 want starting_capital                    50000 'paper.starting_capital (50000 bankroll)'
 want feed_staleness_grace_ms             1500  'feed_staleness_grace_ms (1500; eu-west-1 Binance Mid p95 gap 1.4s — env-correct, see 2026-07-16 log)'
 want book_staleness_dwell_ms             1500  'book_staleness_dwell_ms (1500, filters transient rollover book churn)'
+# Paper venue latency (Phase 1.4 VPS recalibration): placement + cancel both
+# mean_ms=24 / jitter_ms=8 (measured clob REST p50 23.5 ms; p95−p50 ≈ 8). Two
+# sections share the key names, so assert by count rather than `val` (head -1).
+PLM=$(grep -cE '^[[:space:]]*mean_ms[[:space:]]*=[[:space:]]*24' "$CFG")
+PLJ=$(grep -cE '^[[:space:]]*jitter_ms[[:space:]]*=[[:space:]]*8' "$CFG")
+if [ "$PLM" -eq 2 ] && [ "$PLJ" -eq 2 ]; then
+  printf 'PASS  %-46s = %s\n' 'paper placement+cancel latency (mean 24 / jitter 8)' 'mean_ms=24 x2, jitter_ms=8 x2'
+else
+  printf 'FAIL  %-46s mean24 x%s jitter8 x%s (want x2 each)\n' 'paper latency != VPS rebench' "$PLM" "$PLJ"; FAIL=1
+fi
 
 # Layer 3 — model-taker + shadow enabled; fortress arbitration + model-taker earned
 # config (theta 0.03, fortress BTC->momentum / ETH->model) are the TESTED engine
