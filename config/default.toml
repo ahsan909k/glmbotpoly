@@ -132,6 +132,8 @@ taker_cooldown_ms = 5000
 soft_cap_excess_shares = 50      # quote deficit-reducing side only beyond this
 hard_cap_excess_shares = 100     # stop making entirely beyond this
 max_worst_case_loss_per_window = 25  # THE binding sizing constraint (§8)
+clip_size_shares = 0             # normalizer/taker per-order share clip; 0 = disabled. If set, must be >= touch_size and ladder_size_per_level.
+maker_deployment_budget_per_window = 0  # cumulative maker buy notional/window before new placements stop; 0 = unbounded
 
 # Hard-wired risk limits (CLAUDE.md §11).
 [risk]
@@ -143,6 +145,7 @@ sanity_bound = 0.10              # stand down when |fair - mid| exceeds this...
 sanity_bound_duration_ms = 3000  # ...for this long
 error_breaker_max_errors = 10    # API errors...
 error_breaker_window_ms = 60000  # ...within this window trip the breaker
+shadow_loss_stops = false        # PAPER-EVAL ONLY: true = DailyStop/WindowLoss compute but only RECORD (trading continues). Operational breakers stay hard. Keep false in real deployments.
 
 # Main run mode (`bot run`, CLAUDE.md §5): supervision tree + resilient startup
 # self-check. The bot refuses to TRADE until clocks are sane, discovery has

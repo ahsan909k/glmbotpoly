@@ -71,6 +71,12 @@ pub struct RiskParams {
     /// venue's post-restart post-only window is ~2 min, so a few seconds of
     /// cool-down after the last 425/503 is the conservative re-arm point).
     pub engine_restart_cooldown_ms: i64,
+    /// Paper-eval only, default `false`. When `true`, the two loss-based stops
+    /// (`DailyStop`, per-window `WindowLoss`) are computed exactly but only
+    /// RECORDED (a `ShadowStop`) instead of halting/cancelling — trading
+    /// continues. The operational breakers stay hard. Keep `false` in any real
+    /// deployment (CLAUDE.md §11).
+    pub shadow_loss_stops: bool,
 
     /// Whether the owned quote manager is driven (default `true`).
     pub quoter_enabled: bool,
@@ -115,6 +121,7 @@ impl Default for RiskParams {
             error_breaker_max_errors: 10,
             error_breaker_window_ms: 60_000,
             engine_restart_cooldown_ms: 5_000,
+            shadow_loss_stops: false,
             quoter_enabled: true,
             momentum_enabled: true,
             late_window_enabled: true,
@@ -150,6 +157,7 @@ mod tests {
         assert_eq!(p.sanity_bound_duration_ms, 3_000);
         assert_eq!(p.error_breaker_max_errors, 10);
         assert_eq!(p.error_breaker_window_ms, 60_000);
+        assert!(!p.shadow_loss_stops, "shadow loss stops off by default");
         assert!(p.quoter_enabled && p.momentum_enabled && p.late_window_enabled);
         // The model taker is off by default; the fortress map is the default
         // precedence (momentum wins BTC, model wins ETH), inert until enabled.

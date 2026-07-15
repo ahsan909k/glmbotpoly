@@ -95,6 +95,17 @@ pub struct EngineParams {
     /// Maximum worst-case loss per window — the binding constraint on all
     /// sizing (§8).
     pub max_worst_case_loss_per_window: Dollars,
+    /// Defense-in-depth clip cap (shares) enforced by the order normalizer:
+    /// every outgoing share-sized order (and each taker FAK clip) is capped at
+    /// this many shares. `0` (default) disables it. When set, `touch_size` and
+    /// `ladder_size_per_level` must not exceed it (a maker level may never be
+    /// bigger than the clip).
+    pub clip_size_shares: Size,
+    /// Per-window cumulative maker deployment budget (dollars of buy notional
+    /// filled). Once a window's cumulative maker buy fills reach this, the quote
+    /// manager stops OPENING new buys for that window (existing orders are still
+    /// managed/cancelled). `0` (default) = unbounded (existing behavior).
+    pub maker_deployment_budget_per_window: Dollars,
 }
 
 impl Default for EngineParams {
@@ -126,6 +137,8 @@ impl Default for EngineParams {
             soft_cap_excess_shares: shares(50),
             hard_cap_excess_shares: shares(100),
             max_worst_case_loss_per_window: Dollars::new(Decimal::from(25)),
+            clip_size_shares: Size::ZERO,
+            maker_deployment_budget_per_window: Dollars::ZERO,
         }
     }
 }
@@ -281,6 +294,28 @@ impl EngineParams {
             key("max_worst_case_loss_per_window"),
             "must be > 0 — this is the binding constraint on all sizing (§8)",
         );
+        v.require(
+            self.clip_size_shares.as_decimal() >= Decimal::ZERO,
+            key("clip_size_shares"),
+            "must be >= 0 (0 disables the clip)",
+        );
+        if !self.clip_size_shares.is_zero() {
+            v.require(
+                self.touch_size.as_decimal() <= self.clip_size_shares.as_decimal(),
+                key("clip_size_shares"),
+                "must be >= touch_size — a maker level may never exceed the clip",
+            );
+            v.require(
+                self.ladder_size_per_level.as_decimal() <= self.clip_size_shares.as_decimal(),
+                key("clip_size_shares"),
+                "must be >= ladder_size_per_level — a maker level may never exceed the clip",
+            );
+        }
+        v.require(
+            self.maker_deployment_budget_per_window.as_decimal() >= Decimal::ZERO,
+            key("maker_deployment_budget_per_window"),
+            "must be >= 0 (0 disables the budget)",
+        );
     }
 }
 
@@ -345,6 +380,10 @@ pub struct EngineParamsPatch {
     pub hard_cap_excess_shares: Option<Size>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_worst_case_loss_per_window: Option<Dollars>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clip_size_shares: Option<Size>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maker_deployment_budget_per_window: Option<Dollars>,
 }
 
 impl EngineParamsPatch {
@@ -403,6 +442,10 @@ impl EngineParamsPatch {
             max_worst_case_loss_per_window: self
                 .max_worst_case_loss_per_window
                 .unwrap_or(base.max_worst_case_loss_per_window),
+            clip_size_shares: self.clip_size_shares.unwrap_or(base.clip_size_shares),
+            maker_deployment_budget_per_window: self
+                .maker_deployment_budget_per_window
+                .unwrap_or(base.maker_deployment_budget_per_window),
         }
     }
 }
@@ -452,6 +495,8 @@ const STRUCTURAL_PARAM_KEYS: &[&str] = &[
     "soft_cap_excess_shares",
     "hard_cap_excess_shares",
     "max_worst_case_loss_per_window",
+    "clip_size_shares",
+    "maker_deployment_budget_per_window",
 ];
 
 /// A validated runtime parameter change: the safe-list `key` and the
@@ -851,6 +896,31 @@ mod tests {
                 .any(|x| x.key == "engine.series.BTC-5m.merge_min_pairs"),
             "expected a merge_min_pairs violation"
         );
+    }
+
+    #[test]
+    fn clip_size_smaller_than_a_maker_level_is_rejected() {
+        // clip 8, but the ladder places 10-share levels ⇒ a level would exceed
+        // the clip. touch_size 10 also exceeds it.
+        let mut cfg = EngineConfig::default();
+        cfg.defaults.clip_size_shares = shares(8);
+        let mut v = Violations::default();
+        cfg.validate_into(&mut v);
+        let violations = v.into_result().unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|x| x.key == "engine.series.BTC-5m.clip_size_shares"),
+            "a clip below a maker level must be rejected"
+        );
+    }
+
+    #[test]
+    fn clip_zero_disables_the_constraint() {
+        // The default clip is 0 (disabled), so the 10-share ladder is fine.
+        let mut v = Violations::default();
+        EngineConfig::default().validate_into(&mut v);
+        assert_eq!(v.into_result(), Ok(()));
     }
 
     #[test]

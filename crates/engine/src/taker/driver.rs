@@ -49,7 +49,7 @@ use super::edge::{TakePlan, plan_take};
 use super::signal::SignalWindow;
 use super::{MomentumTakerParams, NoTakeReason};
 use crate::arbitration::{FireLedger, TakerId};
-use crate::normalize::{NormalizerParams, OrderDraft, normalize};
+use crate::normalize::{NormalizerParams, OrderDraft, normalize, split_take_clips};
 use crate::quote_manager::RestingLookup;
 
 /// Seconds remaining to close, clamped at zero — computed inline so the driver
@@ -471,52 +471,66 @@ impl MomentumTaker {
         now: TimestampMs,
         arbiter: &mut FireLedger,
     ) {
-        let seq = self.next_seq();
         let open_ms = decision.market.window.open_time.as_millis();
-        let draft = OrderDraft {
-            client_id: Some(format!("mt:{open_ms}:{seq}")),
-            window: decision.market.window,
-            token_id: decision.token_id,
-            outcome: decision.outcome,
-            side: Side::Buy,
-            price: decision.plan.worst_price.as_decimal(),
-            qty: OrderQty::Notional(decision.plan.notional),
-            tif: TimeInForce::Fak,
-        };
-        // FAK is not post-only, so the normalizer's cross check is skipped — no
-        // book view needed. It only snaps the worst-price cap (already on-grid)
-        // and re-checks the $1 notional (guaranteed by plan_take).
-        let order = match normalize(&draft, &decision.market, None, &self.normalizer_params) {
-            Ok(n) => n.order,
-            Err(e) => {
-                tracing::warn!(target: "momentum-taker", reason = %e, "normalize rejected the FAK (unexpected — plan_take guarantees ≥$1 notional + on-grid worst price)");
-                return;
-            }
-        };
-        match port.place(&order).await {
-            Ok(acc) => {
-                if let Some(st) = self.windows.get_mut(&window) {
-                    st.our_orders.insert(acc.order_id.clone());
-                    st.pending
-                        .insert(acc.order_id.clone(), decision.plan.notional);
-                    st.last_take_ms = Some(now.as_millis());
+        // Split the planned take into sequential FAK clips of ≤ clip_size_shares
+        // (§8 burst pattern). With no clip configured this is one full-size FAK
+        // (byte-identical to the pre-clip behavior).
+        let clips = split_take_clips(
+            decision.plan.expected_shares,
+            decision.plan.worst_price,
+            decision.plan.notional,
+            self.normalizer_params.clip_size_shares,
+        );
+        let mut any_fired = false;
+        for clip_notional in clips {
+            let seq = self.next_seq();
+            let draft = OrderDraft {
+                client_id: Some(format!("mt:{open_ms}:{seq}")),
+                window: decision.market.window,
+                token_id: decision.token_id.clone(),
+                outcome: decision.outcome,
+                side: Side::Buy,
+                price: decision.plan.worst_price.as_decimal(),
+                qty: OrderQty::Notional(clip_notional),
+                tif: TimeInForce::Fak,
+            };
+            // FAK is not post-only, so the normalizer's cross check is skipped — no
+            // book view needed. It only snaps the worst-price cap (already on-grid)
+            // and re-checks the $1 notional (guaranteed by plan_take / clip split).
+            let order = match normalize(&draft, &decision.market, None, &self.normalizer_params) {
+                Ok(n) => n.order,
+                Err(e) => {
+                    tracing::warn!(target: "momentum-taker", reason = %e, "normalize rejected a FAK clip (skipping this clip)");
+                    continue;
                 }
-                self.order_window.insert(acc.order_id, window);
-                self.take_count += 1;
-                arbiter.record(TakerId::Momentum, window, now);
-                tracing::info!(
-                    target: "momentum-taker",
-                    outcome = %decision.outcome,
-                    worst = %decision.plan.worst_price,
-                    notional = %decision.plan.notional,
-                    shares = %decision.plan.expected_shares,
-                    edge = %decision.plan.aggregate_edge,
-                    "momentum take (FAK)"
-                );
+            };
+            match port.place(&order).await {
+                Ok(acc) => {
+                    if let Some(st) = self.windows.get_mut(&window) {
+                        st.our_orders.insert(acc.order_id.clone());
+                        st.pending.insert(acc.order_id.clone(), clip_notional);
+                        st.last_take_ms = Some(now.as_millis());
+                    }
+                    self.order_window.insert(acc.order_id, window);
+                    self.take_count += 1;
+                    any_fired = true;
+                    tracing::info!(
+                        target: "momentum-taker",
+                        outcome = %decision.outcome,
+                        worst = %decision.plan.worst_price,
+                        notional = %clip_notional,
+                        "momentum take (FAK clip)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(target: "momentum-taker", error = %e, "FAK place failed");
+                }
             }
-            Err(e) => {
-                tracing::warn!(target: "momentum-taker", error = %e, "FAK place failed");
-            }
+        }
+        // One arbitration record per fire (not per clip): the momentum taker owns
+        // this window for the arbitration span once it has fired at all.
+        if any_fired {
+            arbiter.record(TakerId::Momentum, window, now);
         }
     }
 

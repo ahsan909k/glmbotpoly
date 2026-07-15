@@ -43,7 +43,7 @@ use rust_decimal::prelude::ToPrimitive;
 use venue_api::VenueEvent;
 
 use super::params::RiskParams;
-use super::state::{GuardObservation, RiskStateSnapshot};
+use super::state::{GuardObservation, RiskStateSnapshot, ShadowStop};
 use crate::inventory::{InventoryEffect, InventoryManager};
 
 /// One decision the core hands back to the driver.
@@ -63,6 +63,11 @@ pub enum RiskOutput {
     CancelAll,
     /// Issue the authoritative cancel for one market (a per-window loss halt).
     CancelMarket(ConditionId),
+    /// A loss stop that WOULD have tripped but is only recorded (shadow-loss-stops
+    /// mode, §11 paper eval): trading continues. The driver logs it and buffers it
+    /// for [`take_shadow_stops`](super::RiskManager::take_shadow_stops) — never a
+    /// cancel or halt.
+    ShadowStop(ShadowStop),
 }
 
 /// Per-window fair-vs-mid sanity accounting (the `FairVsMid` breaker input).
@@ -126,6 +131,12 @@ pub(crate) struct RiskCore {
     daily_epoch_day: Option<i64>,
     daily_stop_latched: bool,
 
+    // shadow-loss-stops (§11 paper eval): compute the DailyStop/WindowLoss
+    // thresholds exactly, but record instead of halting/cancelling.
+    shadow_loss_stops: bool,
+    shadow_tripped: Vec<ShadowStop>,
+    shadow_window_latched: HashSet<WindowId>,
+
     // manual
     manual_latched: bool,
 
@@ -177,6 +188,9 @@ impl RiskCore {
             daily_realized: Dollars::ZERO,
             daily_epoch_day: None,
             daily_stop_latched: false,
+            shadow_loss_stops: params.shadow_loss_stops,
+            shadow_tripped: Vec::new(),
+            shadow_window_latched: HashSet::new(),
             manual_latched: false,
             open_orders: HashMap::new(),
             open_notional: Dollars::ZERO,
@@ -219,6 +233,14 @@ impl RiskCore {
         // plus linger, so no late book event can arrive for them.
         self.ended_windows
             .retain(|w| w.open_time.as_millis() >= cutoff.as_millis());
+        // Drop any lingering shadow-loss records for old windows (normally already
+        // pruned on Closed/Resolved — belt-and-suspenders for 24/7).
+        self.shadow_window_latched
+            .retain(|w| w.open_time.as_millis() >= cutoff.as_millis());
+        self.shadow_tripped.retain(|s| {
+            s.window
+                .is_none_or(|w| w.open_time.as_millis() >= cutoff.as_millis())
+        });
         self.inv.prune_settled_before(cutoff)
     }
 
@@ -233,6 +255,7 @@ impl RiskCore {
             error_count: u32::try_from(self.infra_errors.len()).unwrap_or(u32::MAX),
             sanity_breached: self.sanity.values().any(|s| s.breach_since.is_some()),
             globally_halted: !self.tripped.is_empty(),
+            shadow_tripped: self.shadow_tripped.clone(),
         }
     }
 
@@ -442,6 +465,7 @@ impl RiskCore {
             WindowLifecycle::Closed => {
                 self.prune_window_sanity(window, now, out);
                 self.end_window_book_health(window, now, out);
+                self.prune_window_shadow(window);
             }
             WindowLifecycle::Resolved { .. } => {
                 for eff in self.inv.on_event(event) {
@@ -452,6 +476,7 @@ impl RiskCore {
                 self.resume_window(window, out);
                 self.prune_window_sanity(window, now, out);
                 self.end_window_book_health(window, now, out);
+                self.prune_window_shadow(window);
             }
         }
     }
@@ -471,6 +496,13 @@ impl RiskCore {
         if removed {
             self.recompute_sanity(now, out);
         }
+    }
+
+    /// Drops a window's shadow-loss-stop record + latch on Closed/Resolved, so a
+    /// recorded would-be `WindowLoss` does not linger (bounds memory for 24/7).
+    fn prune_window_shadow(&mut self, window: WindowId) {
+        self.shadow_window_latched.remove(&window);
+        self.shadow_tripped.retain(|s| s.window != Some(window));
     }
 
     /// Marks a window ended and purges its book-health from the global breakers.
@@ -494,7 +526,7 @@ impl RiskCore {
     }
 
     /// Folds one venue-stream item.
-    pub(crate) fn on_venue_event(&mut self, ve: &VenueEvent, _now: TimestampMs) -> Vec<RiskOutput> {
+    pub(crate) fn on_venue_event(&mut self, ve: &VenueEvent, now: TimestampMs) -> Vec<RiskOutput> {
         let mut out = Vec::new();
         match ve {
             VenueEvent::Order(u) => {
@@ -516,6 +548,7 @@ impl RiskCore {
                         self.check_window_loss(
                             snap.window,
                             snap.worst_case_if_excess_loses,
+                            now,
                             &mut out,
                         );
                     }
@@ -640,25 +673,43 @@ impl RiskCore {
         &mut self,
         window: WindowId,
         worst_case: Dollars,
+        now: TimestampMs,
         out: &mut Vec<RiskOutput>,
     ) {
-        if self.halted_windows.contains(&window) {
-            return;
-        }
         let Some(cap) = self.series_caps.get(&window.series).copied() else {
             return; // unconfigured series — nothing to enforce against
         };
-        if worst_case > cap {
-            let first = self.halted_windows.is_empty();
-            self.halted_windows.insert(window);
-            if first {
-                out.push(RiskOutput::Announce(RiskEvent::BreakerTripped {
-                    breaker: BreakerKind::WindowLoss,
-                }));
+        if worst_case <= cap {
+            return;
+        }
+        // Shadow-loss-stops (paper eval): record the would-be WindowLoss trip once
+        // per window crossing and keep trading — no halt, no cancel-market.
+        if self.shadow_loss_stops {
+            if self.shadow_window_latched.insert(window) {
+                let s = ShadowStop {
+                    kind: BreakerKind::WindowLoss,
+                    window: Some(window),
+                    threshold: cap,
+                    value: worst_case,
+                    ts: now,
+                };
+                self.shadow_tripped.push(s);
+                out.push(RiskOutput::ShadowStop(s));
             }
-            if let Some(cid) = self.window_cids.get(&window).cloned() {
-                out.push(RiskOutput::CancelMarket(cid));
-            }
+            return;
+        }
+        if self.halted_windows.contains(&window) {
+            return;
+        }
+        let first = self.halted_windows.is_empty();
+        self.halted_windows.insert(window);
+        if first {
+            out.push(RiskOutput::Announce(RiskEvent::BreakerTripped {
+                breaker: BreakerKind::WindowLoss,
+            }));
+        }
+        if let Some(cid) = self.window_cids.get(&window).cloned() {
+            out.push(RiskOutput::CancelMarket(cid));
         }
     }
 
@@ -675,12 +726,32 @@ impl RiskCore {
         if self.daily_epoch_day != Some(day) {
             self.daily_realized = Dollars::ZERO;
             self.daily_epoch_day = Some(day);
+            // A new UTC day: in shadow mode, re-arm the DailyStop shadow so a new
+            // day can shadow again (in hard mode the latch stays until `Reset`).
+            if self.shadow_loss_stops {
+                self.daily_stop_latched = false;
+                self.shadow_tripped
+                    .retain(|s| s.kind != BreakerKind::DailyStop);
+            }
         }
         self.daily_realized = self.daily_realized + realized;
         let neg_limit = -self.daily_stop_loss.as_decimal();
         if self.daily_realized.as_decimal() <= neg_limit && !self.daily_stop_latched {
             self.daily_stop_latched = true;
-            self.trip_global(BreakerKind::DailyStop, out);
+            if self.shadow_loss_stops {
+                // Record the would-be DailyStop and keep trading (no evacuation).
+                let s = ShadowStop {
+                    kind: BreakerKind::DailyStop,
+                    window: None,
+                    threshold: self.daily_stop_loss,
+                    value: self.daily_realized,
+                    ts,
+                };
+                self.shadow_tripped.push(s);
+                out.push(RiskOutput::ShadowStop(s));
+            } else {
+                self.trip_global(BreakerKind::DailyStop, out);
+            }
         }
     }
 }
@@ -883,6 +954,28 @@ mod tests {
     }
     fn has_cancel_all(out: &[RiskOutput]) -> bool {
         out.iter().any(|o| matches!(o, RiskOutput::CancelAll))
+    }
+    /// The breaker kinds carried by any `RiskOutput::ShadowStop` in the outputs.
+    fn shadow_kinds(out: &[RiskOutput]) -> Vec<BreakerKind> {
+        out.iter()
+            .filter_map(|o| match o {
+                RiskOutput::ShadowStop(s) => Some(s.kind),
+                _ => None,
+            })
+            .collect()
+    }
+    fn has_cancel_market(out: &[RiskOutput]) -> bool {
+        out.iter().any(|o| matches!(o, RiskOutput::CancelMarket(_)))
+    }
+    fn shadow_core(daily_stop_loss: Decimal) -> RiskCore {
+        let mut caps = HashMap::new();
+        caps.insert(series(), Dollars::new(Decimal::from(25)));
+        let params = RiskParams {
+            daily_stop_loss: Dollars::new(daily_stop_loss),
+            shadow_loss_stops: true,
+            ..RiskParams::default()
+        };
+        RiskCore::new(&params, caps)
     }
 
     fn open_window(c: &mut RiskCore) {
@@ -1237,6 +1330,98 @@ mod tests {
         assert!(!c.snapshot().is_tripped(BreakerKind::DailyStop));
         assert!(c.snapshot().is_tripped(BreakerKind::Manual));
         assert!(c.is_globally_halted(), "manual kill still halts");
+    }
+
+    // ---- shadow loss stops (paper eval) ------------------------------------
+
+    #[test]
+    fn shadow_daily_stop_records_but_does_not_halt() {
+        let mut c = shadow_core(Decimal::from(5));
+        open_window(&mut c);
+        // Buy 50 Up @ 0.40 (−$20 cash, worst-case $20 < $25 cap ⇒ no window shadow);
+        // resolve Down ⇒ realized −$20 ≤ −$5.
+        let _ = c.on_venue_event(
+            &fill(Outcome::Up, Side::Buy, dec!(0.40), dec!(50)),
+            ts(OPEN_MS),
+        );
+        let out = c.on_event(
+            &win_event(WindowLifecycle::Resolved {
+                outcome: Outcome::Down,
+            }),
+            ts(CLOSE_MS),
+        );
+        // A DailyStop shadow is recorded — but nothing tripped or cancelled.
+        assert_eq!(shadow_kinds(&out), vec![BreakerKind::DailyStop]);
+        assert!(!c.snapshot().is_tripped(BreakerKind::DailyStop));
+        assert!(!c.is_globally_halted());
+        assert!(!has_cancel_all(&out));
+        assert!(
+            tripped_in(&out).is_empty(),
+            "no hard breaker announced under shadow"
+        );
+        let snap = c.snapshot();
+        assert_eq!(snap.shadow_tripped.len(), 1);
+        assert_eq!(snap.shadow_tripped[0].kind, BreakerKind::DailyStop);
+        assert_eq!(snap.shadow_tripped[0].window, None);
+    }
+
+    #[test]
+    fn shadow_window_loss_records_but_does_not_halt() {
+        let mut c = shadow_core(Decimal::from(200));
+        open_window(&mut c);
+        // 100 Up @ 0.40 = $40 worst-case vs the $25 series cap.
+        let out = c.on_venue_event(
+            &fill(Outcome::Up, Side::Buy, dec!(0.40), dec!(100)),
+            ts(OPEN_MS),
+        );
+        assert_eq!(shadow_kinds(&out), vec![BreakerKind::WindowLoss]);
+        assert!(
+            c.halted_windows().is_empty(),
+            "the window is NOT halted under shadow"
+        );
+        assert!(!has_cancel_market(&out), "no cancel-market under shadow");
+        assert!(!c.is_globally_halted());
+        // Latched: a further over-cap fill on the same window does not re-record.
+        let out2 = c.on_venue_event(
+            &fill(Outcome::Up, Side::Buy, dec!(0.40), dec!(10)),
+            ts(OPEN_MS + 1),
+        );
+        assert!(
+            shadow_kinds(&out2).is_empty(),
+            "the window-loss shadow fires once per crossing"
+        );
+        let snap = c.snapshot();
+        assert_eq!(snap.shadow_tripped.len(), 1);
+        assert_eq!(snap.shadow_tripped[0].kind, BreakerKind::WindowLoss);
+        assert_eq!(snap.shadow_tripped[0].window, Some(window()));
+        // Resolution prunes the recorded shadow (bounded memory).
+        let _ = c.on_event(
+            &win_event(WindowLifecycle::Resolved {
+                outcome: Outcome::Down,
+            }),
+            ts(CLOSE_MS),
+        );
+        assert!(c.snapshot().shadow_tripped.is_empty());
+    }
+
+    #[test]
+    fn operational_breakers_still_hard_under_shadow() {
+        let mut c = shadow_core(Decimal::from(200));
+        open_window(&mut c);
+        // Fast-feed staleness still hard-halts + cancels under shadow.
+        let _ = c.on_event(&binance_mid(dec!(60000), OPEN_MS), ts(OPEN_MS));
+        let out = c.on_tick(ts(OPEN_MS + 600));
+        assert_eq!(tripped_in(&out), vec![BreakerKind::FeedStale]);
+        assert!(has_cancel_all(&out));
+        assert!(c.is_globally_halted());
+        assert!(
+            shadow_kinds(&out).is_empty(),
+            "operational breakers are never shadowed"
+        );
+        // A manual kill also hard-halts under shadow.
+        let out = c.on_event(&Event::Control(ControlEvent::Kill), ts(OPEN_MS + 700));
+        assert!(tripped_in(&out).contains(&BreakerKind::Manual));
+        assert!(has_cancel_all(&out));
     }
 
     // ---- sanity (fair vs mid) ----------------------------------------------

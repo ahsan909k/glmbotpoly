@@ -78,6 +78,11 @@ pub struct QuoteManagerParams {
     /// documented 15-order limit internally; this is a defensive cap so a single
     /// converge never exceeds it (a two-sided 3-level ladder is 6).
     pub max_batch: usize,
+    /// Per-window cumulative maker deployment budget (dollars of buy notional
+    /// filled). Once a window's cumulative maker buy fills reach this, the
+    /// manager stops OPENING new buys for that window (cancels still flow).
+    /// `ZERO` (default) = unbounded — the pre-budget behavior.
+    pub maker_deployment_budget_per_window: core_types::Dollars,
 }
 
 impl Default for QuoteManagerParams {
@@ -87,6 +92,7 @@ impl Default for QuoteManagerParams {
             cancel_market_theta: 0.02,
             min_requote_interval_ms: 250,
             max_batch: 15,
+            maker_deployment_budget_per_window: core_types::Dollars::ZERO,
         }
     }
 }

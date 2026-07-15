@@ -24,8 +24,8 @@ use std::time::Duration;
 use core_types::{
     AnchorSource, Asset, BookLevel, BookSnapshot, ConditionId, Decimal, Dollars, DurationMs, Event,
     FeeParams, InputAges, MarketInfo, ModelHealth, ModelHealthReason, ModelSnapshot, OrderState,
-    Price, ResolutionSource, RoundDir, Series, Size, TickSize, TimestampMs, TokenId, TokenPair,
-    WindowDuration, WindowId, WindowLifecycle,
+    OrderUpdate, Price, ResolutionSource, RoundDir, Series, Size, TickSize, TimestampMs, TokenId,
+    TokenPair, WindowDuration, WindowId, WindowLifecycle,
 };
 use engine::{QuoteManagerParams, RiskManager, RiskParams};
 use rust_decimal::dec;
@@ -166,6 +166,45 @@ fn quoter_only_risk() -> RiskManager {
         caps.insert(s, Dollars::new(Decimal::from(10_000)));
     }
     RiskManager::new(params, caps)
+}
+
+/// A quoter-only risk manager with a per-window maker deployment budget.
+fn quoter_only_risk_with_budget(deployment_budget: Dollars) -> RiskManager {
+    let params = RiskParams {
+        quote_manager: QuoteManagerParams {
+            min_requote_interval_ms: 10,
+            maker_deployment_budget_per_window: deployment_budget,
+            ..QuoteManagerParams::default()
+        },
+        momentum_enabled: false,
+        late_window_enabled: false,
+        ..RiskParams::default()
+    };
+    let mut caps = HashMap::new();
+    for s in Series::ALL {
+        caps.insert(s, Dollars::new(Decimal::from(10_000)));
+    }
+    RiskManager::new(params, caps)
+}
+
+/// A terminal "Filled" order-update for a real placed maker order. Folded by the
+/// quoter it accrues `price × filled_size` to that window's deployment via the
+/// order-update fill-delta attribution (only our OWN orders count toward the
+/// budget — a taker's fill on the same window never does).
+fn order_filled(u: &OrderUpdate) -> VenueEvent {
+    VenueEvent::Order(Arc::new(OrderUpdate {
+        order_id: u.order_id.clone(),
+        window: u.window,
+        token_id: u.token_id.clone(),
+        side: u.side,
+        state: OrderState::Filled,
+        price: u.price,
+        original_size: u.original_size,
+        filled_size: u.original_size,
+        reject_reason: None,
+        ts_venue: u.ts_venue,
+        ts_local: u.ts_local,
+    }))
 }
 
 fn params() -> PaperParams {
@@ -366,4 +405,77 @@ async fn closing_one_window_leaves_siblings_resting() {
     );
     assert!(!risk.state_snapshot().any_tripped(), "guard transparent");
     venue.shutdown();
+}
+
+// ---- (c) per-window maker deployment budget gates new placements ----------
+
+/// Arms BTC-5m, converges the maker's ladder, fully fills every placed order
+/// (deployment accrues from our own order-update fill deltas), then converges
+/// again. Returns the number of NEW maker orders opened on the second converge —
+/// 0 iff the deployment budget gated the freed slots' replacement.
+async fn deployment_budget_case(budget: Dollars) -> usize {
+    let start = tokio::time::Instant::now();
+    let mut venue = PaperVenue::spawn(params(), move || {
+        TimestampMs::from_millis(BASE_MS + i64::try_from(start.elapsed().as_millis()).unwrap_or(0))
+    });
+    let mut rx = venue.take_event_rx().expect("event rx");
+    let mut risk = quoter_only_risk_with_budget(budget);
+    let now = || {
+        TimestampMs::from_millis(BASE_MS + i64::try_from(start.elapsed().as_millis()).unwrap_or(0))
+    };
+    let btc5m = Series::ALL[0];
+
+    arm_series(&venue, &mut risk, btc5m, &now).await;
+
+    // First converge: the maker places its ladder (real, owned orders).
+    risk.on_tick(&venue, now()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut recorded = Vec::new();
+    drain(&mut rx, &mut risk, &venue, &now, &mut recorded).await;
+
+    // Fully fill every placed order — deployment accrues ONLY from our own
+    // order-update fill deltas (a taker's fill would not count).
+    let fills: Vec<VenueEvent> = recorded
+        .iter()
+        .filter_map(|ev| match ev {
+            VenueEvent::Order(u) if u.state == OrderState::Open => Some(order_filled(u)),
+            _ => None,
+        })
+        .collect();
+    assert!(!fills.is_empty(), "the first converge must place a ladder");
+    for f in &fills {
+        risk.on_venue_event(f, &venue, now()).await;
+    }
+
+    // Second converge: the filled slots are now empty. With the budget exhausted
+    // the maker does NOT re-open them; unbounded (budget 0) it re-quotes.
+    let before = recorded.len();
+    risk.on_tick(&venue, now()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drain(&mut rx, &mut risk, &venue, &now, &mut recorded).await;
+    let new_opens = recorded[before..]
+        .iter()
+        .filter(|ev| matches!(ev, VenueEvent::Order(u) if u.state == OrderState::Open))
+        .count();
+
+    assert!(!risk.state_snapshot().any_tripped(), "guard transparent");
+    venue.shutdown();
+    new_opens
+}
+
+#[tokio::test(start_paused = true)]
+async fn maker_deployment_budget_gates_new_placements() {
+    // A $5 budget is below the fully-filled ladder's deployment ⇒ the freed
+    // slots are not re-opened on the next converge.
+    let gated = deployment_budget_case(Dollars::new(dec!(5))).await;
+    assert_eq!(
+        gated, 0,
+        "deployment over the budget ⇒ no new maker buys opened"
+    );
+    // Budget 0 is unbounded ⇒ the maker re-quotes the freed slots.
+    let unbounded = deployment_budget_case(Dollars::ZERO).await;
+    assert!(
+        unbounded > 0,
+        "a zero budget is unbounded ⇒ the maker re-quotes the freed slots"
+    );
 }

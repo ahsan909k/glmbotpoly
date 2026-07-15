@@ -73,6 +73,7 @@ use crate::feed::{binance_params, clob_params, depth_params, rtds_params, shadow
 use crate::model_runtime::ModelRuntime;
 use crate::model_taker_record::{ModelTakerDecision, ModelTakerRecorder};
 use crate::paper::paper_params;
+use crate::shadow_stops_record::{ShadowStopRecord, ShadowStopsRecorder};
 use crate::timecfg::{ntp_params, skew_params, std_duration};
 
 // ---- cadences + capacities -------------------------------------------------
@@ -85,6 +86,10 @@ const BUS_CAP: usize = 256;
 const SHADOW_UPDATE_CAP: usize = 256;
 /// Directory for the model-taker decision side-channel (`model-taker-*.jsonl.gz`).
 const MODEL_TAKER_DIR: &str = "data/model-taker";
+/// Directory for the shadow-loss-stop side channel (`shadow-stops-*.jsonl.gz`).
+const SHADOW_STOPS_DIR: &str = "data/shadow-stops";
+/// Channel capacity for the (low-rate) shadow-stop recorder.
+const SHADOW_STOPS_CHANNEL_CAP: usize = 4_096;
 /// Window-announcement (→ clob) and market-lifecycle (clob → scheduler) capacity.
 const WINDOW_CAP: usize = 64;
 /// Control-request channel capacity (dashboard → loop).
@@ -142,6 +147,7 @@ pub(crate) fn quote_manager_params(e: &EngineParams) -> QuoteManagerParams {
     QuoteManagerParams {
         reprice_threshold_theta: e.reprice_threshold_theta,
         cancel_market_theta: e.cancel_market_theta,
+        maker_deployment_budget_per_window: e.maker_deployment_budget_per_window,
         ..QuoteManagerParams::default()
     }
 }
@@ -173,10 +179,18 @@ pub(crate) fn late_window_params(e: &EngineParams) -> LateWindowTakerParams {
 
 /// The order normalizer's params. `size_decimals` has no config key (the venue's
 /// true share precision must be verified live, per the normalizer docs), so the
-/// engine default (whole shares) stands.
+/// engine default (whole shares) stands. `clip_size_shares` maps from config: `0`
+/// disables the clip (`None`), any positive value caps every share-sized order.
 #[must_use]
-pub(crate) fn normalizer_params(_e: &EngineParams) -> NormalizerParams {
-    NormalizerParams::default()
+pub(crate) fn normalizer_params(e: &EngineParams) -> NormalizerParams {
+    NormalizerParams {
+        clip_size_shares: if e.clip_size_shares.is_zero() {
+            None
+        } else {
+            Some(e.clip_size_shares.as_decimal())
+        },
+        ..NormalizerParams::default()
+    }
 }
 
 /// Maps `config.model_taker` into the model taker's engine params (`price_cap`
@@ -261,6 +275,7 @@ pub(crate) fn risk_params(config: &AppConfig) -> RiskParams {
         error_breaker_max_errors: r.error_breaker_max_errors,
         error_breaker_window_ms: r.error_breaker_window_ms.as_millis(),
         engine_restart_cooldown_ms: RiskParams::default().engine_restart_cooldown_ms,
+        shadow_loss_stops: r.shadow_loss_stops,
         quoter_enabled: true,
         momentum_enabled: true,
         late_window_enabled: true,
@@ -720,6 +735,22 @@ async fn run(
         None
     };
 
+    // Shadow-loss-stop recorder (paper eval): spawned only when the risk manager
+    // runs the loss stops in shadow mode. Non-critical; a write failure never
+    // touches the engine.
+    let shadow_stops_recorder = if config.risk.shadow_loss_stops {
+        match ShadowStopsRecorder::spawn(PathBuf::from(SHADOW_STOPS_DIR), SHADOW_STOPS_CHANNEL_CAP)
+        {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::warn!(target: "risk", error = %e, "shadow-stops recorder disabled (dir unwritable)");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Timers.
     let mut sample = interval(SAMPLE_PERIOD);
     let mut heartbeat = interval(MODEL_HEARTBEAT);
@@ -972,6 +1003,7 @@ async fn run(
                     if order_path_open || safety {
                         risk.on_event(&event, &venue, now).await;
                         drain_risk(&mut risk, &recorder, &handle, now);
+                        drain_shadow_stops(&mut risk, shadow_stops_recorder.as_ref(), now);
                     }
                     for effect in inventory.on_event(&event) {
                         publish_inventory_effect(&handle, &recorder, effect, now);
@@ -985,6 +1017,8 @@ async fn run(
                         &ve, &venue, &mut risk, &mut inventory, &mut working,
                         &recorder, &handle, wall_now(),
                     ).await;
+                    // A fill may have crossed a per-window loss cap in shadow mode.
+                    drain_shadow_stops(&mut risk, shadow_stops_recorder.as_ref(), wall_now());
                 }
             }
             ev = clob_market_rx.recv() => {
@@ -1149,6 +1183,16 @@ async fn run(
             "decision journal flushed"
         );
     }
+    // Flush + finalize the shadow-loss-stop side channel.
+    if let Some(rec) = shadow_stops_recorder {
+        let stats = rec.finish();
+        tracing::info!(
+            target: "risk",
+            written = stats.written,
+            dropped = stats.dropped,
+            "shadow-stop journal flushed"
+        );
+    }
     tracing::info!(target: "run", "bot run shut down cleanly");
     Ok(())
 }
@@ -1217,6 +1261,23 @@ fn drain_risk(
     for ev in risk.take_published() {
         recorder.record(&ev);
         handle.project(Mode::Paper, &ev, now);
+    }
+}
+
+/// Drains the risk manager's would-be loss stops (shadow-loss-stops paper eval)
+/// onto the side-channel recorder. Always a no-op unless `shadow_loss_stops` is
+/// enabled — `take_shadow_stops` returns an empty vec — but is called even
+/// without a recorder so the buffer is never left to grow.
+fn drain_shadow_stops(
+    risk: &mut RiskManager,
+    recorder: Option<&ShadowStopsRecorder>,
+    now: TimestampMs,
+) {
+    let stops = risk.take_shadow_stops();
+    if let Some(rec) = recorder {
+        for s in &stops {
+            rec.record(ShadowStopRecord::from_stop(s, now));
+        }
     }
 }
 

@@ -75,6 +75,14 @@ pub struct NormalizerParams {
     /// venue's true precision must be verified live (see the Decisions Log).
     /// Default `0` = whole shares.
     pub size_decimals: u32,
+    /// Defense-in-depth clip cap on a share-sized order (CLAUDE.md §8). `None`
+    /// (default) disables it. When `Some(cap)`, a [`OrderQty::Shares`] order
+    /// larger than `cap` is clipped down to `cap` (flagged
+    /// [`Adjustments::size_clipped`]) *before* the min-size logic — a clip is
+    /// always ≥ the 5-share venue minimum in practice. Marketable-BUY notional
+    /// orders carry no share count and are unaffected; the takers enforce the
+    /// same cap by splitting a FAK into ≤`cap`-share clips ([`split_take_clips`]).
+    pub clip_size_shares: Option<Decimal>,
 }
 
 /// How the draft price was moved onto the grid.
@@ -105,6 +113,11 @@ pub struct Adjustments {
     /// / market minimum). Explicitly flagged: bumping up is allowed, silently
     /// reducing below intent is not (CLAUDE.md §7).
     pub size_bumped_to_min: bool,
+    /// The desired share size exceeded [`NormalizerParams::clip_size_shares`] and
+    /// was clipped down to that cap (defense-in-depth, §8). `false` when no clip
+    /// is configured or the size was already within it, and always `false` for a
+    /// marketable-BUY notional order.
+    pub size_clipped: bool,
 }
 
 /// A normalized order plus the audit trail of what was adjusted.
@@ -219,7 +232,9 @@ pub fn normalize(
     };
 
     // 3. Quantity: notional minimum (marketable BUY) or share minimum + precision.
-    let (qty, size_rounded_down, size_bumped_to_min) = match &draft.qty {
+    //    A share order is clipped to `clip_size_shares` FIRST (defense in depth,
+    //    §8), before the min-size floor — a clip is always ≥ the 5-share minimum.
+    let (qty, size_rounded_down, size_bumped_to_min, size_clipped) = match &draft.qty {
         OrderQty::Notional(dollars) => {
             if dollars.as_decimal() < MIN_NOTIONAL {
                 return Err(NormalizeReject::BelowMinNotional {
@@ -227,12 +242,18 @@ pub fn normalize(
                     min: MIN_NOTIONAL,
                 });
             }
-            (OrderQty::Notional(*dollars), false, false)
+            (OrderQty::Notional(*dollars), false, false, false)
         }
         OrderQty::Shares(size) => {
+            let (clipped, size_clipped) = clip_shares(*size, params);
             let (final_size, rounded_down, bumped) =
-                normalize_shares(*size, snapped, market, params)?;
-            (OrderQty::Shares(final_size), rounded_down, bumped)
+                normalize_shares(clipped, snapped, market, params)?;
+            (
+                OrderQty::Shares(final_size),
+                rounded_down,
+                bumped,
+                size_clipped,
+            )
         }
     };
 
@@ -260,8 +281,60 @@ pub fn normalize(
             price,
             size_rounded_down,
             size_bumped_to_min,
+            size_clipped,
         },
     })
+}
+
+/// Clips a desired share size down to [`NormalizerParams::clip_size_shares`] when
+/// it exceeds the cap, returning `(clipped_size, was_clipped)`. A no-op when no
+/// clip is configured or the size is already within it. Never widens; on the
+/// (unreachable) event the cap is not a valid [`Size`] the original size is kept.
+fn clip_shares(size: Size, params: &NormalizerParams) -> (Size, bool) {
+    if let Some(cap) = params.clip_size_shares
+        && cap > Decimal::ZERO
+        && size.as_decimal() > cap
+        && let Ok(clipped) = Size::new(cap)
+    {
+        return (clipped, true);
+    }
+    (size, false)
+}
+
+/// Splits a marketable-BUY take into sequential FAK clip notionals (CLAUDE.md §8
+/// clip-splitting / the burst pattern). Each returned value is one FAK's
+/// `OrderQty::Notional`; the shared `worst_price` is the slippage cap on every
+/// clip. The venue's own depth walk still bounds the actual fill (§9
+/// conservatism): a clip only ever fills against real displayed asks.
+///
+/// - `clip == None` → one clip carrying the whole `total_notional` — the pre-clip
+///   single-FAK behavior, byte-identical.
+/// - `clip == Some(cap)` (`cap > 0`) → `ceil(expected_shares / cap)` clips of at
+///   most `cap` shares each, each priced at `worst_price` (per-clip notional =
+///   `clip_shares × worst_price`).
+#[must_use]
+pub(crate) fn split_take_clips(
+    expected_shares: Size,
+    worst_price: Price,
+    total_notional: core_types::Dollars,
+    clip: Option<Decimal>,
+) -> Vec<core_types::Dollars> {
+    let cap = match clip {
+        Some(c) if c > Decimal::ZERO => c,
+        _ => return vec![total_notional],
+    };
+    let wp = worst_price.as_decimal();
+    let mut remaining = expected_shares.as_decimal();
+    let mut clips = Vec::new();
+    while remaining > Decimal::ZERO {
+        let clip_shares = remaining.min(cap);
+        clips.push(core_types::Dollars::new(clip_shares * wp));
+        remaining -= clip_shares;
+    }
+    if clips.is_empty() {
+        clips.push(total_notional);
+    }
+    clips
 }
 
 /// Enforces the §7 quantity-kind convention; reuses `venue-live::convert`'s
@@ -881,6 +954,112 @@ mod tests {
                 assert!(s * rp >= MIN_NOTIONAL, "notional {} < $1", s * rp);
             }
         }
+    }
+
+    // ---- clip cap (Feature B) --------------------------------------------
+
+    #[test]
+    fn clip_caps_share_size_and_flags_it() {
+        let m = mkt(TickSize::T001);
+        // A 200-share draft with a 60-share clip → a 60-share order, flagged.
+        let params = NormalizerParams {
+            clip_size_shares: Some(dec!(60)),
+            ..NormalizerParams::default()
+        };
+        let n = normalize(
+            &draft(Side::Buy, dec!(0.50), shares(dec!(200)), gtc_po()),
+            &m,
+            None,
+            &params,
+        )
+        .unwrap();
+        assert_eq!(shares_of(&n), dec!(60));
+        assert!(n.adjustments.size_clipped);
+        assert!(!n.adjustments.size_bumped_to_min);
+        assert!(!n.adjustments.size_rounded_down);
+    }
+
+    #[test]
+    fn no_clip_passes_the_full_size_through() {
+        let m = mkt(TickSize::T001);
+        // Default clip (None) leaves a 200-share order untouched.
+        let n = ok(Side::Buy, dec!(0.50), shares(dec!(200)), gtc_po(), &m, None);
+        assert_eq!(shares_of(&n), dec!(200));
+        assert!(!n.adjustments.size_clipped);
+        // A size at or below the cap is not clipped either.
+        let params = NormalizerParams {
+            clip_size_shares: Some(dec!(60)),
+            ..NormalizerParams::default()
+        };
+        let n2 = normalize(
+            &draft(Side::Buy, dec!(0.50), shares(dec!(50)), gtc_po()),
+            &m,
+            None,
+            &params,
+        )
+        .unwrap();
+        assert_eq!(shares_of(&n2), dec!(50));
+        assert!(!n2.adjustments.size_clipped);
+    }
+
+    #[test]
+    fn marketable_buy_notional_is_never_clipped() {
+        // A marketable BUY carries a dollar notional, not a share count — the
+        // clip cannot apply, and `size_clipped` stays false.
+        let m = mkt(TickSize::T001);
+        let params = NormalizerParams {
+            clip_size_shares: Some(dec!(60)),
+            ..NormalizerParams::default()
+        };
+        let n = normalize(
+            &draft(
+                Side::Buy,
+                dec!(0.50),
+                notional(dec!(1000)),
+                TimeInForce::Fak,
+            ),
+            &m,
+            None,
+            &params,
+        )
+        .unwrap();
+        assert_eq!(n.order.qty, notional(dec!(1000)));
+        assert!(!n.adjustments.size_clipped);
+    }
+
+    // ---- taker clip-splitting (Feature C) --------------------------------
+
+    #[test]
+    fn split_take_clips_none_is_a_single_full_notional() {
+        let clips = super::split_take_clips(
+            Size::new(dec!(12.5)).unwrap(),
+            p(dec!(0.80), TickSize::T001),
+            Dollars::new(dec!(10)),
+            None,
+        );
+        assert_eq!(clips, vec![Dollars::new(dec!(10))]);
+    }
+
+    #[test]
+    fn split_take_clips_caps_each_clip_at_the_share_cap() {
+        // 12.5 shares, cap 5 → clips 5, 5, 2.5 → notionals 4, 4, 2 (× 0.80).
+        let clips = super::split_take_clips(
+            Size::new(dec!(12.5)).unwrap(),
+            p(dec!(0.80), TickSize::T001),
+            Dollars::new(dec!(10)),
+            Some(dec!(5)),
+        );
+        assert_eq!(
+            clips,
+            vec![
+                Dollars::new(dec!(4)),
+                Dollars::new(dec!(4)),
+                Dollars::new(dec!(2)),
+            ]
+        );
+        // The clip notionals sum to the plan notional (no over/under spend here).
+        let total: Decimal = clips.iter().map(|d| d.as_decimal()).sum();
+        assert_eq!(total, dec!(10));
     }
 
     #[test]

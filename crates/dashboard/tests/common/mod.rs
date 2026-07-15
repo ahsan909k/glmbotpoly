@@ -335,6 +335,7 @@ pub fn risk_snapshot() -> RiskStateSnapshot {
         error_count: 0,
         sanity_breached: false,
         globally_halted: false,
+        shadow_tripped: Vec::new(),
     }
 }
 

@@ -29,7 +29,7 @@ use venue_api::{VenueEvent, VenuePort};
 use super::core::{RiskCore, RiskOutput};
 use super::guard::GuardedPort;
 use super::params::RiskParams;
-use super::state::{GateState, GuardObservation, RiskStateSnapshot};
+use super::state::{GateState, GuardObservation, RiskStateSnapshot, ShadowStop};
 use crate::arbitration::FireLedger;
 use crate::late_window::LateWindowTaker;
 use crate::model_taker::{ModelPrediction, ModelTakeOutcome, ModelTaker};
@@ -63,6 +63,9 @@ pub struct RiskManager {
     arbiter: FireLedger,
     /// Breaker events to publish on the bus, drained by the orchestrator.
     published: Vec<Event>,
+    /// Would-be loss stops recorded under shadow-loss-stops mode (§11 paper
+    /// eval), drained by the orchestrator into the side-channel recorder.
+    shadow_stops: Vec<ShadowStop>,
 }
 
 fn log_risk(re: &RiskEvent) {
@@ -109,6 +112,7 @@ impl RiskManager {
             model,
             arbiter,
             published: Vec::new(),
+            shadow_stops: Vec::new(),
         }
     }
 
@@ -117,6 +121,14 @@ impl RiskManager {
     /// Drains the breaker events to publish on the bus (call after each input).
     pub fn take_published(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.published)
+    }
+
+    /// Drains the would-be loss stops recorded under shadow-loss-stops mode (§11
+    /// paper eval). Mirrors [`take_published`](Self::take_published); the
+    /// orchestrator records them to the shadow-stops side channel. Always empty
+    /// unless `shadow_loss_stops` is enabled.
+    pub fn take_shadow_stops(&mut self) -> Vec<ShadowStop> {
+        std::mem::take(&mut self.shadow_stops)
     }
 
     /// The current breaker state for the dashboard risk panel (§10.5).
@@ -385,6 +397,17 @@ impl RiskManager {
                 RiskOutput::CancelMarket(cid) => {
                     let r = port.cancel_market(&cid).await;
                     tracing::warn!(target: "risk", market = %cid, ok = r.is_ok(), "authoritative cancel-market (window loss)");
+                }
+                RiskOutput::ShadowStop(s) => {
+                    tracing::warn!(
+                        target: "risk",
+                        kind = ?s.kind,
+                        window = ?s.window,
+                        threshold = %s.threshold,
+                        value = %s.value,
+                        "SHADOW STOP would have tripped (paper eval; trading continues)"
+                    );
+                    self.shadow_stops.push(s);
                 }
             }
         }

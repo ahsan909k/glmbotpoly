@@ -36,4 +36,4 @@ mod state;
 pub use core::RiskOutput;
 pub use driver::{FillDriver, RiskManager};
 pub use params::RiskParams;
-pub use state::RiskStateSnapshot;
+pub use state::{RiskStateSnapshot, ShadowStop};

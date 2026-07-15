@@ -114,6 +114,27 @@ impl GateState {
     }
 }
 
+/// A loss-based stop that WOULD have tripped, recorded instead of enforced
+/// (CLAUDE.md §11 shadow-loss-stops, paper eval only). Emitted when
+/// [`RiskParams::shadow_loss_stops`](super::RiskParams) is set: the `DailyStop`
+/// and per-window `WindowLoss` breakers are computed exactly as normal, but
+/// instead of halting/cancelling they surface as one of these so trading
+/// continues. Operational breakers are never shadowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShadowStop {
+    /// Which loss breaker would have tripped — always `DailyStop` or `WindowLoss`.
+    pub kind: BreakerKind,
+    /// The window, for a `WindowLoss` shadow; `None` for the global `DailyStop`.
+    pub window: Option<WindowId>,
+    /// The configured limit/cap that was crossed (a positive dollar amount).
+    pub threshold: Dollars,
+    /// The observed loss / worst-case at the crossing (signed; a loss is negative
+    /// realized PnL, a positive worst-case-if-excess-loses).
+    pub value: Dollars,
+    /// When the crossing was observed.
+    pub ts: TimestampMs,
+}
+
 /// A point-in-time projection of the risk manager's breaker state for the
 /// dashboard risk panel (§10.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +158,9 @@ pub struct RiskStateSnapshot {
     pub sanity_breached: bool,
     /// True when any global breaker holds all trading down.
     pub globally_halted: bool,
+    /// Loss stops that WOULD have tripped under shadow-loss-stops mode but were
+    /// only recorded (empty unless `shadow_loss_stops` is enabled).
+    pub shadow_tripped: Vec<ShadowStop>,
 }
 
 impl RiskStateSnapshot {

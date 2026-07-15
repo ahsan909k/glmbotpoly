@@ -34,6 +34,7 @@ mod record;
 mod replay_cmd;
 mod run;
 mod schedule;
+mod shadow_stops_record;
 mod telemetry;
 mod timecfg;
 mod vol;

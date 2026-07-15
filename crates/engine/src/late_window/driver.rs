@@ -36,7 +36,7 @@ use venue_api::{VenueEvent, VenuePort};
 
 use super::edge::{CertaintyTakePlan, plan_certainty_take};
 use super::{LateWindowTakerParams, NoLateTakeReason};
-use crate::normalize::{NormalizerParams, OrderDraft, normalize};
+use crate::normalize::{NormalizerParams, OrderDraft, normalize, split_take_clips};
 use crate::quote_manager::RestingLookup;
 
 /// Seconds remaining to close, clamped at zero — computed inline so the driver
@@ -439,49 +439,57 @@ impl LateWindowTaker {
         decision: Decision,
         now: TimestampMs,
     ) {
-        let seq = self.next_seq();
         let open_ms = decision.market.window.open_time.as_millis();
-        let draft = OrderDraft {
-            client_id: Some(format!("lw:{open_ms}:{seq}")),
-            window: decision.market.window,
-            token_id: decision.token_id,
-            outcome: decision.outcome,
-            side: Side::Buy,
-            price: decision.plan.worst_price.as_decimal(),
-            qty: OrderQty::Notional(decision.plan.notional),
-            tif: TimeInForce::Fak,
-        };
-        // FAK is not post-only, so the normalizer's cross check is skipped — no
-        // book view needed. It only snaps the worst-price cap (already on-grid)
-        // and re-checks the $1 notional (guaranteed by plan_certainty_take).
-        let order = match normalize(&draft, &decision.market, None, &self.normalizer_params) {
-            Ok(n) => n.order,
-            Err(e) => {
-                tracing::warn!(target: "late-window-taker", reason = %e, "normalize rejected the FAK (unexpected — plan_certainty_take guarantees ≥$1 notional + on-grid worst price)");
-                return;
-            }
-        };
-        match port.place(&order).await {
-            Ok(acc) => {
-                if let Some(st) = self.windows.get_mut(&window) {
-                    st.our_orders.insert(acc.order_id.clone());
-                    st.pending
-                        .insert(acc.order_id.clone(), decision.plan.notional);
-                    st.last_take_ms = Some(now.as_millis());
+        // Split into sequential FAK clips of ≤ clip_size_shares (§8 burst
+        // pattern); no clip ⇒ one full-size FAK (byte-identical to before).
+        let clips = split_take_clips(
+            decision.plan.expected_shares,
+            decision.plan.worst_price,
+            decision.plan.notional,
+            self.normalizer_params.clip_size_shares,
+        );
+        for clip_notional in clips {
+            let seq = self.next_seq();
+            let draft = OrderDraft {
+                client_id: Some(format!("lw:{open_ms}:{seq}")),
+                window: decision.market.window,
+                token_id: decision.token_id.clone(),
+                outcome: decision.outcome,
+                side: Side::Buy,
+                price: decision.plan.worst_price.as_decimal(),
+                qty: OrderQty::Notional(clip_notional),
+                tif: TimeInForce::Fak,
+            };
+            // FAK is not post-only, so the normalizer's cross check is skipped — no
+            // book view needed. It only snaps the worst-price cap (already on-grid)
+            // and re-checks the $1 notional (guaranteed by the plan / clip split).
+            let order = match normalize(&draft, &decision.market, None, &self.normalizer_params) {
+                Ok(n) => n.order,
+                Err(e) => {
+                    tracing::warn!(target: "late-window-taker", reason = %e, "normalize rejected a FAK clip (skipping this clip)");
+                    continue;
                 }
-                self.order_window.insert(acc.order_id, window);
-                self.take_count += 1;
-                tracing::info!(
-                    target: "late-window-taker",
-                    outcome = %decision.outcome,
-                    worst = %decision.plan.worst_price,
-                    notional = %decision.plan.notional,
-                    shares = %decision.plan.expected_shares,
-                    "late-window certainty take (FAK)"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(target: "late-window-taker", error = %e, "FAK place failed");
+            };
+            match port.place(&order).await {
+                Ok(acc) => {
+                    if let Some(st) = self.windows.get_mut(&window) {
+                        st.our_orders.insert(acc.order_id.clone());
+                        st.pending.insert(acc.order_id.clone(), clip_notional);
+                        st.last_take_ms = Some(now.as_millis());
+                    }
+                    self.order_window.insert(acc.order_id, window);
+                    self.take_count += 1;
+                    tracing::info!(
+                        target: "late-window-taker",
+                        outcome = %decision.outcome,
+                        worst = %decision.plan.worst_price,
+                        notional = %clip_notional,
+                        "late-window certainty take (FAK clip)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(target: "late-window-taker", error = %e, "FAK place failed");
+                }
             }
         }
     }

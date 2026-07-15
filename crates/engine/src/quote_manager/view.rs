@@ -178,6 +178,17 @@ impl RestingView {
         self.by_id.contains_key(id)
     }
 
+    /// The cumulative filled size of one of our live orders, if we hold it. Used
+    /// to attribute maker fills to the per-window deployment budget from the
+    /// order-update stream (only our own orders are in the view, so `Some`
+    /// distinguishes a maker fill from another strategy's fill on the same
+    /// window). Returns `None` for an order we do not hold (already terminal or
+    /// never ours).
+    #[must_use]
+    pub fn filled_of(&self, id: &OrderId) -> Option<Size> {
+        self.by_id.get(id).map(|o| o.filled_size)
+    }
+
     /// True when no orders are held.
     #[must_use]
     pub fn is_empty(&self) -> bool {

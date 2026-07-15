@@ -34,7 +34,7 @@ use venue_api::{VenueEvent, VenuePort};
 use super::edge::{ModelTakePlan, plan_model_take};
 use super::{ModelPrediction, ModelTakeOutcome, ModelTakerParams, NoModelTakeReason};
 use crate::arbitration::{FireLedger, TakerId};
-use crate::normalize::{NormalizerParams, OrderDraft, normalize};
+use crate::normalize::{NormalizerParams, OrderDraft, normalize, split_take_clips};
 use crate::quote_manager::RestingLookup;
 
 /// Per-window model-taker state: the market metadata, the cached books, and the
@@ -375,60 +375,73 @@ impl ModelTaker {
         now: TimestampMs,
         arbiter: &mut FireLedger,
     ) -> ModelTakeOutcome {
-        let seq = self.next_seq();
-        let open_ms = decision.window.open_time.as_millis();
-        let draft = OrderDraft {
-            client_id: Some(format!("md:{open_ms}:{seq}")),
-            window: decision.window,
-            token_id: decision.token_id.clone(),
-            outcome: decision.outcome,
-            side: Side::Buy,
-            price: decision.plan.worst_price.as_decimal(),
-            qty: OrderQty::Notional(decision.plan.notional),
-            tif: TimeInForce::Fak,
-        };
-        // FAK is not post-only, so the normalizer's cross check is skipped — no
-        // book view needed. It only snaps the worst-price cap and re-checks the $1
-        // notional (both already guaranteed by plan_model_take).
-        let order = match normalize(&draft, &decision.market, None, &self.normalizer_params) {
-            Ok(n) => n.order,
-            Err(e) => {
-                tracing::warn!(target: "model-taker", reason = %e, "normalize rejected the FAK (unexpected — plan guarantees ≥$1 notional + on-grid worst price)");
-                return ModelTakeOutcome::Suppressed(NoModelTakeReason::PlaceRejected);
-            }
-        };
-        match port.place(&order).await {
-            Ok(acc) => {
-                let window = decision.window;
-                if let Some(st) = self.windows.get_mut(&window) {
-                    st.our_orders.insert(acc.order_id.clone());
-                    st.pending
-                        .insert(acc.order_id.clone(), decision.plan.notional);
+        let window = decision.window;
+        let open_ms = window.open_time.as_millis();
+        // Split into sequential FAK clips of ≤ clip_size_shares (§8 burst
+        // pattern); no clip ⇒ one full-size FAK (byte-identical to before).
+        let clips = split_take_clips(
+            decision.plan.expected_shares,
+            decision.plan.worst_price,
+            decision.plan.notional,
+            self.normalizer_params.clip_size_shares,
+        );
+        let mut placed_notional = Dollars::ZERO;
+        for clip_notional in clips {
+            let seq = self.next_seq();
+            let draft = OrderDraft {
+                client_id: Some(format!("md:{open_ms}:{seq}")),
+                window,
+                token_id: decision.token_id.clone(),
+                outcome: decision.outcome,
+                side: Side::Buy,
+                price: decision.plan.worst_price.as_decimal(),
+                qty: OrderQty::Notional(clip_notional),
+                tif: TimeInForce::Fak,
+            };
+            // FAK is not post-only, so the normalizer's cross check is skipped — no
+            // book view needed. It only snaps the worst-price cap and re-checks the
+            // $1 notional (both already guaranteed by the plan / clip split).
+            let order = match normalize(&draft, &decision.market, None, &self.normalizer_params) {
+                Ok(n) => n.order,
+                Err(e) => {
+                    tracing::warn!(target: "model-taker", reason = %e, "normalize rejected a FAK clip (skipping this clip)");
+                    continue;
                 }
-                self.order_window.insert(acc.order_id, window);
-                self.take_count += 1;
-                arbiter.record(TakerId::Model, window, now);
-                tracing::info!(
-                    target: "model-taker",
-                    window = %window,
-                    outcome = %decision.outcome,
-                    worst = %decision.plan.worst_price,
-                    notional = %decision.plan.notional,
-                    shares = %decision.plan.expected_shares,
-                    "model take (FAK)"
-                );
-                ModelTakeOutcome::Fired {
-                    window,
-                    outcome: decision.outcome,
-                    shares: decision.plan.expected_shares,
-                    notional: decision.plan.notional,
-                    worst_price: decision.plan.worst_price,
+            };
+            match port.place(&order).await {
+                Ok(acc) => {
+                    if let Some(st) = self.windows.get_mut(&window) {
+                        st.our_orders.insert(acc.order_id.clone());
+                        st.pending.insert(acc.order_id.clone(), clip_notional);
+                    }
+                    self.order_window.insert(acc.order_id, window);
+                    self.take_count += 1;
+                    placed_notional = placed_notional + clip_notional;
+                    tracing::info!(
+                        target: "model-taker",
+                        window = %window,
+                        outcome = %decision.outcome,
+                        worst = %decision.plan.worst_price,
+                        notional = %clip_notional,
+                        "model take (FAK clip)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(target: "model-taker", error = %e, "FAK place failed");
                 }
             }
-            Err(e) => {
-                tracing::warn!(target: "model-taker", error = %e, "FAK place failed");
-                ModelTakeOutcome::Suppressed(NoModelTakeReason::PlaceRejected)
+        }
+        if placed_notional.as_decimal() > Decimal::ZERO {
+            arbiter.record(TakerId::Model, window, now);
+            ModelTakeOutcome::Fired {
+                window,
+                outcome: decision.outcome,
+                shares: decision.plan.expected_shares,
+                notional: placed_notional,
+                worst_price: decision.plan.worst_price,
             }
+        } else {
+            ModelTakeOutcome::Suppressed(NoModelTakeReason::PlaceRejected)
         }
     }
 

@@ -27,9 +27,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use core_types::{
-    BookSnapshot, BreakerKind, Decimal, Event, InventorySnapshot, MarketInfo, ModelSnapshot,
-    OrderQty, Outcome, RiskEvent, Side, SideInventory, Size, TimestampMs, TokenId, TopOfBook,
-    WindowId, WindowLifecycle,
+    BookSnapshot, BreakerKind, Decimal, Dollars, Event, InventorySnapshot, MarketInfo,
+    ModelSnapshot, OrderQty, Outcome, RiskEvent, Side, SideInventory, Size, TimestampMs, TokenId,
+    TopOfBook, WindowId, WindowLifecycle,
 };
 use venue_api::{VenueEvent, VenuePort};
 
@@ -66,6 +66,11 @@ struct ActiveWindow {
     dirty: bool,
     /// The window has entered its Closing phase — no further placements.
     closing: bool,
+    /// Cumulative maker BUY notional filled on this window (`Σ price × size` over
+    /// buy fills). Gates opening new buys once it reaches
+    /// [`QuoteManagerParams::maker_deployment_budget_per_window`] (§8). `ZERO`
+    /// budget = unbounded.
+    deployed_notional: Dollars,
 }
 
 impl ActiveWindow {
@@ -79,6 +84,7 @@ impl ActiveWindow {
             last_place_ms: None,
             dirty: false,
             closing: false,
+            deployed_notional: Dollars::ZERO,
         }
     }
 }
@@ -191,7 +197,24 @@ impl QuoteManager {
         match ve {
             VenueEvent::Order(u) => {
                 if let Some(a) = self.windows.get_mut(&u.window) {
+                    // Cumulative maker-BUY deployment for the per-window budget
+                    // (§8), attributed from the order-update stream: `filled_of`
+                    // is `Some` only for OUR own resting orders (the view holds
+                    // nothing else), so a taker's fill on this window never
+                    // consumes the maker budget. Read the prior cumulative fill
+                    // before the update terminalizes the order, then add the new
+                    // delta at the order's limit price.
+                    let before = a.view.filled_of(&u.order_id);
                     a.view.apply_order_update(u);
+                    if u.side == Side::Buy
+                        && let Some(before) = before
+                    {
+                        let delta = u.filled_size.as_decimal() - before.as_decimal();
+                        if delta > Decimal::ZERO {
+                            a.deployed_notional = a.deployed_notional
+                                + Dollars::new(u.price.as_decimal() * delta);
+                        }
+                    }
                 }
             }
             VenueEvent::Fill(f) => {
@@ -254,7 +277,7 @@ impl QuoteManager {
                     tau,
                     market.tick_size,
                 );
-                let plan = ConvergencePlanner::plan(
+                let mut plan = ConvergencePlanner::plan(
                     &decision,
                     &a.view,
                     &market,
@@ -263,6 +286,16 @@ impl QuoteManager {
                     self.qm_params.reprice_threshold_theta,
                     self.qm_params.cancel_market_theta,
                 );
+                // Per-window maker deployment budget (§8): once cumulative maker
+                // buy fills reach the budget, stop OPENING new buys for this
+                // window — drop the placements, keep the cancels (existing orders
+                // are still managed). A zero budget is unbounded (no gate).
+                let budget = self.qm_params.maker_deployment_budget_per_window;
+                if budget.as_decimal() > Decimal::ZERO
+                    && a.deployed_notional.as_decimal() >= budget.as_decimal()
+                {
+                    plan.places.clear();
+                }
                 Some((plan, market, a.window, model.p_up))
             };
             if let Some((plan, market, w, p_up)) = planned {

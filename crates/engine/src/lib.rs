@@ -67,7 +67,7 @@ pub use quoting::{
     FinalSecondsViolation, NoQuoteReason, PassiveLevelRef, QuoteDecision, QuoteLevel, QuoteParams,
     QuoteSet, SuppressReason, Suppressed, calculate_quotes, check_final_seconds_invariant,
 };
-pub use risk::{FillDriver, RiskManager, RiskOutput, RiskParams, RiskStateSnapshot};
+pub use risk::{FillDriver, RiskManager, RiskOutput, RiskParams, RiskStateSnapshot, ShadowStop};
 pub use taker::{
     ConfirmedMove, MomentumTakerParams, NoTakeReason, SignalWindow, TakePlan, plan_take,
 };

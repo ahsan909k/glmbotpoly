@@ -35,6 +35,14 @@ pub struct RiskConfig {
     pub error_breaker_max_errors: u32,
     /// …within this rolling window.
     pub error_breaker_window_ms: DurationMs,
+    /// Paper-eval only, default `false`. When `true`, the two **loss-based**
+    /// stops (`DailyStop`, per-window `WindowLoss`) are still *computed* exactly
+    /// as today, but instead of halting/cancelling they emit a
+    /// "would-have-tripped" shadow record and trading continues. The operational
+    /// breakers (feed staleness, WS disconnect, clock skew, fair-vs-mid, engine
+    /// restart, error rate, manual kill) are UNCHANGED — always hard. Leave
+    /// `false` in any real deployment.
+    pub shadow_loss_stops: bool,
 }
 
 impl Default for RiskConfig {
@@ -48,6 +56,7 @@ impl Default for RiskConfig {
             sanity_bound_duration_ms: DurationMs::from_millis(3_000),
             error_breaker_max_errors: 10,
             error_breaker_window_ms: DurationMs::from_millis(60_000),
+            shadow_loss_stops: false,
         }
     }
 }

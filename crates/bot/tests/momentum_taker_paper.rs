@@ -28,7 +28,7 @@ use core_types::{
     Price, PriceSource, PriceTick, ResolutionSource, RoundDir, Series, Size, TickKind, TickSize,
     TimestampMs, TokenId, TokenPair, WindowDuration, WindowId, WindowLifecycle, taker_fee,
 };
-use engine::{MomentumTakerParams, RiskManager, RiskParams};
+use engine::{MomentumTakerParams, NormalizerParams, RiskManager, RiskParams};
 use journal::{Recorder, RecorderParams, ReplayReader};
 use rust_decimal::dec;
 use tokio::sync::mpsc::Receiver;
@@ -191,6 +191,24 @@ fn momentum_only_risk(mt: MomentumTakerParams) -> RiskManager {
     RiskManager::new(params, caps)
 }
 
+/// Like [`momentum_only_risk`] but with a share clip on the normalizer, so each
+/// taker FAK is split into ≤ `clip` share clips (CLAUDE.md §8 clip-splitting).
+fn momentum_only_risk_with_clip(mt: MomentumTakerParams, clip: Decimal) -> RiskManager {
+    let params = RiskParams {
+        momentum: mt,
+        normalizer: NormalizerParams {
+            clip_size_shares: Some(clip),
+            ..NormalizerParams::default()
+        },
+        quoter_enabled: false,
+        late_window_enabled: false,
+        ..RiskParams::default()
+    };
+    let mut caps = HashMap::new();
+    caps.insert(window().series, Dollars::new(Decimal::from(10_000)));
+    RiskManager::new(params, caps)
+}
+
 // ---- harness --------------------------------------------------------------
 
 fn make(
@@ -207,6 +225,22 @@ fn make(
     });
     let rx = venue.take_event_rx().expect("event rx");
     (venue, rx, momentum_only_risk(taker_params), start)
+}
+
+fn make_with_risk(
+    risk: RiskManager,
+) -> (
+    PaperVenue,
+    Receiver<VenueEvent>,
+    RiskManager,
+    tokio::time::Instant,
+) {
+    let start = tokio::time::Instant::now();
+    let mut venue = PaperVenue::spawn(params(), move || {
+        TimestampMs::from_millis(BASE_MS + i64::try_from(start.elapsed().as_millis()).unwrap_or(0))
+    });
+    let rx = venue.take_event_rx().expect("event rx");
+    (venue, rx, risk, start)
 }
 
 /// Feeds one bus event to both the paper venue (fill sim) and the risk manager.
@@ -317,6 +351,69 @@ async fn takes_and_fills_against_the_stale_book_on_recorded_data() {
         !risk.state_snapshot().any_tripped(),
         "the guard was transparent — no breaker tripped"
     );
+    venue.shutdown();
+}
+
+// ---- (a2) the clip cap splits one take into several FAKs ------------------
+
+#[tokio::test(start_paused = true)]
+async fn clip_splits_the_take_into_multiple_faks() {
+    // A 5-share clip splits the $10 / 12.5-share take into three FAK clips
+    // (5, 5, 2.5 shares), each ≤ the clip, that together fill the full size.
+    let risk = momentum_only_risk_with_clip(MomentumTakerParams::default(), dec!(5));
+    let (venue, mut rx, mut risk, start) = make_with_risk(risk);
+    let now = || {
+        TimestampMs::from_millis(BASE_MS + i64::try_from(start.elapsed().as_millis()).unwrap_or(0))
+    };
+
+    feed(
+        &venue,
+        &mut risk,
+        &window_event(WindowLifecycle::Open),
+        &now,
+    )
+    .await;
+    feed(
+        &venue,
+        &mut risk,
+        &book(up_token(), &[(dec!(0.80), dec!(50))], BASE_MS),
+        &now,
+    )
+    .await;
+    for ev in up_ramp(BASE_MS) {
+        feed(&venue, &mut risk, &ev, &now).await;
+    }
+    feed(&venue, &mut risk, &model(0.85, 1e-4, BASE_MS), &now).await;
+
+    assert_eq!(
+        risk.momentum_take_count(),
+        3,
+        "the take split into three FAK clips"
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let events = drain(&mut rx, &mut risk, &venue, &now).await;
+
+    // Every clip fills at 0.80; the sizes sum to the full 12.5-share plan.
+    let mut total = Decimal::ZERO;
+    for ev in &events {
+        if let VenueEvent::Fill(f) = ev {
+            assert_eq!(f.liquidity, Liquidity::Taker);
+            assert_eq!(f.price.as_decimal(), dec!(0.80));
+            assert!(
+                f.size.as_decimal() <= dec!(5),
+                "each clip fill is ≤ the 5-share clip (got {})",
+                f.size
+            );
+            total += f.size.as_decimal();
+        }
+    }
+    assert_eq!(total, dec!(12.5), "clips fill the full planned size");
+    assert!(
+        risk.momentum_realized_spent().as_decimal() <= dec!(10),
+        "spend stays within the per-window budget"
+    );
+    assert!(!risk.state_snapshot().any_tripped(), "guard transparent");
     venue.shutdown();
 }
 
