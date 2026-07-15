@@ -1,0 +1,63 @@
+# EVAL config overlay — Days 1–3 sizing ($150/window). Signed off 2026-07-15.
+#
+# Copy to /etc/bot/config/bot.local.toml at cutover (layered OVER
+# config/default.toml). Inspect the merged result before starting:
+#   sudo -u bot /opt/bot/bin/bot check-config --config-dir /etc/bot/config
+#
+# DAY-4 sizing bump (only if the day-3 gate passes): change the three lines
+# marked [DAY-4] below, then `sudo systemctl restart bot` (graceful drain).
+# Every knob here is STRUCTURAL / restart-only — none is runtime `set-param`able.
+
+[log]
+dir = "/var/lib/bot/data/logs"
+
+[journal]
+dir = "/var/lib/bot/data/journal"                 # gzip segments (source of truth)
+sqlite_path = "/var/lib/bot/data/journal.sqlite"  # queryable index (+ -wal/-shm)
+depth_dir = "/var/lib/bot/data/depth"             # binance depth20 side-channel
+# Keep the whole eval in the sqlite index for a direct day-14 report; the nightly
+# S3-backup script prunes local raw segments >7 d that are confirmed in S3, so the
+# disk stays bounded while the structured index (small) covers the full window.
+# The daily digests archived to S3 are the authoritative eval record regardless.
+retention_max_age_ms = 2592000000                 # 30 days
+retention_max_total_bytes = 0                     # 0 = S3-backup handles segment disk
+
+[paper]
+starting_capital = 50000                          # $50k bankroll (both phases)
+# venue_taker_delay_ms stays 250 (Polymarket's, not ours — do NOT change).
+# Set placement/cancel latency AFTER the `bot latency` rebench on the VPS
+# (Phase 1.4): mean_ms = measured clob REST p50, jitter_ms = p95 − p50.
+[paper.placement_latency]
+mean_ms = 31        # PLACEHOLDER — overwrite with measured VPS p50
+jitter_ms = 12      # PLACEHOLDER — overwrite with measured VPS (p95 − p50)
+[paper.cancel_latency]
+mean_ms = 31        # PLACEHOLDER — overwrite with measured VPS p50
+jitter_ms = 12      # PLACEHOLDER — overwrite with measured VPS (p95 − p50)
+
+[risk]
+shadow_loss_stops = true      # PAPER EVAL: loss stops (DailyStop/WindowLoss) record + flag,
+                              # never halt. Operational breakers stay HARD.
+daily_stop_loss = 1000        # 2% of $50k — SHADOW (computed, journaled, never halts).
+max_open_notional = 5000      # REAL backstop (~4× peak instantaneous deployment ~$1.2k).
+feed_staleness_grace_ms = 0   # strict §11 — colocated VPS, no grace.
+
+[shadow]
+enable = true                 # champion-model observer (required by model_taker).
+
+[model_taker]
+enable = true                 # champion dir10 model taker (per-window, all four M5/M15).
+budget_per_window = 10        # [DAY-4] -> 100
+
+[engine.defaults]
+clip_size_shares = 60                     # hard per-order cap (maker levels + taker clips ≤ 60).
+touch_size = 40                           # ~$152 two-sided instantaneous resting (≈ $19/order).
+ladder_size_per_level = 40
+ladder_levels = 3
+maker_deployment_budget_per_window = 150  # [DAY-4] -> 1000  (cumulative gross-buy $/window)
+max_worst_case_loss_per_window = 95       # constant both phases (risk = net inventory, not churn)
+soft_cap_excess_shares = 200
+hard_cap_excess_shares = 400
+taker_budget_per_window = 10              # [DAY-4] -> 100  (momentum + late, cumulative $)
+
+# Dashboard stays on loopback (default); reach it via the SSH tunnel:
+#   ssh -N -L 8080:localhost:8080 ubuntu@54.154.134.102

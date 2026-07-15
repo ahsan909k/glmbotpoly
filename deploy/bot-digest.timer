@@ -1,0 +1,12 @@
+# Fires daily at 03:40 UTC (after the 03:17 S3 backup, so the digest and its
+# inputs are both archived). Check: systemctl list-timers bot-digest.timer
+[Unit]
+Description=Daily eval digest timer
+
+[Timer]
+OnCalendar=*-*-* 03:40:00 UTC
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

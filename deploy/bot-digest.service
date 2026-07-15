@@ -1,0 +1,17 @@
+# Daily eval digest generator. Install:
+#   sudo install -m 0755 deploy/bot-digest.sh /usr/local/bin/bot-digest.sh
+#   sudo install -m 0644 deploy/bot-digest.service /etc/systemd/system/
+#   sudo install -m 0644 deploy/bot-digest.timer   /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now bot-digest.timer
+[Unit]
+Description=Daily eval digest (per-driver/per-series PnL from the journal)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=bot
+Group=bot
+ExecStart=/usr/local/bin/bot-digest.sh
+# The bot latency/digest report writes under /var/lib/bot only.
+WorkingDirectory=/var/lib/bot
+Nice=10
