@@ -935,6 +935,29 @@ async function loadRisk() {
     renderRisk();
     showAuthBanner(false);
   } catch (e) { if (e.message !== "unauthorized") toast("risk: " + e.message, true); }
+  try {
+    state.feedCadence = await api(`/api/feed-cadence`);
+    renderFeedCadence();
+  } catch (e) { /* feed-cadence is best-effort diagnostic */ }
+}
+function renderFeedCadence() {
+  const c = state.feedCadence;
+  const el = $("feed-cadence");
+  if (!c || !el) return;
+  const trip = c.feed_stale_trip_ms;
+  // p95 gap vs the trip threshold: amber if p95 approaches/exceeds trip.
+  const gapCls = c.mid_gap_p95_ms >= trip ? "bad" : c.mid_gap_p95_ms >= trip * 0.6 ? "warn" : "ok";
+  const maxrow = c.mid_gap_hist.length ? Math.max(...c.mid_gap_hist.map((b) => b.count), 1) : 1;
+  const bars = (c.mid_gap_hist || []).map((b) => {
+    const w = Math.round((b.count / maxrow) * 100);
+    const overTrip = /^(500|1000|2000)-|^>=(500|1000|2000|5000)/.test(b.label);
+    return `<div class="health-item ${overTrip ? "warn" : "ok"}"><span>${b.label}</span><span>${b.count}</span><span style="flex:0 0 40%"><span style="display:inline-block;height:6px;width:${w}%;background:currentColor;border-radius:3px"></span></span></div>`;
+  }).join("");
+  el.innerHTML =
+    `<div class="health-item ${gapCls}"><span>Mid gap p50 / p95 / max</span><span>${c.mid_gap_p50_ms} / ${c.mid_gap_p95_ms} / ${c.mid_gap_max_ms} ms</span></div>` +
+    `<div class="health-item ok"><span>loop lag p95 / max</span><span>${c.loop_lag_p95_ms} / ${c.loop_lag_max_ms} ms</span></div>` +
+    `<div class="health-sub">FeedStale trips at gap ≥ ${trip} ms &nbsp;·&nbsp; Mid-gap histogram:</div>` +
+    bars;
 }
 function renderRisk() {
   const r = state.risk;

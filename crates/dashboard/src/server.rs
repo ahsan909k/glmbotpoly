@@ -310,6 +310,10 @@ async fn model_taker(State(app): State<AppState>) -> Json<dto::ModelTakerDto> {
     Json(app.handle.with_data(dto::model_taker))
 }
 
+async fn feed_cadence(State(app): State<AppState>) -> Json<dto::FeedCadenceDto> {
+    Json(app.handle.with_data(dto::feed_cadence))
+}
+
 async fn pnl_matrix(
     State(app): State<AppState>,
     Query(q): Query<CompareQuery>,
@@ -640,6 +644,7 @@ pub fn router(
         .route("/api/params", get(params))
         .route("/api/shadow", get(shadow))
         .route("/api/model-taker", get(model_taker))
+        .route("/api/feed-cadence", get(feed_cadence))
         .route("/api/pnl-matrix", get(pnl_matrix))
         .route("/api/status-strip", get(status_strip))
         .route("/api/benchmark", get(benchmark))

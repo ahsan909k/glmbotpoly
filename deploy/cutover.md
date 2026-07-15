@@ -73,6 +73,20 @@ chronyc tracking | grep 'System time'                      # < 1 ms offset
 sudo journalctl -u bot --since '5 min ago' | grep -c 'authoritative cancel-all'   # ~0 = recovered
 ```
 
+**Feed cadence + FeedStale grace (2026-07-16).** The risk fast-feed staleness bound
+is 500 ms; on this eu-west-1 box the direct-Binance Mid path stalls p95 ~1.4 s
+(bursty trans-region delivery, WS stable), so `risk.feed_staleness_grace_ms = 1500`
+(env-correct — see the Decisions Log). Watch the new **feed-cadence tile**
+(`GET /api/feed-cadence`: Mid-gap histogram + loop-lag) and the `mid_gap_p95_ms`
+resource-report field, NOT breaker flaps, to judge feed health.
+**Fallback (only if the rehearsal still shows residual Binance-origin FeedStale at
+grace=1500):** try the drop-in endpoint `[feeds] binance_ws_url =
+"wss://data-stream.binance.vision"` — a different Binance edge that may have a
+better path from Dublin. Re-benchmark the Mid-gap p95 after switching; keep
+whichever endpoint's cadence is tighter. ChainlinkRtds `#42P01` RTDS stalls are a
+Polymarket vendor incident (annotate, don't count toward the <5/hr gate) and must
+be recovered before EVAL START regardless of grace.
+
 ## 8. GATE 0 — six-series maker proof (LIVE, after ≥2 window cycles / ~10 min)
 ```bash
 sqlite3 -readonly /var/lib/bot/data/journal.sqlite <<'SQL'

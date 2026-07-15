@@ -41,7 +41,9 @@ use core_types::{
     BreakerKind, ControlEvent, Dollars, Event, MarketInfo, MarketLifecycleEvent, Mode, OrderId,
     PriceSource, RiskEvent, Series, TickKind, TimestampMs, WindowId, WindowLifecycle,
 };
-use dashboard::{ControlRequest, DashboardHandle, DriverStatus, ModelTakerTick, ShadowTick};
+use dashboard::{
+    ControlRequest, DashboardHandle, DriverStatus, FeedCadence, ModelTakerTick, ShadowTick,
+};
 use discovery::DiscoveryService;
 use engine::{
     InventoryEffect, InventoryManager, LateWindowTakerParams, ModelPrediction, ModelTakeOutcome,
@@ -115,6 +117,11 @@ const INVENTORY_RETENTION_MS: i64 = 2 * 3_600_000;
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Trailing samples in the event-loop decision-lag ring (~40 s at ~100 mid-ticks/s).
 const DECISION_LAG_RING: usize = 4_096;
+/// Upper edges (ms, exclusive) for the Binance-Mid inter-update-gap histogram; a
+/// final open `[5000, ∞)` bucket is implied. The 500 ms fast-feed staleness bound
+/// sits inside `[500, 1000)`, so buckets at/above it are the ones that would trip
+/// `FeedStale` (before grace).
+const MID_GAP_BUCKETS: [i64; 7] = [50, 100, 250, 500, 1_000, 2_000, 5_000];
 /// Assumed memory page size for the Linux RSS report (good enough for a trend).
 #[cfg(target_os = "linux")]
 const PAGE_KB: u64 = 4;
@@ -796,6 +803,19 @@ async fn run(
     // at ~100 mid-ticks/s).
     let mut decision_lag: VecDeque<i64> = VecDeque::with_capacity(DECISION_LAG_RING);
 
+    // Permanent Binance-Mid inter-update-gap metric: per asset, the time between
+    // consecutive BinanceDirect/Mid ticks. THIS is feed cadence (network health) —
+    // the risk 500 ms fast-feed bound trips when a gap exceeds it, so this makes
+    // the cause directly visible instead of inferred from breaker flaps. A
+    // trailing ring feeds p50/p95/max; the cumulative histogram shows the shape.
+    let mut mid_gap: VecDeque<i64> = VecDeque::with_capacity(DECISION_LAG_RING);
+    let mut mid_gap_hist = [0u64; MID_GAP_BUCKETS.len() + 1];
+    let mut last_mid_recv: HashMap<core_types::Asset, TimestampMs> = HashMap::new();
+    // The fast-feed staleness trip threshold in effect (§11 bound + grace): a Mid
+    // gap at or above this trips FeedStale. Rendered on the feed-cadence tile.
+    let feed_stale_trip_ms =
+        config.risk.feed_staleness_ms.as_millis() + config.risk.feed_staleness_grace_ms.as_millis();
+
     loop {
         // Order flow is allowed only once armed and while every critical
         // dependency is alive (a dead feed/scheduler gates placement until it
@@ -1012,17 +1032,21 @@ async fn run(
             maybe = bus_rx.recv() => match maybe {
                 Some(event) => {
                     let now = wall_now();
-                    // Event-loop decision-lag sample: receive→process delay for the
-                    // fast feed (the tick that drives every reprice/take).
+                    // Event-loop decision-lag + feed-cadence samples for the fast
+                    // feed (the tick that drives every reprice/take).
                     if let Event::PriceTick(t) = &event
                         && t.source == PriceSource::BinanceDirect
                         && t.kind == TickKind::Mid
                     {
+                        // decision lag: receive (`ts_local`) → process (`now`).
                         let lag = now.as_millis().saturating_sub(t.ts_local.as_millis());
-                        if decision_lag.len() == DECISION_LAG_RING {
-                            decision_lag.pop_front();
+                        push_ring(&mut decision_lag, lag);
+                        // inter-update gap: time since this asset's previous Mid.
+                        if let Some(prev) = last_mid_recv.insert(t.asset, now) {
+                            let gap = now.as_millis().saturating_sub(prev.as_millis());
+                            push_ring(&mut mid_gap, gap);
+                            mid_gap_hist[mid_gap_bucket(gap)] += 1;
                         }
-                        decision_lag.push_back(lag);
                     }
                     recorder.record(&event);
                     // Observation-only shadow: a drop-on-full clone of every bus
@@ -1134,6 +1158,20 @@ async fn run(
                 // §10 contention counters (drain-and-report the arbitration blocks
                 // + placement vetoes accumulated since the last sample).
                 handle.set_contention(Mode::Paper, &risk.contention_snapshot(), now);
+                // Feed-cadence + loop-health tile (Binance-Mid gap histogram +
+                // decision lag) — feed cadence stays directly visible.
+                handle.set_feed_cadence(
+                    FeedCadence {
+                        mid_gap_p50_ms: percentile_ms(&mid_gap, 0.50),
+                        mid_gap_p95_ms: percentile_ms(&mid_gap, 0.95),
+                        mid_gap_max_ms: mid_gap.iter().copied().max().unwrap_or(0),
+                        mid_gap_hist: mid_gap_histogram(&mid_gap_hist),
+                        loop_lag_p95_ms: percentile_ms(&decision_lag, 0.95),
+                        loop_lag_max_ms: decision_lag.iter().copied().max().unwrap_or(0),
+                        feed_stale_trip_ms,
+                    },
+                    now,
+                );
             }
             _ = rss_tick.tick() => {
                 let cutoff = TimestampMs::from_millis(
@@ -1152,6 +1190,9 @@ async fn run(
                     decision_lag_p95_ms = percentile_ms(&decision_lag, 0.95),
                     decision_lag_max_ms = decision_lag.iter().copied().max().unwrap_or(0),
                     decision_lag_n = decision_lag.len(),
+                    mid_gap_p50_ms = percentile_ms(&mid_gap, 0.50),
+                    mid_gap_p95_ms = percentile_ms(&mid_gap, 0.95),
+                    mid_gap_max_ms = mid_gap.iter().copied().max().unwrap_or(0),
                     armed,
                     "resource report"
                 );
@@ -1525,6 +1566,41 @@ fn percentile_ms(samples: &VecDeque<i64>, q: f64) -> i64 {
     v[idx.min(v.len() - 1)]
 }
 
+/// Pushes a sample into a bounded trailing ring, evicting the oldest at capacity.
+fn push_ring(ring: &mut VecDeque<i64>, v: i64) {
+    if ring.len() == DECISION_LAG_RING {
+        ring.pop_front();
+    }
+    ring.push_back(v);
+}
+
+/// The [`MID_GAP_BUCKETS`] index a gap (ms) falls into (the final index is the
+/// open `[last, ∞)` bucket).
+fn mid_gap_bucket(gap_ms: i64) -> usize {
+    MID_GAP_BUCKETS
+        .iter()
+        .position(|&edge| gap_ms < edge)
+        .unwrap_or(MID_GAP_BUCKETS.len())
+}
+
+/// Human-readable `(label, count)` rows for the Mid-gap histogram, for the
+/// dashboard feed-cadence tile.
+fn mid_gap_histogram(hist: &[u64]) -> Vec<(String, u64)> {
+    let mut rows = Vec::with_capacity(hist.len());
+    let mut lo = 0i64;
+    for (i, &count) in hist.iter().enumerate() {
+        let label = match MID_GAP_BUCKETS.get(i) {
+            Some(&hi) => format!("{lo}-{hi}ms"),
+            None => format!(">={lo}ms"),
+        };
+        rows.push((label, count));
+        if let Some(&hi) = MID_GAP_BUCKETS.get(i) {
+            lo = hi;
+        }
+    }
+    rows
+}
+
 /// Reports resident set size in KiB on Linux (dependency-free `/proc/self/statm`),
 /// `None` elsewhere. Assumes a 4 KiB page — good enough for a memory trend.
 #[cfg(target_os = "linux")]
@@ -1763,6 +1839,25 @@ mod tests {
         assert_eq!(percentile_ms(&hundred, 0.95), 95);
         assert_eq!(percentile_ms(&hundred, 1.0), 100);
         assert_eq!(percentile_ms(&hundred, 0.50), 50);
+    }
+
+    #[test]
+    fn mid_gap_bucketing_and_histogram() {
+        // Buckets: [0,50) [50,100) [100,250) [250,500) [500,1000) [1000,2000)
+        //          [2000,5000) [5000,∞)  → 8 buckets.
+        assert_eq!(mid_gap_bucket(0), 0);
+        assert_eq!(mid_gap_bucket(49), 0);
+        assert_eq!(mid_gap_bucket(50), 1);
+        assert_eq!(mid_gap_bucket(499), 3);
+        assert_eq!(mid_gap_bucket(500), 4); // the 500 ms bound sits here
+        assert_eq!(mid_gap_bucket(1_500), 5);
+        assert_eq!(mid_gap_bucket(9_999), 7); // open [5000, ∞)
+        let hist = [1u64, 2, 3, 4, 5, 6, 7, 8];
+        let rows = mid_gap_histogram(&hist);
+        assert_eq!(rows.len(), 8);
+        assert_eq!(rows[0], ("0-50ms".to_string(), 1));
+        assert_eq!(rows[4], ("500-1000ms".to_string(), 5));
+        assert_eq!(rows[7], (">=5000ms".to_string(), 8));
     }
 
     // ---- config → engine boundary maps (anti-drift) ------------------------

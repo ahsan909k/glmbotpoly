@@ -1494,6 +1494,60 @@ pub(crate) fn contention(data: &DashboardData, mode: Mode) -> ContentionDto {
     }
 }
 
+/// One `(label, count)` row of the Binance-Mid gap histogram.
+#[derive(Debug, Clone, Serialize)]
+pub struct MidGapBucketDto {
+    /// Bucket label, e.g. "500-1000ms".
+    pub label: String,
+    /// Count of Mid gaps in this bucket (cumulative since boot).
+    pub count: u64,
+}
+
+/// The `/api/feed-cadence` response — direct-Binance Mid inter-update gap
+/// distribution + event-loop decision lag. Makes feed cadence (network health)
+/// and loop health directly visible so a `FeedStale` rate is never inferred from
+/// breaker flaps.
+#[derive(Debug, Clone, Serialize)]
+pub struct FeedCadenceDto {
+    /// Mid inter-update gap median (ms).
+    pub mid_gap_p50_ms: i64,
+    /// Mid inter-update gap p95 (ms).
+    pub mid_gap_p95_ms: i64,
+    /// Mid inter-update gap max (ms).
+    pub mid_gap_max_ms: i64,
+    /// Gap histogram (cumulative).
+    pub mid_gap_hist: Vec<MidGapBucketDto>,
+    /// Event-loop decision lag (receive→process) p95 (ms).
+    pub loop_lag_p95_ms: i64,
+    /// Event-loop decision lag max (ms).
+    pub loop_lag_max_ms: i64,
+    /// The fast-feed staleness trip threshold in effect (500 ms bound + grace):
+    /// a Mid gap at or above this trips `FeedStale`.
+    pub feed_stale_trip_ms: i64,
+}
+
+/// Builds the feed-cadence tile from the shared snapshot.
+#[must_use]
+pub(crate) fn feed_cadence(data: &DashboardData) -> FeedCadenceDto {
+    let c = &data.feed_cadence;
+    FeedCadenceDto {
+        mid_gap_p50_ms: c.mid_gap_p50_ms,
+        mid_gap_p95_ms: c.mid_gap_p95_ms,
+        mid_gap_max_ms: c.mid_gap_max_ms,
+        mid_gap_hist: c
+            .mid_gap_hist
+            .iter()
+            .map(|(label, count)| MidGapBucketDto {
+                label: label.clone(),
+                count: *count,
+            })
+            .collect(),
+        loop_lag_p95_ms: c.loop_lag_p95_ms,
+        loop_lag_max_ms: c.loop_lag_max_ms,
+        feed_stale_trip_ms: c.feed_stale_trip_ms,
+    }
+}
+
 // ---- series comparison -----------------------------------------------------
 
 /// A sortable column hint for the comparison table.

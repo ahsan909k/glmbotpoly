@@ -49,6 +49,29 @@ pub struct DriverStatus {
     pub model_standing_down: bool,
 }
 
+/// Feed-cadence + loop-health snapshot for the dashboard (pushed from the
+/// orchestrator's sample tick). Makes the direct-Binance Mid inter-update gap
+/// (network cadence) and the event-loop decision lag directly visible, so a
+/// `FeedStale` breaker rate is never again inferred from breaker flaps.
+#[derive(Debug, Clone, Default)]
+pub struct FeedCadence {
+    /// Binance-Mid inter-update gap (ms): median / p95 / max over the trailing ring.
+    pub mid_gap_p50_ms: i64,
+    /// p95 Mid gap.
+    pub mid_gap_p95_ms: i64,
+    /// Max Mid gap.
+    pub mid_gap_max_ms: i64,
+    /// Cumulative `(bucket-label, count)` histogram of Mid gaps.
+    pub mid_gap_hist: Vec<(String, u64)>,
+    /// Event-loop decision lag (receive→process) p95, ms.
+    pub loop_lag_p95_ms: i64,
+    /// Event-loop decision lag max, ms.
+    pub loop_lag_max_ms: i64,
+    /// The §11 fast-feed staleness bound + grace in effect (ms) — the gap size at
+    /// or above which `FeedStale` would trip. Renders the threshold on the tile.
+    pub feed_stale_trip_ms: i64,
+}
+
 /// Cumulative §10 contention counters, folded from the risk manager's
 /// drain-and-report [`ContentionSnapshot`] each risk tick.
 #[derive(Debug, Clone, Default)]
@@ -422,6 +445,8 @@ pub(crate) struct DashboardData {
     pub(crate) shadow: ShadowState,
     /// Model-taker fires tile (fed by `set_model_taker`). Paper-only in this bot.
     pub(crate) model_taker: ModelTakerState,
+    /// Feed-cadence + loop-health tile (fed by `set_feed_cadence`). Shared.
+    pub(crate) feed_cadence: FeedCadence,
     pub(crate) server_started: TimestampMs,
     pub(crate) last_now: TimestampMs,
 }
@@ -436,9 +461,16 @@ impl DashboardData {
             control_state: None,
             shadow: ShadowState::default(),
             model_taker: ModelTakerState::default(),
+            feed_cadence: FeedCadence::default(),
             server_started: now,
             last_now: now,
         }
+    }
+
+    /// Stores the latest feed-cadence snapshot (shared market-data health).
+    pub(crate) fn set_feed_cadence(&mut self, cadence: FeedCadence, now: TimestampMs) {
+        self.last_now = now;
+        self.feed_cadence = cadence;
     }
 
     pub(crate) fn mode(&self, mode: Mode) -> &ModeState {

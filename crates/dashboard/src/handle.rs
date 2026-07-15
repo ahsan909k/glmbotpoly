@@ -22,7 +22,7 @@ use crate::command::{
     ControlError, ControlOutcome, ControlRequest, ControlStateSnapshot, DashboardCommand,
 };
 use crate::shadow::ShadowTick;
-use crate::state::{DashboardData, ParamsView};
+use crate::state::{DashboardData, FeedCadence, ParamsView};
 use crate::ws::WsUpdate;
 
 /// How long the endpoint waits for the orchestrator to reply to a control
@@ -191,6 +191,13 @@ impl DashboardHandle {
     /// Sets the displayed parameters view.
     pub fn set_params(&self, params: ParamsView, now: TimestampMs) {
         self.lock().set_params(params, now);
+    }
+
+    /// Records the latest feed-cadence + loop-health snapshot (Binance-Mid
+    /// inter-update gap histogram + decision lag), pushed from the sample tick.
+    /// Served by `GET /api/feed-cadence`.
+    pub fn set_feed_cadence(&self, cadence: FeedCadence, now: TimestampMs) {
+        self.lock().set_feed_cadence(cadence, now);
     }
 
     /// Pushes the current control-plane state snapshot (read by

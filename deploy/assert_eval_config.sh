@@ -44,7 +44,7 @@ want shadow_loss_stops                   true  'shadow_loss_stops (true = SHADOW
 want daily_stop_loss                     1000  'daily_stop_loss (1000, SHADOW)'
 want max_open_notional                   5000  'max_open_notional (5000, HARD backstop)'
 want starting_capital                    50000 'paper.starting_capital (50000 bankroll)'
-want feed_staleness_grace_ms             0     'feed_staleness_grace_ms (0, strict §11)'
+want feed_staleness_grace_ms             1500  'feed_staleness_grace_ms (1500; eu-west-1 Binance Mid p95 gap 1.4s — env-correct, see 2026-07-16 log)'
 want book_staleness_dwell_ms             1500  'book_staleness_dwell_ms (1500, filters transient rollover book churn)'
 
 # Layer 3 — model-taker + shadow enabled; fortress arbitration + model-taker earned
