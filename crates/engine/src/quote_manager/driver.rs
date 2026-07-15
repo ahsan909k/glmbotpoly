@@ -36,7 +36,7 @@ use venue_api::{VenueEvent, VenuePort};
 use super::QuoteManagerParams;
 use super::client_id::ClientId;
 use super::plan::{CancelAction, ConvergeRationale, ConvergencePlan, ConvergencePlanner};
-use super::view::RestingView;
+use super::view::{RestingLookup, RestingView};
 use crate::inventory::InventoryManager;
 use crate::normalize::{NormalizerParams, OrderDraft, normalize};
 use crate::quoting::{
@@ -95,7 +95,10 @@ pub struct QuoteManager {
     /// self-contained for quoting decisions (the alternative, consuming a global
     /// `Event::Inventory`, would couple correctness to bus ordering).
     inv_mgr: InventoryManager,
-    active: Option<ActiveWindow>,
+    /// Per-active-window state, keyed by [`WindowId`]. The maker quotes every
+    /// concurrently-active window (all six series) at once — no single-slot
+    /// clobber at a shared window boundary.
+    windows: HashMap<WindowId, ActiveWindow>,
     /// True while a risk breaker holds us down (no placements until cleared).
     standing_down: bool,
     /// The set of currently-tripped breakers (stand down until empty).
@@ -123,7 +126,7 @@ impl QuoteManager {
             quote_params,
             normalizer_params,
             inv_mgr: InventoryManager::new(),
-            active: None,
+            windows: HashMap::new(),
             standing_down: false,
             tripped: HashSet::new(),
             tops: HashMap::new(),
@@ -132,16 +135,24 @@ impl QuoteManager {
         }
     }
 
-    /// The resting view for the active window, if one is open (inspection).
+    /// The resting view for a specific active window, if the maker quotes it
+    /// (inspection + the taker self-match lookup).
     #[must_use]
-    pub fn resting_view(&self) -> Option<&RestingView> {
-        self.active.as_ref().map(|a| &a.view)
+    pub fn resting_view_for(&self, window: WindowId) -> Option<&RestingView> {
+        self.windows.get(&window).map(|a| &a.view)
     }
 
-    /// Whether `id` is one of the quoter's live resting orders (driver attribution).
+    /// The total number of live resting orders across every active window.
+    #[must_use]
+    pub fn total_resting(&self) -> usize {
+        self.windows.values().map(|a| a.view.len()).sum()
+    }
+
+    /// Whether `id` is one of the quoter's live resting orders on any window
+    /// (driver attribution).
     #[must_use]
     pub fn owns(&self, id: &core_types::OrderId) -> bool {
-        self.active.as_ref().is_some_and(|a| a.view.owns(id))
+        self.windows.values().any(|a| a.view.owns(id))
     }
 
     /// Number of placement cycles run so far (each is one `place_batch` that
@@ -165,7 +176,7 @@ impl QuoteManager {
         match event {
             Event::Window { market, lifecycle } => self.on_window(market, *lifecycle, port).await,
             Event::Model(snap) => self.on_model(snap, port).await,
-            Event::ModelHealth(_) => self.mark_dirty(),
+            Event::ModelHealth(_) => self.mark_all_dirty(),
             Event::TopOfBook { token_id, top } => self.on_top(token_id, *top),
             Event::Book(snap) => self.on_book(snap),
             Event::Risk(risk) => self.on_risk(*risk, port).await,
@@ -179,13 +190,15 @@ impl QuoteManager {
     pub fn on_venue_event(&mut self, ve: &VenueEvent, _now: TimestampMs) {
         match ve {
             VenueEvent::Order(u) => {
-                if let Some(a) = self.active.as_mut() {
+                if let Some(a) = self.windows.get_mut(&u.window) {
                     a.view.apply_order_update(u);
                 }
             }
             VenueEvent::Fill(f) => {
                 let _ = self.inv_mgr.on_event(&Event::Fill(Arc::clone(f)));
-                self.mark_dirty();
+                if let Some(a) = self.windows.get_mut(&f.window) {
+                    a.dirty = true;
+                }
             }
             // User-WS connectivity is a risk-manager concern (it owns the venue
             // stream and trips WsDisconnect); the quoter ignores it.
@@ -199,57 +212,62 @@ impl QuoteManager {
         if self.standing_down {
             return;
         }
-        let planned = {
-            let Some(a) = self.active.as_ref() else {
-                return;
+        // Snapshot the window ids up front so we can re-borrow `self.windows`
+        // mutably in `execute_plan` between iterations (a window is never removed
+        // by a converge, so the ids stay valid).
+        let ids: Vec<WindowId> = self.windows.keys().copied().collect();
+        for window in ids {
+            let planned = {
+                let Some(a) = self.windows.get(&window) else {
+                    continue;
+                };
+                if a.closing || !a.dirty {
+                    continue;
+                }
+                // Rate budget: throttle placements (cancels already ran on the trigger).
+                if let Some(last) = a.last_place_ms
+                    && now.as_millis() - last < self.qm_params.min_requote_interval_ms
+                {
+                    continue; // defer; keep dirty.
+                }
+                let Some(model) = a.last_model else {
+                    continue;
+                };
+                let market = Arc::clone(&a.market);
+                let inv = self.inv_mgr.book(a.window).map_or_else(
+                    || {
+                        InventorySnapshot::derive(
+                            a.window,
+                            SideInventory::default(),
+                            SideInventory::default(),
+                            now,
+                        )
+                    },
+                    |b| b.snapshot(now),
+                );
+                let tau = tau_secs(now, market.close_time);
+                let decision = calculate_quotes(
+                    &model,
+                    &inv,
+                    &market.fees,
+                    &self.quote_params,
+                    tau,
+                    market.tick_size,
+                );
+                let plan = ConvergencePlanner::plan(
+                    &decision,
+                    &a.view,
+                    &market,
+                    model.p_up,
+                    a.p_up_at_last_quote,
+                    self.qm_params.reprice_threshold_theta,
+                    self.qm_params.cancel_market_theta,
+                );
+                Some((plan, market, a.window, model.p_up))
             };
-            if a.closing || !a.dirty {
-                return;
+            if let Some((plan, market, w, p_up)) = planned {
+                self.execute_plan(port, plan, &market, w, p_up, now).await;
             }
-            // Rate budget: throttle placements (cancels already ran on the trigger).
-            if let Some(last) = a.last_place_ms
-                && now.as_millis() - last < self.qm_params.min_requote_interval_ms
-            {
-                return; // defer; keep dirty.
-            }
-            let Some(model) = a.last_model else {
-                return;
-            };
-            let market = Arc::clone(&a.market);
-            let inv = self.inv_mgr.book(a.window).map_or_else(
-                || {
-                    InventorySnapshot::derive(
-                        a.window,
-                        SideInventory::default(),
-                        SideInventory::default(),
-                        now,
-                    )
-                },
-                |b| b.snapshot(now),
-            );
-            let tau = tau_secs(now, market.close_time);
-            let decision = calculate_quotes(
-                &model,
-                &inv,
-                &market.fees,
-                &self.quote_params,
-                tau,
-                market.tick_size,
-            );
-            let plan = ConvergencePlanner::plan(
-                &decision,
-                &a.view,
-                &market,
-                model.p_up,
-                a.p_up_at_last_quote,
-                self.qm_params.reprice_threshold_theta,
-                self.qm_params.cancel_market_theta,
-            );
-            Some((plan, market, a.window, model.p_up))
-        };
-        if let Some((plan, market, window, p_up)) = planned {
-            self.execute_plan(port, plan, &market, window, p_up, now)
-                .await;
         }
     }
 
@@ -263,59 +281,46 @@ impl QuoteManager {
     ) {
         match lifecycle {
             WindowLifecycle::Open => {
-                self.active = Some(ActiveWindow::new(Arc::clone(market)));
+                self.windows
+                    .insert(market.window, ActiveWindow::new(Arc::clone(market)));
                 tracing::info!(target: "quote-manager", window = %market.window, "window open: ready to quote");
             }
             WindowLifecycle::Closing => {
-                if self
-                    .active
-                    .as_ref()
-                    .is_some_and(|a| a.window == market.window)
-                {
-                    if let Some(a) = self.active.as_mut() {
+                // Withdraw ONLY this window's quotes — cancel-market by condition id,
+                // never cancel-all, so closing one window leaves siblings resting.
+                if self.windows.contains_key(&market.window) {
+                    if let Some(a) = self.windows.get_mut(&market.window) {
                         a.closing = true;
                     }
-                    let report = port.cancel_all().await;
-                    self.mark_all_pending_cancel();
-                    tracing::info!(target: "quote-manager", window = %market.window, ok = report.is_ok(), "window closing: cancel-all");
+                    let report = port.cancel_market(&market.condition_id).await;
+                    self.mark_window_pending_cancel(market.window);
+                    tracing::info!(target: "quote-manager", window = %market.window, ok = report.is_ok(), "window closing: cancel-market");
                 }
             }
             WindowLifecycle::Closed => {
-                if self
-                    .active
-                    .as_ref()
-                    .is_some_and(|a| a.window == market.window)
-                {
-                    self.active = None;
-                }
+                self.windows.remove(&market.window);
             }
             WindowLifecycle::Resolved { .. } => {
                 let _ = self.inv_mgr.on_event(&Event::Window {
                     market: Arc::clone(market),
                     lifecycle,
                 });
-                if self
-                    .active
-                    .as_ref()
-                    .is_some_and(|a| a.window == market.window)
-                {
-                    self.active = None;
-                }
+                self.windows.remove(&market.window);
             }
             WindowLifecycle::Discovered => {}
         }
     }
 
     async fn on_model<P: VenuePort>(&mut self, snap: &ModelSnapshot, port: &P) {
-        // Store the snapshot + mark dirty even while standing down, so a recovery
-        // requotes off the latest model.
+        // Route to the snapshot's own window. Store the snapshot + mark dirty even
+        // while standing down, so a recovery requotes off the latest model.
+        let Some(win) = snap.window else {
+            return;
+        };
         {
-            let Some(a) = self.active.as_mut() else {
+            let Some(a) = self.windows.get_mut(&win) else {
                 return;
             };
-            if snap.window != Some(a.window) {
-                return;
-            }
             a.last_model = Some(*snap);
             a.dirty = true;
         }
@@ -324,8 +329,8 @@ impl QuoteManager {
         }
         // Rule B: urgent adverse-move cancel — bypasses the rate budget (a cancel
         // is always safe). The replacement is placed by the next eligible tick.
-        if let Some(action) = self.urgent_cancel_action(snap.p_up) {
-            self.execute_cancels(port, &action).await;
+        if let Some(action) = self.urgent_cancel_action(win, snap.p_up) {
+            self.execute_cancels(port, &action, win).await;
         }
     }
 
@@ -343,9 +348,7 @@ impl QuoteManager {
                 self.tripped.remove(&breaker);
                 if self.tripped.is_empty() {
                     self.standing_down = false;
-                    if let Some(a) = self.active.as_mut() {
-                        a.dirty = true;
-                    }
+                    self.mark_all_dirty();
                     tracing::info!(target: "quote-manager", "all breakers cleared: resuming");
                 }
             }
@@ -354,26 +357,39 @@ impl QuoteManager {
 
     fn on_top(&mut self, token_id: &TokenId, top: TopOfBook) {
         self.tops.insert(token_id.clone(), top);
-        if self.book_touches_our_levels(token_id, &top) {
-            self.mark_dirty();
-        }
+        self.mark_touched_window_dirty(token_id, &top);
     }
 
     fn on_book(&mut self, snap: &BookSnapshot) {
         let top = snap.top();
         self.tops.insert(snap.token_id.clone(), top);
-        if self.book_touches_our_levels(&snap.token_id, &top) {
-            self.mark_dirty();
+        self.mark_touched_window_dirty(&snap.token_id, &top);
+    }
+
+    /// Finds the window owning `token_id` and, if the book top touches one of its
+    /// resting levels, marks that window dirty. A token belongs to exactly one
+    /// active window's market, so at most one window is dirtied.
+    fn mark_touched_window_dirty(&mut self, token_id: &TokenId, top: &TopOfBook) {
+        let touched = self.windows.iter().find_map(|(win, a)| {
+            if a.market.tokens.outcome_of(token_id).is_some()
+                && Self::view_touched(a, token_id, top)
+            {
+                Some(*win)
+            } else {
+                None
+            }
+        });
+        if let Some(w) = touched
+            && let Some(a) = self.windows.get_mut(&w)
+        {
+            a.dirty = true;
         }
     }
 
-    /// Cheap coalescing filter: a book change only dirties the manager if its top
-    /// is at or through one of our resting bid prices on that token (cross risk or
+    /// Cheap coalescing filter: a book change only matters if its top is at or
+    /// through one of the window's resting bid prices on that token (cross risk or
     /// our level now at the touch). Deep-book churn far from our quotes is ignored.
-    fn book_touches_our_levels(&self, token_id: &TokenId, top: &TopOfBook) -> bool {
-        let Some(a) = self.active.as_ref() else {
-            return false;
-        };
+    fn view_touched(a: &ActiveWindow, token_id: &TokenId, top: &TopOfBook) -> bool {
         let our: Vec<Decimal> = a
             .view
             .live_orders()
@@ -400,15 +416,22 @@ impl QuoteManager {
 
     // ---- convergence -------------------------------------------------------
 
-    /// Issues cancels, marking each affected order pending-cancel in the view so a
-    /// racing trigger does not re-cancel it.
-    async fn execute_cancels<P: VenuePort>(&mut self, port: &P, action: &CancelAction) {
+    /// Issues cancels for `window`, marking each affected order pending-cancel in
+    /// that window's view so a racing trigger does not re-cancel it. A scoped
+    /// `Market` cancel touches only `window`; a `CancelAction::All` (risk paths)
+    /// stays global.
+    async fn execute_cancels<P: VenuePort>(
+        &mut self,
+        port: &P,
+        action: &CancelAction,
+        window: WindowId,
+    ) {
         match action {
             CancelAction::None => {}
             CancelAction::Orders(ids) => {
                 for id in ids {
                     let report = port.cancel(id).await;
-                    if let Some(a) = self.active.as_mut() {
+                    if let Some(a) = self.windows.get_mut(&window) {
                         a.view.mark_pending_cancel(id);
                     }
                     tracing::info!(target: "quote-manager", order = %id, ok = report.is_ok(), "cancel (cancel-first)");
@@ -416,7 +439,7 @@ impl QuoteManager {
             }
             CancelAction::Market(cid) => {
                 let report = port.cancel_market(cid).await;
-                self.mark_all_pending_cancel();
+                self.mark_window_pending_cancel(window);
                 tracing::info!(target: "quote-manager", market = %cid, ok = report.is_ok(), "cancel-market (large move)");
             }
             CancelAction::All => {
@@ -441,7 +464,7 @@ impl QuoteManager {
         let converged = matches!(plan.rationale, ConvergeRationale::AlreadyConverged);
 
         // 1. Cancels first — awaited before any placement (split-cycle).
-        self.execute_cancels(port, &plan.cancels).await;
+        self.execute_cancels(port, &plan.cancels, window).await;
 
         // 1b. Defense in depth (§8/§11): independently re-check the final-seconds
         //     rules the calculator already enforces (G4 no-passive, S6 ATM
@@ -536,9 +559,7 @@ impl QuoteManager {
                                     OrderQty::Shares(s) => s,
                                     OrderQty::Notional(_) => Size::ZERO,
                                 };
-                                if let Some(a) = self.active.as_mut()
-                                    && a.window == window
-                                {
+                                if let Some(a) = self.windows.get_mut(&window) {
                                     a.view.record_pending(
                                         acc.order_id,
                                         *cid,
@@ -567,9 +588,7 @@ impl QuoteManager {
         if placed_any {
             self.place_cycles += 1;
         }
-        if let Some(a) = self.active.as_mut()
-            && a.window == window
-        {
+        if let Some(a) = self.windows.get_mut(&window) {
             if placed_any {
                 a.last_place_ms = Some(now.as_millis());
                 a.p_up_at_last_quote = Some(p_up);
@@ -582,14 +601,27 @@ impl QuoteManager {
 
     // ---- helpers -----------------------------------------------------------
 
-    fn mark_dirty(&mut self) {
-        if let Some(a) = self.active.as_mut() {
+    /// Marks every active window's quotes dirty (a global trigger: a model-health
+    /// change or a breaker recovery — re-evaluate them all).
+    fn mark_all_dirty(&mut self) {
+        for a in self.windows.values_mut() {
             a.dirty = true;
         }
     }
 
+    /// Marks every live order for `window` pending-cancel (a scoped cancel).
+    fn mark_window_pending_cancel(&mut self, window: WindowId) {
+        if let Some(a) = self.windows.get_mut(&window) {
+            for id in a.view.live_ids() {
+                a.view.mark_pending_cancel(&id);
+            }
+        }
+    }
+
+    /// Marks every live order on every window pending-cancel (a global cancel-all,
+    /// the risk-veto path).
     fn mark_all_pending_cancel(&mut self) {
-        if let Some(a) = self.active.as_mut() {
+        for a in self.windows.values_mut() {
             for id in a.view.live_ids() {
                 a.view.mark_pending_cancel(&id);
             }
@@ -606,8 +638,8 @@ impl QuoteManager {
     /// than θ against a resting quote, cancel the *endangered* side immediately
     /// (Up-buys when fair fell, Down-buys when fair rose); escalate to a bulk
     /// market cancel on a move larger than `cancel_market_theta`.
-    fn urgent_cancel_action(&self, p_up_now: f64) -> Option<CancelAction> {
-        let a = self.active.as_ref()?;
+    fn urgent_cancel_action(&self, window: WindowId, p_up_now: f64) -> Option<CancelAction> {
+        let a = self.windows.get(&window)?;
         if a.closing || !a.view.has_live_cancelable() {
             return None;
         }
@@ -638,5 +670,11 @@ impl QuoteManager {
         Some(CancelAction::Orders(
             ids.into_iter().map(|(.., id)| id).collect(),
         ))
+    }
+}
+
+impl RestingLookup for QuoteManager {
+    fn resting_view_for(&self, window: WindowId) -> Option<&RestingView> {
+        self.windows.get(&window).map(|a| &a.view)
     }
 }

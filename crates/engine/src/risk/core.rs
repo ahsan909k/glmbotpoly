@@ -65,6 +65,18 @@ pub enum RiskOutput {
     CancelMarket(ConditionId),
 }
 
+/// Per-window fair-vs-mid sanity accounting (the `FairVsMid` breaker input).
+#[derive(Default)]
+struct WindowSanity {
+    /// Latest model `p_up` for this window.
+    last_p_up: Option<f64>,
+    /// Latest Up-token book mid for this window.
+    last_mid: Option<f64>,
+    /// When this window first breached the sanity bound (dwell anchor); `None`
+    /// while within bound.
+    breach_since: Option<TimestampMs>,
+}
+
 /// The §11 breaker state machine (sans-IO).
 pub(crate) struct RiskCore {
     // thresholds (copied from RiskParams at construction)
@@ -99,12 +111,11 @@ pub(crate) struct RiskCore {
     /// permanent global halt after the first window rollover.
     ended_windows: HashSet<WindowId>,
 
-    // sanity (fair vs mid)
-    active_window: Option<WindowId>,
-    active_up_token: Option<TokenId>,
-    last_mid: Option<f64>,
-    last_p_up: Option<f64>,
-    sanity_breach_since: Option<TimestampMs>,
+    // sanity (fair vs mid) — per window; any window over the dwell trips the
+    // global FairVsMid halt (semantics unchanged — still a global breaker).
+    sanity: HashMap<WindowId, WindowSanity>,
+    /// Up token → the window it belongs to, for routing an incoming mid.
+    sanity_up_token: HashMap<TokenId, WindowId>,
 
     // error rate + engine restart
     infra_errors: VecDeque<TimestampMs>,
@@ -159,11 +170,8 @@ impl RiskCore {
             ws_down_windows: HashSet::new(),
             user_ws_down: false,
             ended_windows: HashSet::new(),
-            active_window: None,
-            active_up_token: None,
-            last_mid: None,
-            last_p_up: None,
-            sanity_breach_since: None,
+            sanity: HashMap::new(),
+            sanity_up_token: HashMap::new(),
             infra_errors: VecDeque::new(),
             engine_restart_last: None,
             daily_realized: Dollars::ZERO,
@@ -223,7 +231,7 @@ impl RiskCore {
             open_notional_cap: self.max_open_notional,
             daily_pnl: self.daily_realized,
             error_count: u32::try_from(self.infra_errors.len()).unwrap_or(u32::MAX),
-            sanity_breached: self.sanity_breach_since.is_some(),
+            sanity_breached: self.sanity.values().any(|s| s.breach_since.is_some()),
             globally_halted: !self.tripped.is_empty(),
         }
     }
@@ -330,25 +338,34 @@ impl RiskCore {
                 }
             }
             Event::TopOfBook { token_id, top } => {
-                if self.active_up_token.as_ref() == Some(token_id.as_ref())
+                if let Some(w) = self.sanity_up_token.get(token_id.as_ref()).copied()
                     && let Some(m) = mid_of(top)
                 {
-                    self.last_mid = Some(m);
+                    self.sanity.entry(w).or_default().last_mid = Some(m);
                     self.recompute_sanity(now, &mut out);
                 }
             }
             Event::Book(snap) => {
-                if self.active_up_token.as_ref() == Some(&snap.token_id)
+                if let Some(w) = self.sanity_up_token.get(&snap.token_id).copied()
                     && let Some(m) = mid_of(&snap.top())
                 {
-                    self.last_mid = Some(m);
+                    self.sanity.entry(w).or_default().last_mid = Some(m);
                     self.recompute_sanity(now, &mut out);
                 }
             }
             Event::Model(snap) => {
-                if self.active_window.is_some() && snap.window == self.active_window {
-                    self.last_p_up = Some(snap.p_up);
-                    self.recompute_sanity(now, &mut out);
+                // Fold p_up for a window we currently track (open) — mirrors the
+                // original `active_window == snap.window` gate, now per window.
+                if let Some(w) = snap.window {
+                    let folded = if let Some(s) = self.sanity.get_mut(&w) {
+                        s.last_p_up = Some(snap.p_up);
+                        true
+                    } else {
+                        false
+                    };
+                    if folded {
+                        self.recompute_sanity(now, &mut out);
+                    }
                 }
             }
             Event::Window { market, lifecycle } => {
@@ -417,18 +434,13 @@ impl RiskCore {
     ) {
         match lifecycle {
             WindowLifecycle::Open => {
-                self.active_window = Some(window);
-                self.active_up_token = Some(up_token);
-                self.last_mid = None;
-                self.last_p_up = None;
-                self.sanity_breach_since = None;
+                // Fresh per-window sanity slot + its up-token routing on open.
+                self.sanity.insert(window, WindowSanity::default());
+                self.sanity_up_token.insert(up_token, window);
             }
             WindowLifecycle::Closing | WindowLifecycle::Discovered => {}
             WindowLifecycle::Closed => {
-                if self.active_window == Some(window) {
-                    self.active_window = None;
-                    self.active_up_token = None;
-                }
+                self.prune_window_sanity(window, now, out);
                 self.end_window_book_health(window, now, out);
             }
             WindowLifecycle::Resolved { .. } => {
@@ -438,12 +450,26 @@ impl RiskCore {
                     }
                 }
                 self.resume_window(window, out);
-                if self.active_window == Some(window) {
-                    self.active_window = None;
-                    self.active_up_token = None;
-                }
+                self.prune_window_sanity(window, now, out);
                 self.end_window_book_health(window, now, out);
             }
+        }
+    }
+
+    /// Drops a window's sanity accounting (and its up-token routing) on
+    /// Closed/Resolved, then re-evaluates the global `FairVsMid` breaker so a halt
+    /// that was held only by the departing window clears once no live window
+    /// breaches. Bounds memory for 24/7 operation.
+    fn prune_window_sanity(
+        &mut self,
+        window: WindowId,
+        now: TimestampMs,
+        out: &mut Vec<RiskOutput>,
+    ) {
+        let removed = self.sanity.remove(&window).is_some();
+        self.sanity_up_token.retain(|_, w| *w != window);
+        if removed {
+            self.recompute_sanity(now, out);
         }
     }
 
@@ -549,17 +575,29 @@ impl RiskCore {
     }
 
     fn recompute_sanity(&mut self, now: TimestampMs, out: &mut Vec<RiskOutput>) {
-        let diverged = match (self.last_p_up, self.last_mid) {
-            (Some(p), Some(m)) => (p - m).abs() > self.sanity_bound,
-            _ => false,
-        };
-        if diverged {
-            let since = *self.sanity_breach_since.get_or_insert(now);
-            if now.as_millis().saturating_sub(since.as_millis()) >= self.sanity_bound_duration_ms {
-                self.trip_global(BreakerKind::FairVsMid, out);
+        // Per window: track each window's own dwell timer; the GLOBAL FairVsMid
+        // trips iff ANY window has diverged past the dwell, and clears only when
+        // NONE is over the dwell (a healthy sibling never clears a diverged one).
+        let bound = self.sanity_bound;
+        let dwell = self.sanity_bound_duration_ms;
+        let mut any_over_dwell = false;
+        for s in self.sanity.values_mut() {
+            let diverged = match (s.last_p_up, s.last_mid) {
+                (Some(p), Some(m)) => (p - m).abs() > bound,
+                _ => false,
+            };
+            if diverged {
+                let since = *s.breach_since.get_or_insert(now);
+                if now.as_millis().saturating_sub(since.as_millis()) >= dwell {
+                    any_over_dwell = true;
+                }
+            } else {
+                s.breach_since = None;
             }
+        }
+        if any_over_dwell {
+            self.trip_global(BreakerKind::FairVsMid, out);
         } else {
-            self.sanity_breach_since = None;
             self.clear_global(BreakerKind::FairVsMid, out);
         }
     }
@@ -741,9 +779,12 @@ mod tests {
         })
     }
     fn model(p_up: f64, ms: i64) -> Event {
+        model_for(window(), p_up, ms)
+    }
+    fn model_for(win: WindowId, p_up: f64, ms: i64) -> Event {
         Event::Model(ModelSnapshot {
             asset: Asset::Btc,
-            window: Some(window()),
+            window: Some(win),
             p_up,
             z: 0.0,
             sigma_1s: 5e-4,
@@ -1232,6 +1273,66 @@ mod tests {
         assert!(c.on_tick(ts(OPEN_MS + 2000)).is_empty());
         let out = c.on_event(&model(0.50, OPEN_MS + 2500), ts(OPEN_MS + 2500));
         assert!(tripped_in(&out).is_empty());
+        assert!(!c.is_globally_halted());
+    }
+
+    /// Per-window FairVsMid: window A diverging past the dwell trips the GLOBAL
+    /// halt, and a perfectly healthy sibling window B must NOT clear it while A
+    /// stays diverged. Only A recovering clears the global breaker.
+    #[test]
+    fn second_window_divergence_trips_and_healthy_sibling_does_not_clear() {
+        let mut c = core();
+        open_window(&mut c); // window A (window(), up_token())
+
+        // Open a second window B: same series, later open, its own up token.
+        let win_b = WindowId {
+            series: series(),
+            open_time: ts(OPEN_MS + 300_000),
+        };
+        let up_b = TokenId::new("333").unwrap();
+        let mut m_b = (*market()).clone();
+        m_b.window = win_b;
+        m_b.tokens = TokenPair {
+            up: up_b.clone(),
+            down: TokenId::new("444").unwrap(),
+        };
+        m_b.close_time = ts(OPEN_MS + 600_000);
+        let _ = c.on_event(
+            &Event::Window {
+                market: Arc::new(m_b),
+                lifecycle: WindowLifecycle::Open,
+            },
+            ts(OPEN_MS + 300_000),
+        );
+
+        // Window A diverges (mid ~0.50, p_up 0.85) and stays diverged past the dwell.
+        let _ = c.on_event(
+            &top_event(up_token(), dec!(0.49), dec!(0.51), OPEN_MS),
+            ts(OPEN_MS),
+        );
+        let _ = c.on_event(&model(0.85, OPEN_MS), ts(OPEN_MS));
+        let out = c.on_tick(ts(OPEN_MS + 3000));
+        assert_eq!(tripped_in(&out), vec![BreakerKind::FairVsMid]);
+        assert!(c.is_globally_halted());
+
+        // Window B is perfectly healthy (mid ≈ p_up) — it must NOT clear the halt.
+        let _ = c.on_event(
+            &top_event(up_b.clone(), dec!(0.49), dec!(0.51), OPEN_MS + 300_100),
+            ts(OPEN_MS + 300_100),
+        );
+        let out = c.on_event(
+            &model_for(win_b, 0.50, OPEN_MS + 300_100),
+            ts(OPEN_MS + 300_100),
+        );
+        assert!(
+            cleared_in(&out).is_empty(),
+            "a healthy sibling must not clear window A's halt"
+        );
+        assert!(c.is_globally_halted(), "A still diverged ⇒ still halted");
+
+        // A recovers → the global FairVsMid clears.
+        let out = c.on_event(&model(0.50, OPEN_MS + 3500), ts(OPEN_MS + 3500));
+        assert_eq!(cleared_in(&out), vec![BreakerKind::FairVsMid]);
         assert!(!c.is_globally_halted());
     }
 

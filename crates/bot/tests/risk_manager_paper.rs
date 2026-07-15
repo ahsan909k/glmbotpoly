@@ -251,7 +251,7 @@ fn count_state(recorded: &[VenueEvent], state: OrderState) -> usize {
         .count()
 }
 fn resting_len(risk: &RiskManager) -> usize {
-    risk.resting_view().map_or(0, |v| v.len())
+    risk.total_resting_len()
 }
 
 /// Feeds window-open + both books + a Ready model, converges the quoter, and

@@ -9,11 +9,12 @@
 //! taker fees on both legs). [`filter_asks`] removes (or shrinks) exactly those
 //! ask levels before any taker walks the book.
 //!
-//! Pure and sans-IO. Naturally window-scoped: the quoter's [`RestingView`] holds
-//! only its single active window, and each resting order is additionally matched
-//! on its [`WindowId`], so the filter is a no-op for any window the quoter is not
-//! currently quoting (and when `resting` is `None`) — which is exactly when a
-//! self-match is impossible.
+//! Pure and sans-IO. Naturally window-scoped: the caller passes the maker's
+//! per-window [`RestingView`] for the exact window being taken (resolved via
+//! [`RestingLookup`](crate::quote_manager::RestingLookup)), and each resting order
+//! is additionally matched on its [`WindowId`], so the filter is a no-op for any
+//! window the maker is not currently quoting (and when `resting` is `None`) —
+//! which is exactly when a self-match is impossible.
 //!
 //! Paper venues cannot reproduce the collision (a paper FAK never matches our own
 //! resting paper orders — disjoint books), so this guard is proven by the unit
@@ -30,8 +31,8 @@ use crate::quote_manager::RestingView;
 /// (`original_size − filled_size`) of our live resting BUY orders on
 /// `outcome.opposite()` at `p.complement()` in the same `window`. A level fully
 /// covered by our own liquidity is dropped; a partially-covered one is shrunk to
-/// the external remainder. When `resting` is `None` (no active quoter window) the
-/// asks are returned unchanged.
+/// the external remainder. When `resting` is `None` (the maker is not quoting this
+/// window) the asks are returned unchanged.
 #[must_use]
 pub fn filter_asks(
     outcome: Outcome,

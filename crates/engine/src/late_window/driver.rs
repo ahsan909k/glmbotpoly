@@ -29,15 +29,15 @@ use std::sync::Arc;
 
 use core_types::{
     AnchorSource, BookSnapshot, BreakerKind, Decimal, Dollars, Event, Liquidity, MarketInfo,
-    ModelSnapshot, OrderQty, Outcome, RiskEvent, Side, TimeInForce, TimestampMs, TokenId, WindowId,
-    WindowLifecycle,
+    ModelSnapshot, OrderId, OrderQty, Outcome, RiskEvent, Side, TimeInForce, TimestampMs, TokenId,
+    WindowId, WindowLifecycle,
 };
 use venue_api::{VenueEvent, VenuePort};
 
 use super::edge::{CertaintyTakePlan, plan_certainty_take};
 use super::{LateWindowTakerParams, NoLateTakeReason};
 use crate::normalize::{NormalizerParams, OrderDraft, normalize};
-use crate::quote_manager::RestingView;
+use crate::quote_manager::RestingLookup;
 
 /// Seconds remaining to close, clamped at zero — computed inline so the driver
 /// needs no `timeutil` dependency (the `quote_manager`/`taker` precedent).
@@ -46,10 +46,44 @@ fn tau_secs(now: TimestampMs, close: TimestampMs) -> f64 {
     if ms <= 0 { 0.0 } else { ms as f64 / 1000.0 }
 }
 
-/// The active window the taker is currently trading.
-struct Active {
-    window: WindowId,
+/// Per-window late-window-taker state: the market, the cached books, the latest
+/// model snapshot, and the committed-in-flight budget/cooldown for this window.
+struct State {
     market: Arc<MarketInfo>,
+    /// Latest full book per this window's token (depth for sizing).
+    books: HashMap<TokenId, Arc<BookSnapshot>>,
+    /// Latest model snapshot for this window.
+    last_model: Option<ModelSnapshot>,
+    /// Realized taker spend this window (from our own fills).
+    realized_spent: Dollars,
+    /// Committed-but-not-yet-realized notional per in-flight take order.
+    pending: HashMap<OrderId, Dollars>,
+    /// Order ids of takes we placed on this window (fill attribution).
+    our_orders: HashSet<OrderId>,
+    /// Wall time (ms) of the last fired take — the cooldown anchor.
+    last_take_ms: Option<i64>,
+}
+
+impl State {
+    fn new(market: Arc<MarketInfo>) -> Self {
+        Self {
+            market,
+            books: HashMap::new(),
+            last_model: None,
+            realized_spent: Dollars::ZERO,
+            pending: HashMap::new(),
+            our_orders: HashSet::new(),
+            last_take_ms: None,
+        }
+    }
+
+    /// Budget committed so far this window: realized fills plus in-flight notional.
+    fn effective_spent(&self) -> Dollars {
+        self.pending
+            .values()
+            .copied()
+            .fold(self.realized_spent, |acc, p| acc + p)
+    }
 }
 
 /// A fully-vetted take decision: the FAK to build.
@@ -67,24 +101,14 @@ struct Decision {
 pub struct LateWindowTaker {
     params: LateWindowTakerParams,
     normalizer_params: NormalizerParams,
-    /// Latest model snapshot.
-    last_model: Option<ModelSnapshot>,
-    /// Latest full book per active-window token (depth for sizing).
-    books: HashMap<TokenId, Arc<BookSnapshot>>,
-    /// The active window, if one is open.
-    active: Option<Active>,
+    /// Per-window state — the taker trades every active window concurrently.
+    windows: HashMap<WindowId, State>,
+    /// `order_id → window`, so a venue fill finds its budget in O(1).
+    order_window: HashMap<OrderId, WindowId>,
     /// True while a risk breaker holds the taker down.
     standing_down: bool,
     /// Currently-tripped breakers (stand down until empty).
     tripped: HashSet<BreakerKind>,
-    /// Realized taker spend this window (from our own fills).
-    realized_spent: Dollars,
-    /// Committed-but-not-yet-realized notional per in-flight take order.
-    pending: HashMap<core_types::OrderId, Dollars>,
-    /// Order ids of takes we placed this window (fill attribution).
-    our_orders: HashSet<core_types::OrderId>,
-    /// Wall time (ms) of the last fired take — the cooldown anchor.
-    last_take_ms: Option<i64>,
     /// Monotonic per-process placement sequence (client-id uniqueness).
     seq: u64,
     /// Count of takes fired so far (test/diagnostic metric).
@@ -98,15 +122,10 @@ impl LateWindowTaker {
         Self {
             params,
             normalizer_params,
-            last_model: None,
-            books: HashMap::new(),
-            active: None,
+            windows: HashMap::new(),
+            order_window: HashMap::new(),
             standing_down: false,
             tripped: HashSet::new(),
-            realized_spent: Dollars::ZERO,
-            pending: HashMap::new(),
-            our_orders: HashSet::new(),
-            last_take_ms: None,
             seq: 0,
             take_count: 0,
         }
@@ -118,19 +137,20 @@ impl LateWindowTaker {
         self.take_count
     }
 
-    /// Realized taker spend this window (from our own fills).
+    /// Realized taker spend across all live windows (from our own fills).
     #[must_use]
     pub fn realized_spent(&self) -> Dollars {
-        self.realized_spent
+        self.windows
+            .values()
+            .fold(Dollars::ZERO, |acc, st| acc + st.realized_spent)
     }
 
-    /// Budget committed so far this window: realized fills plus in-flight notional.
+    /// Committed-in-flight taker spend across all live windows.
     #[must_use]
     pub fn effective_spent(&self) -> Dollars {
-        self.pending
+        self.windows
             .values()
-            .copied()
-            .fold(self.realized_spent, |acc, p| acc + p)
+            .fold(Dollars::ZERO, |acc, st| acc + st.effective_spent())
     }
 
     /// Whether a risk breaker currently holds the taker down.
@@ -141,39 +161,41 @@ impl LateWindowTaker {
 
     /// Whether `id` is one of this taker's placed orders (driver attribution).
     #[must_use]
-    pub fn owns(&self, id: &core_types::OrderId) -> bool {
-        self.our_orders.contains(id)
+    pub fn owns(&self, id: &OrderId) -> bool {
+        self.order_window.contains_key(id)
     }
 
-    /// Handles one bus event; attempts a take after a model or active-token book
-    /// update (a fresh fair or a fresh book may have opened the endgame). A price
-    /// tick is ignored — this taker uses no fast-feed signal.
+    /// Handles one bus event; attempts a take on the affected window after a model
+    /// or active-token book update (a fresh fair or a fresh book may have opened the
+    /// endgame). A price tick is ignored — this taker uses no fast-feed signal.
     pub async fn on_event<P: VenuePort>(
         &mut self,
         event: &Event,
         port: &P,
         now: TimestampMs,
-        resting: Option<&RestingView>,
+        resting: Option<&dyn RestingLookup>,
     ) {
-        if self.ingest(event) {
-            self.attempt_take(port, now, resting).await;
+        if let Some(window) = self.ingest(event) {
+            self.attempt_take(window, port, now, resting).await;
         }
     }
 
     /// Folds one item from the venue's order/fill stream: our own fills charge the
-    /// budget; a terminal update on one of our orders drops its in-flight residual.
+    /// owning window's budget; a terminal update drops its in-flight residual.
     pub fn on_venue_event(&mut self, ve: &VenueEvent, _now: TimestampMs) {
         match ve {
             VenueEvent::Fill(f) => {
-                if self.our_orders.contains(&f.order_id) {
+                if let Some(w) = self.order_window.get(&f.order_id).copied()
+                    && let Some(st) = self.windows.get_mut(&w)
+                {
                     debug_assert_eq!(
                         f.liquidity,
                         Liquidity::Taker,
                         "the late-window taker only ever fires FAK taker orders"
                     );
                     let filled = Dollars::new(f.price.as_decimal() * f.size.as_decimal());
-                    self.realized_spent = self.realized_spent + filled;
-                    if let Some(rem) = self.pending.get_mut(&f.order_id) {
+                    st.realized_spent = st.realized_spent + filled;
+                    if let Some(rem) = st.pending.get_mut(&f.order_id) {
                         let after = *rem - filled;
                         *rem = if after.is_negative() {
                             Dollars::ZERO
@@ -185,9 +207,12 @@ impl LateWindowTaker {
                 }
             }
             VenueEvent::Order(u) => {
-                if u.state.is_terminal() && self.our_orders.contains(&u.order_id) {
+                if u.state.is_terminal()
+                    && let Some(w) = self.order_window.get(&u.order_id).copied()
+                    && let Some(st) = self.windows.get_mut(&w)
+                {
                     // FAK remainder killed — the unfilled part was never spent.
-                    self.pending.remove(&u.order_id);
+                    st.pending.remove(&u.order_id);
                 }
             }
             // User-WS connectivity is a risk-manager concern; the taker ignores it.
@@ -197,68 +222,63 @@ impl LateWindowTaker {
 
     // ---- ingestion (sync) --------------------------------------------------
 
-    /// Applies one bus event to the taker's state. Returns `true` when a take
-    /// should be attempted (a model update, or a fresh book on an active token).
-    fn ingest(&mut self, event: &Event) -> bool {
+    /// Applies one bus event to the taker's state. Returns the window to attempt a
+    /// take on when a take should be re-evaluated (a model update or a fresh book
+    /// on an active token); `None` otherwise.
+    fn ingest(&mut self, event: &Event) -> Option<WindowId> {
         match event {
             // No fast feed: the late-window decision is Chainlink-anchored only,
             // so price ticks never feed it.
-            Event::PriceTick(_) => false,
+            Event::PriceTick(_) => None,
             Event::Model(snap) => {
-                self.last_model = Some(*snap);
-                true
+                let win = snap.window?;
+                if let Some(st) = self.windows.get_mut(&win) {
+                    st.last_model = Some(*snap);
+                    Some(win)
+                } else {
+                    None
+                }
             }
-            Event::Book(snap) => self.cache_active_book(snap),
+            Event::Book(snap) => self.cache_book(snap),
             Event::Window { market, lifecycle } => {
                 self.on_window(market, *lifecycle);
-                false
+                None
             }
             Event::Risk(risk) => {
                 self.on_risk(*risk);
-                false
+                None
             }
-            _ => false,
+            _ => None,
         }
     }
 
-    /// Caches a book iff it belongs to the active window's tokens; returns whether
-    /// it did (and therefore whether a take should be re-evaluated).
-    fn cache_active_book(&mut self, snap: &Arc<BookSnapshot>) -> bool {
-        let is_active = self
-            .active
-            .as_ref()
-            .is_some_and(|a| a.market.tokens.outcome_of(&snap.token_id).is_some());
-        if is_active {
-            self.books.insert(snap.token_id.clone(), Arc::clone(snap));
+    /// Caches a book onto whichever active window owns its token; returns that
+    /// window (so a take can be re-evaluated) if it belonged to one.
+    fn cache_book(&mut self, snap: &Arc<BookSnapshot>) -> Option<WindowId> {
+        for (win, st) in &mut self.windows {
+            if st.market.tokens.outcome_of(&snap.token_id).is_some() {
+                st.books.insert(snap.token_id.clone(), Arc::clone(snap));
+                return Some(*win);
+            }
         }
-        is_active
+        None
     }
 
     fn on_window(&mut self, market: &Arc<MarketInfo>, lifecycle: WindowLifecycle) {
         match lifecycle {
             WindowLifecycle::Open => {
-                self.active = Some(Active {
-                    window: market.window,
-                    market: Arc::clone(market),
-                });
-                // Fresh per-window budget/cooldown/attribution; books re-arrive.
-                self.realized_spent = Dollars::ZERO;
-                self.pending.clear();
-                self.our_orders.clear();
-                self.books.clear();
-                self.last_take_ms = None;
+                // Fresh per-window state (budget/cooldown/orders/books) on open.
+                self.windows
+                    .insert(market.window, State::new(Arc::clone(market)));
                 tracing::info!(target: "late-window-taker", window = %market.window, "window open: late taker armed");
             }
             WindowLifecycle::Closing
             | WindowLifecycle::Closed
             | WindowLifecycle::Resolved { .. } => {
-                if self
-                    .active
-                    .as_ref()
-                    .is_some_and(|a| a.window == market.window)
-                {
-                    self.active = None;
-                    tracing::debug!(target: "late-window-taker", window = %market.window, ?lifecycle, "window ended: late taker stood down");
+                let w = market.window;
+                if self.windows.remove(&w).is_some() {
+                    self.order_window.retain(|_, ow| *ow != w);
+                    tracing::debug!(target: "late-window-taker", window = %w, ?lifecycle, "window ended: late taker stood down");
                 }
             }
             WindowLifecycle::Discovered => {}
@@ -291,21 +311,24 @@ impl LateWindowTaker {
     /// every non-fire is explainable. Pure and synchronous.
     fn decide(
         &self,
+        window: WindowId,
         now: TimestampMs,
-        resting: Option<&RestingView>,
+        resting: Option<&dyn RestingLookup>,
     ) -> Result<Decision, NoLateTakeReason> {
         if self.standing_down {
             return Err(NoLateTakeReason::StandingDown);
         }
-        let active = self
-            .active
-            .as_ref()
+        let st = self
+            .windows
+            .get(&window)
             .ok_or(NoLateTakeReason::NoActiveWindow)?;
-        let model = self.last_model.ok_or(NoLateTakeReason::NoModel)?;
-        if model.window != Some(active.window) {
+        let model = st.last_model.ok_or(NoLateTakeReason::NoModel)?;
+        // Defensive: the model is stored in its own window's slot, so this always
+        // holds — kept as a belt-and-suspenders (and for the typed reason).
+        if model.window != Some(window) {
             return Err(NoLateTakeReason::WindowMismatch {
                 model: model.window,
-                active: active.window,
+                active: window,
             });
         }
         if !model.health.allows_quoting() {
@@ -328,7 +351,7 @@ impl LateWindowTaker {
             return Err(NoLateTakeReason::UnusableFair { p_up });
         }
         // Defensive expiry guard, then the late-window activation.
-        let tau = tau_secs(now, active.market.close_time);
+        let tau = tau_secs(now, st.market.close_time);
         if tau <= 0.0 {
             return Err(NoLateTakeReason::Expired { tau_secs: tau });
         }
@@ -352,7 +375,7 @@ impl LateWindowTaker {
             });
         };
         // Cooldown.
-        if let Some(last) = self.last_take_ms {
+        if let Some(last) = st.last_take_ms {
             let elapsed = now.as_millis() - last;
             if elapsed < self.params.cooldown_ms {
                 return Err(NoLateTakeReason::InCooldown {
@@ -360,32 +383,34 @@ impl LateWindowTaker {
                 });
             }
         }
-        // Budget (committed-in-flight aware).
-        let remaining = self.params.budget_per_window - self.effective_spent();
+        // Budget (committed-in-flight aware, per window).
+        let remaining = self.params.budget_per_window - st.effective_spent();
         if remaining.as_decimal() < Decimal::ONE {
             return Err(NoLateTakeReason::BudgetExhausted {
                 remaining,
                 need: Dollars::new(Decimal::ONE),
             });
         }
-        let token_id = active.market.tokens.get(outcome).clone();
-        let book = self
+        let token_id = st.market.tokens.get(outcome).clone();
+        let book = st
             .books
             .get(&token_id)
             .ok_or(NoLateTakeReason::NoBookForToken)?;
-        let fees = &active.market.fees;
+        let fees = &st.market.fees;
         let fee_rate = if fees.enabled {
             fees.rate
         } else {
             Decimal::ZERO
         };
-        // §7 self-match filter: never lift our own mirrored resting liquidity.
-        let asks = crate::self_match::filter_asks(outcome, &book.asks, active.window, resting);
+        // §7 self-match filter: never lift our own mirrored resting liquidity on
+        // this window (the maker's per-window view).
+        let view = resting.and_then(|r| r.resting_view_for(window));
+        let asks = crate::self_match::filter_asks(outcome, &book.asks, window, view);
         let plan = plan_certainty_take(outcome, &asks, fee_rate, self.params.price_cap, remaining)?;
         Ok(Decision {
             outcome,
             token_id,
-            market: Arc::clone(&active.market),
+            market: Arc::clone(&st.market),
             plan,
         })
     }
@@ -394,19 +419,26 @@ impl LateWindowTaker {
 
     async fn attempt_take<P: VenuePort>(
         &mut self,
+        window: WindowId,
         port: &P,
         now: TimestampMs,
-        resting: Option<&RestingView>,
+        resting: Option<&dyn RestingLookup>,
     ) {
-        match self.decide(now, resting) {
-            Ok(decision) => self.fire(port, decision, now).await,
+        match self.decide(window, now, resting) {
+            Ok(decision) => self.fire(window, port, decision, now).await,
             Err(reason) => {
                 tracing::debug!(target: "late-window-taker", reason = %reason, "no take");
             }
         }
     }
 
-    async fn fire<P: VenuePort>(&mut self, port: &P, decision: Decision, now: TimestampMs) {
+    async fn fire<P: VenuePort>(
+        &mut self,
+        window: WindowId,
+        port: &P,
+        decision: Decision,
+        now: TimestampMs,
+    ) {
         let seq = self.next_seq();
         let open_ms = decision.market.window.open_time.as_millis();
         let draft = OrderDraft {
@@ -431,9 +463,13 @@ impl LateWindowTaker {
         };
         match port.place(&order).await {
             Ok(acc) => {
-                self.our_orders.insert(acc.order_id.clone());
-                self.pending.insert(acc.order_id, decision.plan.notional);
-                self.last_take_ms = Some(now.as_millis());
+                if let Some(st) = self.windows.get_mut(&window) {
+                    st.our_orders.insert(acc.order_id.clone());
+                    st.pending
+                        .insert(acc.order_id.clone(), decision.plan.notional);
+                    st.last_take_ms = Some(now.as_millis());
+                }
+                self.order_window.insert(acc.order_id, window);
                 self.take_count += 1;
                 tracing::info!(
                     target: "late-window-taker",
@@ -454,6 +490,24 @@ impl LateWindowTaker {
         let s = self.seq;
         self.seq = self.seq.wrapping_add(1);
         s
+    }
+}
+
+#[cfg(test)]
+impl LateWindowTaker {
+    /// Test-only: mutable access to a window's per-window state.
+    fn test_state_mut(&mut self, w: WindowId) -> &mut State {
+        self.windows.get_mut(&w).expect("open window state")
+    }
+
+    /// Test-only: registers `oid` as an in-flight take on `w` (the post-fire
+    /// bookkeeping) with `notional` pending — for budget-reconciliation tests.
+    fn test_register_pending(&mut self, w: WindowId, oid: OrderId, notional: Dollars) {
+        if let Some(st) = self.windows.get_mut(&w) {
+            st.our_orders.insert(oid.clone());
+            st.pending.insert(oid.clone(), notional);
+        }
+        self.order_window.insert(oid, w);
     }
 }
 
@@ -639,7 +693,7 @@ mod tests {
     #[test]
     fn happy_path_decides_an_up_take() {
         let t = armed_up();
-        let d = t.decide(ts(LATE_MS), None).expect("a take");
+        let d = t.decide(window(), ts(LATE_MS), None).expect("a take");
         assert_eq!(d.outcome, Outcome::Up);
         assert_eq!(d.token_id, up_token());
         assert_eq!(d.plan.worst_price.as_decimal(), dec!(0.98));
@@ -657,7 +711,7 @@ mod tests {
             down_token(),
             &[(dec!(0.98), dec!(50))],
         );
-        let d = t.decide(ts(LATE_MS), None).expect("a down take");
+        let d = t.decide(window(), ts(LATE_MS), None).expect("a down take");
         assert_eq!(d.outcome, Outcome::Down);
         assert_eq!(d.token_id, down_token());
     }
@@ -674,7 +728,9 @@ mod tests {
             &[(dec!(0.95), dec!(50))],
         );
         assert_eq!(
-            up.decide(ts(LATE_MS), None).expect("up take").outcome,
+            up.decide(window(), ts(LATE_MS), None)
+                .expect("up take")
+                .outcome,
             Outcome::Up
         );
         // p_up == 0.969 ⇒ uncertain.
@@ -685,7 +741,7 @@ mod tests {
             &[(dec!(0.95), dec!(50))],
         );
         assert!(matches!(
-            near.decide(ts(LATE_MS), None),
+            near.decide(window(), ts(LATE_MS), None),
             Err(NoLateTakeReason::NotCertain { .. })
         ));
         // p_up == 0.03 == 1 − 0.97 ⇒ Down (inclusive).
@@ -696,7 +752,9 @@ mod tests {
             &[(dec!(0.95), dec!(50))],
         );
         assert_eq!(
-            down.decide(ts(LATE_MS), None).expect("down take").outcome,
+            down.decide(window(), ts(LATE_MS), None)
+                .expect("down take")
+                .outcome,
             Outcome::Down
         );
         // p_up == 0.031 ⇒ uncertain.
@@ -707,7 +765,7 @@ mod tests {
             &[(dec!(0.95), dec!(50))],
         );
         assert!(matches!(
-            near_down.decide(ts(LATE_MS), None),
+            near_down.decide(window(), ts(LATE_MS), None),
             Err(NoLateTakeReason::NotCertain { .. })
         ));
     }
@@ -724,7 +782,7 @@ mod tests {
             &[(dec!(0.98), dec!(50))],
         );
         assert_eq!(
-            up.decide(ts(LATE_MS), None)
+            up.decide(window(), ts(LATE_MS), None)
                 .expect("up take at p_up=1.0")
                 .outcome,
             Outcome::Up
@@ -736,7 +794,7 @@ mod tests {
             &[(dec!(0.98), dec!(50))],
         );
         assert_eq!(
-            down.decide(ts(LATE_MS), None)
+            down.decide(window(), ts(LATE_MS), None)
                 .expect("down take at p_up=0.0")
                 .outcome,
             Outcome::Down
@@ -755,7 +813,7 @@ mod tests {
             &[(dec!(0.98), dec!(50))],
         );
         assert!(matches!(
-            fast.decide(ts(LATE_MS), None),
+            fast.decide(window(), ts(LATE_MS), None),
             Err(NoLateTakeReason::NotChainlinkAnchored {
                 anchor: AnchorSource::BinanceCorrected
             })
@@ -766,14 +824,14 @@ mod tests {
             up_token(),
             &[(dec!(0.98), dec!(50))],
         );
-        assert!(chainlink.decide(ts(LATE_MS), None).is_ok());
+        assert!(chainlink.decide(window(), ts(LATE_MS), None).is_ok());
     }
 
     #[test]
     fn no_active_window() {
         let t = taker();
         assert!(matches!(
-            t.decide(ts(LATE_MS), None),
+            t.decide(window(), ts(LATE_MS), None),
             Err(NoLateTakeReason::NoActiveWindow)
         ));
     }
@@ -783,7 +841,7 @@ mod tests {
         let mut t = taker();
         t.ingest(&open_event());
         assert!(matches!(
-            t.decide(ts(LATE_MS), None),
+            t.decide(window(), ts(LATE_MS), None),
             Err(NoLateTakeReason::NoModel)
         ));
     }
@@ -792,14 +850,19 @@ mod tests {
     fn window_mismatch() {
         let mut t = taker();
         t.ingest(&open_event());
-        t.ingest(&model_snapshot(
+        // Poke a snapshot whose window differs into window()'s slot — the
+        // defensive WindowMismatch guard (per-window ingest would normally drop a
+        // foreign-window model, so we poke it directly).
+        if let Event::Model(snap) = model_snapshot(
             0.99,
             ModelHealth::Ready,
             AnchorSource::Chainlink,
             Some(other_window()),
-        ));
+        ) {
+            t.test_state_mut(window()).last_model = Some(snap);
+        }
         assert!(matches!(
-            t.decide(ts(LATE_MS), None),
+            t.decide(window(), ts(LATE_MS), None),
             Err(NoLateTakeReason::WindowMismatch { .. })
         ));
     }
@@ -822,7 +885,7 @@ mod tests {
             ));
             assert!(
                 matches!(
-                    t.decide(ts(LATE_MS), None),
+                    t.decide(window(), ts(LATE_MS), None),
                     Err(NoLateTakeReason::ModelNotReady { .. })
                 ),
                 "{health:?} should block"
@@ -847,7 +910,7 @@ mod tests {
             ));
             assert!(
                 matches!(
-                    t.decide(ts(LATE_MS), None),
+                    t.decide(window(), ts(LATE_MS), None),
                     Err(NoLateTakeReason::UnusableFair { .. })
                 ),
                 "{bad} should be unusable"
@@ -864,14 +927,14 @@ mod tests {
             up_token(),
             &[(dec!(0.98), dec!(50))],
         );
-        assert!(t.decide(ts(LATE_MS), None).is_ok());
+        assert!(t.decide(window(), ts(LATE_MS), None).is_ok());
     }
 
     #[test]
     fn expired_window_blocks() {
         let t = armed_up();
         assert!(matches!(
-            t.decide(ts(CLOSE_MS + 1), None),
+            t.decide(window(), ts(CLOSE_MS + 1), None),
             Err(NoLateTakeReason::Expired { .. })
         ));
     }
@@ -881,7 +944,7 @@ mod tests {
         let t = armed_up();
         // τ = 60 s > 30 s threshold.
         assert!(matches!(
-            t.decide(ts(CLOSE_MS - 60_000), None),
+            t.decide(window(), ts(CLOSE_MS - 60_000), None),
             Err(NoLateTakeReason::NotLateWindow { .. })
         ));
     }
@@ -895,7 +958,7 @@ mod tests {
             &[(dec!(0.78), dec!(50))],
         );
         assert!(matches!(
-            t.decide(ts(LATE_MS), None),
+            t.decide(window(), ts(LATE_MS), None),
             Err(NoLateTakeReason::NotCertain { .. })
         ));
     }
@@ -907,7 +970,7 @@ mod tests {
         t.ingest(&ready_chainlink(0.99));
         // No book ingested.
         assert!(matches!(
-            t.decide(ts(LATE_MS), None),
+            t.decide(window(), ts(LATE_MS), None),
             Err(NoLateTakeReason::NoBookForToken)
         ));
     }
@@ -924,7 +987,7 @@ mod tests {
         t.ingest(&ready_chainlink(0.99));
         t.ingest(&book(up_token(), &[(dec!(0.96), dec!(50))]));
         assert!(matches!(
-            t.decide(ts(LATE_MS), None),
+            t.decide(window(), ts(LATE_MS), None),
             Err(NoLateTakeReason::AllAsksAbovePriceCap { .. })
         ));
     }
@@ -932,33 +995,32 @@ mod tests {
     #[test]
     fn cooldown_blocks() {
         let mut t = armed_up();
-        t.last_take_ms = Some(LATE_MS - 100); // fired 100 ms ago < 5 s cooldown
+        t.test_state_mut(window()).last_take_ms = Some(LATE_MS - 100); // fired 100 ms ago < 5 s cooldown
         assert!(matches!(
-            t.decide(ts(LATE_MS), None),
+            t.decide(window(), ts(LATE_MS), None),
             Err(NoLateTakeReason::InCooldown { .. })
         ));
         // After the cooldown elapses, the take is allowed again.
-        t.last_take_ms = Some(LATE_MS - 6_000);
-        assert!(t.decide(ts(LATE_MS), None).is_ok());
+        t.test_state_mut(window()).last_take_ms = Some(LATE_MS - 6_000);
+        assert!(t.decide(window(), ts(LATE_MS), None).is_ok());
     }
 
     /// Required case 4: budget exhaustion — directly, and via in-flight commitment.
     #[test]
     fn budget_exhausted_blocks() {
         let mut t = armed_up();
-        t.realized_spent = Dollars::new(dec!(10));
+        t.test_state_mut(window()).realized_spent = Dollars::new(dec!(10));
         assert!(matches!(
-            t.decide(ts(LATE_MS), None),
+            t.decide(window(), ts(LATE_MS), None),
             Err(NoLateTakeReason::BudgetExhausted { .. })
         ));
 
         // An in-flight take leaving < $1 also blocks a second.
         let mut t2 = armed_up();
         let oid = OrderId::new("lw-1").unwrap();
-        t2.our_orders.insert(oid.clone());
-        t2.pending.insert(oid, Dollars::new(dec!(9.50)));
+        t2.test_register_pending(window(), oid, Dollars::new(dec!(9.50)));
         assert!(matches!(
-            t2.decide(ts(LATE_MS), None),
+            t2.decide(window(), ts(LATE_MS), None),
             Err(NoLateTakeReason::BudgetExhausted { .. })
         ));
     }
@@ -975,7 +1037,7 @@ mod tests {
         t.ingest(&open_event());
         t.ingest(&ready_chainlink(0.99));
         t.ingest(&book(up_token(), &[(dec!(0.98), dec!(100))]));
-        let d = t.decide(ts(LATE_MS), None).expect("a take");
+        let d = t.decide(window(), ts(LATE_MS), None).expect("a take");
         // 49 / 0.98 = 50 shares, $49 notional ≤ budget.
         assert_eq!(d.plan.expected_shares, Size::new(dec!(50)).unwrap());
         assert!(d.plan.notional.as_decimal() <= dec!(49));
@@ -996,8 +1058,8 @@ mod tests {
             ts_exchange: ts(OPEN_MS),
             ts_local: ts(OPEN_MS),
         });
-        // ingest returns false ⇒ on_event would attempt no take.
-        assert!(!t.ingest(&big_ramp));
+        // ingest returns None ⇒ on_event would attempt no take.
+        assert!(t.ingest(&big_ramp).is_none());
     }
 
     #[test]
@@ -1008,14 +1070,14 @@ mod tests {
         });
         assert!(t.is_standing_down());
         assert!(matches!(
-            t.decide(ts(LATE_MS), None),
+            t.decide(window(), ts(LATE_MS), None),
             Err(NoLateTakeReason::StandingDown)
         ));
         t.on_risk(RiskEvent::BreakerCleared {
             breaker: BreakerKind::FeedStale,
         });
         assert!(!t.is_standing_down());
-        assert!(t.decide(ts(LATE_MS), None).is_ok());
+        assert!(t.decide(window(), ts(LATE_MS), None).is_ok());
     }
 
     #[test]
@@ -1038,11 +1100,14 @@ mod tests {
     }
 
     #[test]
-    fn window_open_resets_budget_and_cooldown() {
+    fn window_open_starts_fresh_budget_and_cooldown() {
         let mut t = armed_up();
-        t.realized_spent = Dollars::new(dec!(8));
-        t.last_take_ms = Some(OPEN_MS + 100);
-        t.our_orders.insert(OrderId::new("lw-9").unwrap());
+        {
+            let st = t.test_state_mut(window());
+            st.realized_spent = Dollars::new(dec!(8));
+            st.last_take_ms = Some(OPEN_MS + 100);
+            st.our_orders.insert(OrderId::new("lw-9").unwrap());
+        }
         let next = WindowId {
             series: window().series,
             open_time: TimestampMs::from_millis(CLOSE_MS),
@@ -1054,10 +1119,92 @@ mod tests {
             market: Arc::new(m),
             lifecycle: WindowLifecycle::Open,
         });
-        assert_eq!(t.realized_spent(), Dollars::ZERO);
-        assert_eq!(t.effective_spent(), Dollars::ZERO);
-        assert!(t.last_take_ms.is_none());
-        assert!(t.our_orders.is_empty());
+        // The new window's per-window state is fresh.
+        let st = t.test_state_mut(next);
+        assert_eq!(st.realized_spent, Dollars::ZERO);
+        assert_eq!(st.effective_spent(), Dollars::ZERO);
+        assert!(st.last_take_ms.is_none());
+        assert!(st.our_orders.is_empty());
+    }
+
+    // ---- per-window state ---------------------------------------------------
+
+    #[test]
+    fn per_window_independence_and_close_prunes() {
+        let mut t = taker();
+        // Arm two windows of the same series.
+        t.ingest(&open_event()); // window() @ OPEN_MS
+        let next = WindowId {
+            series: window().series,
+            open_time: TimestampMs::from_millis(CLOSE_MS),
+        };
+        let mut m = (*market()).clone();
+        m.window = next;
+        m.close_time = TimestampMs::from_millis(CLOSE_MS + 300_000);
+        t.ingest(&Event::Window {
+            market: Arc::new(m),
+            lifecycle: WindowLifecycle::Open,
+        });
+        assert_eq!(t.windows.len(), 2);
+        // Register an order on window() so we can prove order_window pruning.
+        let oid = OrderId::new("lw-a").unwrap();
+        t.test_register_pending(window(), oid.clone(), Dollars::new(dec!(5)));
+        assert!(t.order_window.contains_key(&oid));
+        // Closing window() drops only its state + its order attribution.
+        t.ingest(&Event::Window {
+            market: market(),
+            lifecycle: WindowLifecycle::Closed,
+        });
+        assert_eq!(t.windows.len(), 1);
+        assert!(t.windows.contains_key(&next));
+        assert!(
+            !t.order_window.contains_key(&oid),
+            "order attribution pruned"
+        );
+    }
+
+    /// A resting maker quote recorded for a *different* window must NOT shield a
+    /// take on this window (the self-match filter fetches only this window's view).
+    #[test]
+    fn a_resting_quote_on_another_window_does_not_shield_a_take() {
+        use crate::quote_manager::{ClientId, RestingView};
+        use std::collections::HashMap;
+
+        struct MockLookup {
+            map: HashMap<WindowId, RestingView>,
+        }
+        impl RestingLookup for MockLookup {
+            fn resting_view_for(&self, window: WindowId) -> Option<&RestingView> {
+                self.map.get(&window)
+            }
+        }
+
+        // Up book @ 0.98×50, certain p_up on window().
+        let t = armed_up();
+        // A mirror resting BUY Down @ 0.02 (= complement of the 0.98 Up ask) that
+        // would fully cover the ask — but recorded on `other_window()`.
+        let mut other_view = RestingView::new();
+        other_view.record_pending(
+            OrderId::new("qm-other").unwrap(),
+            ClientId {
+                open_ms: other_window().open_time.as_millis(),
+                outcome: Outcome::Down,
+                level: 0,
+                seq: 0,
+            },
+            other_window(),
+            Price::on_grid(dec!(0.02), TICK).unwrap(),
+            Size::new(dec!(50)).unwrap(),
+        );
+        let mut map = HashMap::new();
+        map.insert(other_window(), other_view);
+        let lookup = MockLookup { map };
+        // `resting_view_for(window())` is empty here, so the other window's mirror
+        // never shields — the take fires normally.
+        let d = t
+            .decide(window(), ts(LATE_MS), Some(&lookup))
+            .expect("not shielded by another window's quote");
+        assert_eq!(d.outcome, Outcome::Up);
     }
 
     // ---- budget reconciliation from the venue stream (sync) ----------------
@@ -1066,8 +1213,7 @@ mod tests {
     fn fills_charge_budget_and_terminal_drops_residual() {
         let mut t = armed_up();
         let oid = OrderId::new("lw-7").unwrap();
-        t.our_orders.insert(oid.clone());
-        t.pending.insert(oid.clone(), Dollars::new(dec!(10)));
+        t.test_register_pending(window(), oid.clone(), Dollars::new(dec!(10)));
         assert_eq!(t.effective_spent(), Dollars::new(dec!(10)));
 
         // A partial taker fill: 5 shares @ 0.98 = $4.90.
@@ -1091,7 +1237,7 @@ mod tests {
     #[test]
     fn foreign_fills_are_ignored() {
         let mut t = armed_up();
-        t.our_orders.insert(OrderId::new("lw-1").unwrap());
+        t.test_register_pending(window(), OrderId::new("lw-1").unwrap(), Dollars::ZERO);
         let foreign = OrderId::new("qm-9").unwrap();
         t.on_venue_event(
             &VenueEvent::Fill(Arc::new(fill(&foreign, dec!(0.98), dec!(20)))),

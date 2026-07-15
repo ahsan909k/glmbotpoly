@@ -219,7 +219,7 @@ fn expected_levels(p_up: f64, sigma: f64) -> Vec<(Outcome, Decimal, Decimal)> {
 /// delegated through the risk manager.
 fn resting_levels(risk: &RiskManager) -> Vec<(Outcome, Decimal, Decimal)> {
     let mut v: Vec<(Outcome, Decimal, Decimal)> = risk
-        .resting_view()
+        .resting_view_for(window())
         .expect("active window")
         .live_orders()
         .map(|o| {
@@ -429,7 +429,7 @@ async fn cancels_before_replacing_under_a_price_jump() {
     drain(&mut rx, &mut risk, &venue, &now, &mut first).await;
     assert_eq!(resting_levels(&risk).len(), 6, "converged before the jump");
     let pre_ids: HashSet<String> = risk
-        .resting_view()
+        .resting_view_for(window())
         .unwrap()
         .live_orders()
         .map(|o| o.order_id.as_str().to_owned())
@@ -456,7 +456,7 @@ async fn cancels_before_replacing_under_a_price_jump() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     drain(&mut rx, &mut risk, &venue, &now, &mut recorded).await;
     assert!(
-        risk.resting_view().unwrap().is_empty(),
+        risk.resting_view_for(window()).unwrap().is_empty(),
         "old quotes withdrawn first"
     );
 
@@ -474,7 +474,7 @@ async fn cancels_before_replacing_under_a_price_jump() {
     );
 
     let new_ids: HashSet<String> = risk
-        .resting_view()
+        .resting_view_for(window())
         .unwrap()
         .live_orders()
         .map(|o| o.order_id.as_str().to_owned())
@@ -602,7 +602,7 @@ async fn withdraws_cleanly_on_window_closing() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     drain(&mut rx, &mut risk, &venue, &now, &mut recorded).await;
     assert!(
-        risk.resting_view().unwrap().is_empty(),
+        risk.resting_view_for(window()).unwrap().is_empty(),
         "all quotes withdrawn on Closing"
     );
 
@@ -617,7 +617,7 @@ async fn withdraws_cleanly_on_window_closing() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     drain(&mut rx, &mut risk, &venue, &now, &mut recorded).await;
     assert!(
-        risk.resting_view().unwrap().is_empty(),
+        risk.resting_view_for(window()).unwrap().is_empty(),
         "no re-quoting after Closing"
     );
     assert_eq!(
@@ -678,7 +678,7 @@ async fn withdraws_in_the_final_seconds_via_the_tau_gate() {
     drain(&mut rx, &mut risk, &venue, &now, &mut recorded).await;
 
     assert!(
-        risk.resting_view().unwrap().is_empty(),
+        risk.resting_view_for(window()).unwrap().is_empty(),
         "withdrawn in the final seconds"
     );
     venue.shutdown();

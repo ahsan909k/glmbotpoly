@@ -50,7 +50,7 @@ pub use driver::QuoteManager;
 pub use plan::{
     CancelAction, ConvergeRationale, ConvergencePlan, ConvergencePlanner, DesiredPlace,
 };
-pub use view::{RestingOrder, RestingView};
+pub use view::{RestingLookup, RestingOrder, RestingView};
 
 /// Engine-local quote-manager tunables (CLAUDE.md §8). `Copy`, but **not** `Eq`
 /// (it holds `f64` thresholds).

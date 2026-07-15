@@ -35,7 +35,7 @@ use super::edge::{ModelTakePlan, plan_model_take};
 use super::{ModelPrediction, ModelTakeOutcome, ModelTakerParams, NoModelTakeReason};
 use crate::arbitration::{FireLedger, TakerId};
 use crate::normalize::{NormalizerParams, OrderDraft, normalize};
-use crate::quote_manager::RestingView;
+use crate::quote_manager::RestingLookup;
 
 /// Per-window model-taker state: the market metadata, the cached books, and the
 /// committed-in-flight budget for this window.
@@ -212,7 +212,7 @@ impl ModelTaker {
         port: &P,
         now: TimestampMs,
         arbiter: &mut FireLedger,
-        resting: Option<&RestingView>,
+        resting: Option<&dyn RestingLookup>,
     ) -> ModelTakeOutcome {
         match self.decide(pred, now, arbiter, resting) {
             Ok(decision) => self.fire(port, decision, now, arbiter).await,
@@ -285,7 +285,7 @@ impl ModelTaker {
         pred: &ModelPrediction,
         now: TimestampMs,
         arbiter: &FireLedger,
-        resting: Option<&RestingView>,
+        resting: Option<&dyn RestingLookup>,
     ) -> Result<Decision, NoModelTakeReason> {
         if self.standing_down {
             return Err(NoModelTakeReason::StandingDown);
@@ -348,20 +348,15 @@ impl ModelTaker {
         if age > self.params.max_book_staleness_ms {
             return Err(NoModelTakeReason::BookStale { age_ms: age });
         }
-        // §7 self-match filter BEFORE the walk.
-        let asks = crate::self_match::filter_asks(outcome, &book.asks, window, resting);
+        // §7 self-match filter BEFORE the walk (the maker's per-window view).
+        let view = resting.and_then(|r| r.resting_view_for(window));
+        let asks = crate::self_match::filter_asks(outcome, &book.asks, window, view);
         let fee_rate = if st.market.fees.enabled {
             st.market.fees.rate
         } else {
             Decimal::ZERO
         };
-        let plan = plan_model_take(
-            outcome,
-            &asks,
-            fee_rate,
-            self.params.price_cap,
-            remaining,
-        )?;
+        let plan = plan_model_take(outcome, &asks, fee_rate, self.params.price_cap, remaining)?;
         Ok(Decision {
             window,
             outcome,
@@ -407,7 +402,8 @@ impl ModelTaker {
                 let window = decision.window;
                 if let Some(st) = self.windows.get_mut(&window) {
                     st.our_orders.insert(acc.order_id.clone());
-                    st.pending.insert(acc.order_id.clone(), decision.plan.notional);
+                    st.pending
+                        .insert(acc.order_id.clone(), decision.plan.notional);
                 }
                 self.order_window.insert(acc.order_id, window);
                 self.take_count += 1;
@@ -447,11 +443,7 @@ impl ModelTaker {
 /// needs no `timeutil` dependency (the `quote_manager`/`taker` precedent).
 fn tau_secs(now: TimestampMs, close: TimestampMs) -> f64 {
     let ms = close.as_millis() - now.as_millis();
-    if ms <= 0 {
-        0.0
-    } else {
-        ms as f64 / 1000.0
-    }
+    if ms <= 0 { 0.0 } else { ms as f64 / 1000.0 }
 }
 
 #[cfg(test)]
@@ -502,7 +494,12 @@ mod tests {
         })
     }
 
-    fn book(token: &TokenId, cid: &ConditionId, asks: &[(Decimal, Decimal)], ts: i64) -> Arc<BookSnapshot> {
+    fn book(
+        token: &TokenId,
+        cid: &ConditionId,
+        asks: &[(Decimal, Decimal)],
+        ts: i64,
+    ) -> Arc<BookSnapshot> {
         Arc::new(BookSnapshot {
             token_id: token.clone(),
             condition_id: cid.clone(),
@@ -542,7 +539,12 @@ mod tests {
             market: Arc::clone(&m),
             lifecycle: WindowLifecycle::Open,
         });
-        let b = book(&m.tokens.up, &m.condition_id, &[(dec!(0.80), dec!(50))], open_ms + 1_000);
+        let b = book(
+            &m.tokens.up,
+            &m.condition_id,
+            &[(dec!(0.80), dec!(50))],
+            open_ms + 1_000,
+        );
         t.on_bus_event(&Event::Book(b));
         t
     }
@@ -572,7 +574,12 @@ mod tests {
             lifecycle: WindowLifecycle::Open,
         });
         // Cache a Down-token book; a low p_up should buy Down.
-        let b = book(&m.tokens.down, &m.condition_id, &[(dec!(0.70), dec!(20))], 1_000);
+        let b = book(
+            &m.tokens.down,
+            &m.condition_id,
+            &[(dec!(0.70), dec!(20))],
+            1_000,
+        );
         t.on_bus_event(&Event::Book(b));
         let arb = FireLedger::default();
         let d = t

@@ -208,6 +208,18 @@ impl RestingView {
     }
 }
 
+/// Lets a taker resolve the maker's resting view for a specific window (for the
+/// §7 self-match filter) without depending on the concrete
+/// [`QuoteManager`](super::QuoteManager) type.
+///
+/// The maker core keeps a [`RestingView`] per active window; a taker firing on
+/// window `W` fetches exactly `W`'s view so its self-match filter sees only the
+/// mirrored liquidity that could actually collide.
+pub trait RestingLookup {
+    /// The resting view for `window`, if the maker is quoting it.
+    fn resting_view_for(&self, window: WindowId) -> Option<&RestingView>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

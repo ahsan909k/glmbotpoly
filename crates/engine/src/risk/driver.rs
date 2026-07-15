@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use core_types::{
-    Dollars, Event, OrderId, RiskEvent, Series, TimestampMs, WindowLifecycle,
+    Dollars, Event, OrderId, RiskEvent, Series, TimestampMs, WindowId, WindowLifecycle,
 };
 use venue_api::{VenueEvent, VenuePort};
 
@@ -33,7 +33,7 @@ use super::state::{GateState, GuardObservation, RiskStateSnapshot};
 use crate::arbitration::FireLedger;
 use crate::late_window::LateWindowTaker;
 use crate::model_taker::{ModelPrediction, ModelTakeOutcome, ModelTaker};
-use crate::quote_manager::{QuoteManager, RestingView};
+use crate::quote_manager::{QuoteManager, RestingLookup, RestingView};
 use crate::taker::MomentumTaker;
 
 /// Which owned strategy placed an order — the driver a fill is attributed to
@@ -198,10 +198,18 @@ impl RiskManager {
         }
     }
 
-    /// The owned quote manager's resting-order view (delegated inspection).
+    /// The owned quote manager's resting-order view for a specific window
+    /// (delegated inspection).
     #[must_use]
-    pub fn resting_view(&self) -> Option<&RestingView> {
-        self.quoter.resting_view()
+    pub fn resting_view_for(&self, window: WindowId) -> Option<&RestingView> {
+        self.quoter.resting_view_for(window)
+    }
+
+    /// The total number of live resting maker orders across every active window
+    /// (delegated inspection).
+    #[must_use]
+    pub fn total_resting_len(&self) -> usize {
+        self.quoter.total_resting()
     }
 
     /// The owned quote manager's placement-cycle count (delegated inspection).
@@ -238,6 +246,12 @@ impl RiskManager {
     #[must_use]
     pub fn late_realized_spent(&self) -> Dollars {
         self.late.realized_spent()
+    }
+
+    /// The owned late-window taker's committed-in-flight spend (delegated).
+    #[must_use]
+    pub fn late_effective_spent(&self) -> Dollars {
+        self.late.effective_spent()
     }
 
     // ---- entry points -------------------------------------------------------
@@ -311,10 +325,13 @@ impl RiskManager {
             return None;
         }
         let guard = GuardedPort::new(port, Arc::clone(&self.shared), now);
-        let resting = self.quoter.resting_view();
+        // The maker's per-window resting views (immutable, disjoint from the
+        // mutable `self.model`/`self.arbiter` borrows) resolve the §7 self-match
+        // filter for whichever window the prediction fires.
+        let quoter: &dyn RestingLookup = &self.quoter;
         let out = self
             .model
-            .on_prediction(pred, &guard, now, &mut self.arbiter, resting)
+            .on_prediction(pred, &guard, now, &mut self.arbiter, Some(quoter))
             .await;
         Some(out)
     }
@@ -390,15 +407,15 @@ impl RiskManager {
         }
         if self.params.momentum_enabled {
             let guard = GuardedPort::new(port, Arc::clone(&self.shared), now);
-            let resting = self.quoter.resting_view();
+            let quoter: &dyn RestingLookup = &self.quoter;
             self.momentum
-                .on_event(ev, &guard, now, &mut self.arbiter, resting)
+                .on_event(ev, &guard, now, &mut self.arbiter, Some(quoter))
                 .await;
         }
         if self.params.late_window_enabled {
             let guard = GuardedPort::new(port, Arc::clone(&self.shared), now);
-            let resting = self.quoter.resting_view();
-            self.late.on_event(ev, &guard, now, resting).await;
+            let quoter: &dyn RestingLookup = &self.quoter;
+            self.late.on_event(ev, &guard, now, Some(quoter)).await;
         }
         if self.params.model_enabled {
             // Sync state refresh only — the model fires on a prediction, never a
