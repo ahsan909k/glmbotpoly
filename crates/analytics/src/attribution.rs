@@ -630,6 +630,12 @@ mod tests {
             a.comprehensive_pnl(),
             a.realized_pnl + Dollars::new(dec!(0.6125))
         );
+        // The dashboard's two buckets plus the estimated rebate reconcile to the
+        // comprehensive total exactly (the identity the summary panel asserts).
+        assert_eq!(
+            a.completed_pair_pnl() + a.stuck_leg_pnl() + a.estimated_rebate,
+            a.comprehensive_pnl()
+        );
     }
 
     #[test]

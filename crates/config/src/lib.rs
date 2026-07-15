@@ -41,10 +41,12 @@ pub use crate::sections::journal::JournalConfig;
 pub use crate::sections::latency::LatencyHarnessConfig;
 pub use crate::sections::live::{LIVE_CONFIRM_PHRASE, LiveArming, LiveConfig};
 pub use crate::sections::log::{LogConfig, LogRotation};
+pub use crate::sections::model_taker::{Driver, ModelTakerConfig};
 pub use crate::sections::paper::{LatencyConfig, PaperConfig};
 pub use crate::sections::risk::RiskConfig;
 pub use crate::sections::run::RunConfig;
 pub use crate::sections::scheduler::SchedulerConfig;
+pub use crate::sections::shadow::ShadowConfig;
 pub use crate::validate::validate;
 
 // Test-exe hash remint marker (Windows App Control 4551 workaround; harmless).
@@ -84,6 +86,11 @@ pub struct AppConfig {
     pub dashboard: DashboardConfig,
     /// Tracing output settings.
     pub log: LogConfig,
+    /// Shadow-mode observer settings (BUILD_PLAN 12–13). Off by default.
+    pub shadow: ShadowConfig,
+    /// Model-taker settings (§8) — the live PAPER taker on the shadow model's
+    /// prediction stream. Off by default; requires `[shadow]` enabled.
+    pub model_taker: ModelTakerConfig,
 }
 
 #[cfg(test)]

@@ -14,6 +14,13 @@ pub struct RiskConfig {
     /// Feed staleness threshold that triggers cancel-all. §11 fixes the
     /// ceiling at 500 ms — configuring it tighter is allowed, looser is not.
     pub feed_staleness_ms: DurationMs,
+    /// Home-testing concession, default 0 (off, strict §11). Extra tolerance
+    /// added to the fast-feed staleness *timer* only, so a transient
+    /// direct-Binance gap on a jittery home link no longer fires cancel-all —
+    /// the `FeedStale` timer trips at `feed_staleness_ms + feed_staleness_grace_ms`.
+    /// Leave at 0 on a colocated VPS. Capped at 5000 ms; latched feed/book
+    /// stale reports and disconnects are unaffected.
+    pub feed_staleness_grace_ms: DurationMs,
     /// Daily stop-loss: once cumulative realized PnL for the day reaches
     /// this loss, all trading halts until manual reset.
     pub daily_stop_loss: Dollars,
@@ -34,6 +41,7 @@ impl Default for RiskConfig {
     fn default() -> Self {
         Self {
             feed_staleness_ms: DurationMs::from_millis(500),
+            feed_staleness_grace_ms: DurationMs::from_millis(0),
             daily_stop_loss: Dollars::new(Decimal::from(200)),
             max_open_notional: Dollars::new(Decimal::from(1_000)),
             sanity_bound: 0.10,
@@ -51,6 +59,12 @@ impl RiskConfig {
             staleness > 0 && staleness <= 500,
             "risk.feed_staleness_ms",
             "must be in (0, 500] — §11 fixes the ceiling at 500 ms (tighter ok, looser never)",
+        );
+        let grace = self.feed_staleness_grace_ms.as_millis();
+        v.require(
+            (0..=5_000).contains(&grace),
+            "risk.feed_staleness_grace_ms",
+            "must be in [0, 5000] — 0 is strict §11; raise it only for home testing on a jittery link",
         );
         v.require(
             self.daily_stop_loss.as_decimal() > Decimal::ZERO,
@@ -110,6 +124,38 @@ mod tests {
                 violations.iter().any(|x| x.key == "risk.feed_staleness_ms"),
                 "staleness {bad} should be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn staleness_grace_out_of_range_rejected() {
+        for bad in [-1i64, 5_001, 10_000] {
+            let cfg = RiskConfig {
+                feed_staleness_grace_ms: DurationMs::from_millis(bad),
+                ..RiskConfig::default()
+            };
+            let mut v = Violations::default();
+            cfg.validate_into(&mut v);
+            let violations = v.into_result().unwrap_err();
+            assert!(
+                violations
+                    .iter()
+                    .any(|x| x.key == "risk.feed_staleness_grace_ms"),
+                "grace {bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn staleness_grace_in_range_accepted() {
+        for ok in [0i64, 1_500, 5_000] {
+            let cfg = RiskConfig {
+                feed_staleness_grace_ms: DurationMs::from_millis(ok),
+                ..RiskConfig::default()
+            };
+            let mut v = Violations::default();
+            cfg.validate_into(&mut v);
+            assert!(v.into_result().is_ok(), "grace {ok} should be accepted");
         }
     }
 

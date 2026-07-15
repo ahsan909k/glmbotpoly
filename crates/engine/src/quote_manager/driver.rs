@@ -138,6 +138,12 @@ impl QuoteManager {
         self.active.as_ref().map(|a| &a.view)
     }
 
+    /// Whether `id` is one of the quoter's live resting orders (driver attribution).
+    #[must_use]
+    pub fn owns(&self, id: &core_types::OrderId) -> bool {
+        self.active.as_ref().is_some_and(|a| a.view.owns(id))
+    }
+
     /// Number of placement cycles run so far (each is one `place_batch` that
     /// placed at least one order). The rate-budget metric.
     #[must_use]

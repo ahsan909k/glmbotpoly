@@ -183,6 +183,9 @@ fn params() -> PaperParams {
             jitter_ms: DurationMs::ZERO,
         },
         rng_seed: Some(1),
+        // Chaos scenarios assert breaker/cancel behavior at network-latency fill timing; the
+        // venue taker delay is orthogonal here, so zero it.
+        venue_taker_delay_ms: DurationMs::ZERO,
         ..PaperParams::default()
     }
 }

@@ -23,7 +23,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-from .config import Paths, resolve_paths, stage_parser
+from .config import Paths, require_tables, resolve_paths, stage_parser
 from .lib import math as lm
 
 
@@ -109,6 +109,8 @@ def _calibration(model: pd.DataFrame, window_labels: pd.DataFrame) -> dict:
 
 def validate(paths: Paths) -> dict:
     """Runs the validate stage; returns the metrics dict (also written to disk)."""
+    require_tables(paths, "model", "ticks")  # must be non-empty
+    require_tables(paths, "window_labels", min_rows=0)  # footer-only (may be empty)
     out_dir = paths.out_dir / "validation"
     out_dir.mkdir(parents=True, exist_ok=True)
     model = pd.read_parquet(paths.table("model"), engine="pyarrow")

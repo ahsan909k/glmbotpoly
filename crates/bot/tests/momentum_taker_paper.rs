@@ -170,6 +170,9 @@ fn params() -> PaperParams {
             jitter_ms: DurationMs::ZERO,
         },
         rng_seed: Some(1),
+        // This test verifies the momentum taker's engine logic, not the venue delay — zero it
+        // so FAK fills land at the network-latency deadline the clock advances to.
+        venue_taker_delay_ms: DurationMs::ZERO,
         ..PaperParams::default()
     }
 }

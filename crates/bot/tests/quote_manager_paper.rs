@@ -167,6 +167,9 @@ fn params() -> PaperParams {
             jitter_ms: DurationMs::ZERO,
         },
         rng_seed: Some(1),
+        // Quote-manager convergence is maker-only (post-only), unaffected by the venue taker
+        // delay; zero it to keep the params pinned to this test's timing assumptions.
+        venue_taker_delay_ms: DurationMs::ZERO,
         ..PaperParams::default()
     }
 }

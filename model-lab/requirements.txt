@@ -2,6 +2,9 @@
 # Deliberately minimal — a standard scientific stack, no scipy/sklearn (Φ uses
 # stdlib math.erfc, AUC is a rank-based numpy implementation). Requires Python
 # >= 3.10. Install into a venv: see README.
+#
+# The opt-in GBT challenger (learn_gbt / compare) needs LightGBM + scipy — those
+# live in requirements-gbt.txt, not here, so the core stays pure-wheel.
 numpy==2.1.3
 pandas==2.2.3
 pyarrow==18.1.0

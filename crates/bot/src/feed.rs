@@ -94,6 +94,62 @@ pub(crate) fn binance_params(cfg: &config::FeedsConfig) -> BinanceParams {
     }
 }
 
+/// Maps the `[feeds]` + `[journal]` sections to Binance `depth20@100ms` capture
+/// parameters (`depth_capture`, wired into `bot record` and `bot run`). Reuses
+/// the shared connect-timeout + reconnect-backoff policy; the URL is the
+/// combined-stream form and the output directory is the separate depth series.
+pub(crate) fn depth_params(
+    feeds: &config::FeedsConfig,
+    journal: &config::JournalConfig,
+) -> crate::depth_capture::DepthCaptureParams {
+    crate::depth_capture::DepthCaptureParams {
+        url: crate::depth_capture::combined_depth_url(&feeds.binance_ws_url),
+        connect_timeout: std_duration(feeds.ws_connect_timeout_ms),
+        backoff: backoff_params(feeds),
+        out_dir: journal.depth_dir.clone(),
+        channel_capacity: 4_096,
+    }
+}
+
+/// Maps the `[shadow]` + `[feeds]` sections to the shadow observer's runtime
+/// parameters (the `config → shadow` boundary; the shadow crate has no `config`
+/// dependency). Assets are the distinct assets of the enabled series (shadow
+/// filters windows to the BTC/ETH × 5m/15m champion set internally); the depth
+/// feed reuses `feeds.binance_ws_url` unless `shadow.depth_ws_url` overrides it.
+pub(crate) fn shadow_params(config: &AppConfig) -> shadow::ShadowParams {
+    let s = &config.shadow;
+    let base = if s.depth_ws_url.is_empty() {
+        &config.feeds.binance_ws_url
+    } else {
+        &s.depth_ws_url
+    };
+    let mut assets: Vec<core_types::Asset> = config
+        .engine
+        .enabled_series()
+        .iter()
+        .map(|x| x.asset)
+        .collect();
+    assets.sort();
+    assets.dedup();
+    if assets.is_empty() {
+        assets = vec![core_types::Asset::Btc, core_types::Asset::Eth];
+    }
+    shadow::ShadowParams {
+        assets,
+        sample_secs: s.sample_secs,
+        max_staleness_ms: i64::try_from(s.max_staleness_secs).unwrap_or(120) * 1_000,
+        depth: shadow::DepthFeedParams {
+            url: shadow::combined_depth_url(base),
+            connect_timeout: std_duration(config.feeds.ws_connect_timeout_ms),
+            backoff: backoff_params(&config.feeds),
+        },
+        shadow_dir: s.shadow_dir.clone(),
+        record_channel_cap: s.record_channel_cap,
+        depth_channel_cap: s.depth_channel_cap,
+        staleness_alert_days: i64::from(s.staleness_alert_days),
+    }
+}
+
 /// Maps the `[feeds]` section to CLOB market-channel feed parameters
 /// (`bot ladder`).
 pub(crate) fn clob_params(cfg: &config::FeedsConfig) -> feed_clob::ClobParams {

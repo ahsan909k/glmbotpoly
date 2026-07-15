@@ -11,6 +11,8 @@ validate the journaled model outputs without re-deriving the specification:
   log returns (``crates/model::vol``): ``var ← λ^k·var + (1−λ^k)·(r²/k)``,
   ``λ = 2^(−1/half_life)``, warmup + floor/cap clamp.
 - :func:`markout` — signed fair-value move after a fill (``crates/analytics``).
+- :func:`taker_fee` — the exact venue taker fee (``crates/core-types::money``):
+  ``shares·rate·p·(1−p)``, 5-dp half-away rounding, ``$0.00001`` floor.
 """
 
 from __future__ import annotations
@@ -128,6 +130,106 @@ def markout(fair_before: float, fair_after: float, position_sign: int) -> float:
     return position_sign * (fair_after - fair_before)
 
 
+def taker_fee(shares: float, fee_rate: float, price: float) -> float:
+    """The exact venue taker fee, an offline replica of Rust
+    ``crates/core-types/src/money.rs::taker_fee``.
+
+    ``raw = shares · fee_rate · price · (1 − price)``. If ``raw`` is zero (any of
+    shares/rate/price is 0, or ``price == 1``) the fee is ``0.0`` with **no** floor
+    (the Rust ``raw.is_zero()`` early return). Otherwise ``raw`` is rounded to 5
+    decimal places **half-away-from-zero** — fees are non-negative, so
+    ``floor(raw·1e5 + 0.5)/1e5`` gives that rounding — then floored to the
+    ``$0.00001`` minimum charge. ``price`` is a probability in ``(0, 1)``; callers
+    guard the domain. Fractional ``shares`` are allowed (venue sizes are decimals).
+    Makers pay zero — apply this only to taker fills.
+    """
+    raw = float(shares) * float(fee_rate) * float(price) * (1.0 - float(price))
+    if raw == 0.0:
+        return 0.0
+    rounded = math.floor(raw * 1e5 + 0.5) / 1e5
+    return max(rounded, 1e-5)
+
+
+# --- Taker Fee Rebate Program -------------------------------------------------
+# docs.polymarket.com/trading/taker-rebates. Tier is set by 30-day *rolling*
+# WEIGHTED VOLUME  wV = size·(1−entry)·category_weight·bonus  (crypto weight 2.3,
+# no crypto bonus). The rebate paid is  tier% × the TAKER FEES paid over the period
+# — a fee *refund*, NOT a percentage of notional (3–50% of notional is impossible;
+# the parallel maker program is likewise "% of taker fees"). Paid daily 00:00 UTC
+# in pUSD, $1 minimum accrual, tier recalculated daily and applied going forward.
+#
+# Mirror of the Rust consts in ``crates/venue-paper/src/engine.rs`` — keep in sync.
+CRYPTO_WV_WEIGHT = 2.3
+
+#: (30-day wV threshold, tier name, rebate fraction), ascending. Below $2k = None.
+TAKER_TIERS: list[tuple[float, str, float]] = [
+    (0.0, "None", 0.0),
+    (2_000.0, "Bronze", 0.03),
+    (20_000.0, "Silver", 0.08),
+    (200_000.0, "Gold", 0.18),
+    (1_000_000.0, "Platinum", 0.32),
+    (4_000_000.0, "Diamond", 0.44),
+    (10_000_000.0, "Obsidian", 0.50),
+]
+
+
+def weighted_volume(shares: float, price: float, weight: float = CRYPTO_WV_WEIGHT) -> float:
+    """One trade's contribution to 30-day weighted volume: ``size·(1−entry)·weight``.
+
+    ``price`` is the entry (fill) price in ``(0, 1)``; ``weight`` defaults to the
+    crypto category weight (2.3). Used only to determine the rebate *tier*, never
+    the rebate amount (which is tier% of taker fees).
+    """
+    return float(shares) * (1.0 - float(price)) * float(weight)
+
+
+def taker_rebate_tier(wv_30d: float) -> tuple[str, float]:
+    """Maps a 30-day weighted volume to ``(tier_name, rebate_fraction)``.
+
+    Returns the highest tier whose threshold ``wv_30d`` meets or exceeds, e.g.
+    ``$0 → ("None", 0.0)``, ``$2,000 → ("Bronze", 0.03)``, ``$10M →
+    ("Obsidian", 0.50)``.
+    """
+    name, pct = TAKER_TIERS[0][1], TAKER_TIERS[0][2]
+    for threshold, tname, tpct in TAKER_TIERS:
+        if wv_30d >= threshold:
+            name, pct = tname, tpct
+        else:
+            break
+    return name, pct
+
+
+def taker_rebate_next_tier(wv_30d: float) -> tuple[str | None, float]:
+    """The next tier up and the additional 30-day wV needed to reach it.
+
+    Returns ``(next_tier_name, wv_needed)``; ``(None, 0.0)`` when already at the top
+    tier (Obsidian).
+    """
+    for threshold, tname, _pct in TAKER_TIERS:
+        if wv_30d < threshold:
+            return tname, threshold - wv_30d
+    return None, 0.0
+
+
+def majority_baseline(y_true: np.ndarray) -> dict:
+    """The always-predict-the-common-side (base-rate) no-skill baseline.
+
+    Returns ``{"n", "p", "diracc", "brier"}`` where ``p = mean(y_true)`` is the Up
+    rate, ``diracc = max(p, 1 − p)`` (accuracy of always calling the more common
+    side), and ``brier = p·(1 − p)`` (the Brier of the constant base-rate forecast
+    — the standard no-information reference, matching the ``chance_brier`` /
+    ``base_rate_acc`` convention already used in the shuffled-label controls). A
+    model's *skill* is its lift over this. NaNs on empty input.
+    """
+    y = np.asarray(y_true, dtype=float)
+    y = y[np.isfinite(y)]
+    n = int(len(y))
+    if n == 0:
+        return {"n": 0, "p": float("nan"), "diracc": float("nan"), "brier": float("nan")}
+    p = float(np.mean(y))
+    return {"n": n, "p": p, "diracc": max(p, 1.0 - p), "brier": p * (1.0 - p)}
+
+
 def brier_score(prob: np.ndarray, outcome: np.ndarray) -> float:
     """Mean squared error of predicted probabilities against 0/1 outcomes."""
     prob = np.asarray(prob, dtype=float)
@@ -174,6 +276,28 @@ def log_loss(prob: np.ndarray, outcome: np.ndarray, eps: float = 1e-15) -> float
         return float("nan")
     p = np.clip(prob, eps, 1.0 - eps)
     return float(np.mean(-(outcome * np.log(p) + (1.0 - outcome) * np.log(1.0 - p))))
+
+
+def directional_accuracy(prob: np.ndarray, outcome: np.ndarray, *, tie_is_up: bool = True) -> float:
+    """Fraction of predictions that call the right side of a binary outcome.
+
+    A probability forecast "calls Up" when ``prob > 0.5`` (and, when ``tie_is_up``,
+    also at exactly ``0.5`` — matching the engine's ≥-ties-Up resolution rule). The
+    call is correct when it agrees with ``outcome`` (1 = Up). Returns the mean
+    correct rate in ``[0, 1]``; ``nan`` on empty input. ``nan`` predictions or
+    outcomes are excluded. Unlike Brier/log-loss this scores only the *side*, not
+    the confidence — a useful, decision-shaped complement.
+    """
+    prob = np.asarray(prob, dtype=float)
+    outcome = np.asarray(outcome, dtype=float)
+    mask = np.isfinite(prob) & np.isfinite(outcome)
+    prob = prob[mask]
+    outcome = outcome[mask]
+    if len(prob) == 0:
+        return float("nan")
+    calls_up = prob >= 0.5 if tie_is_up else prob > 0.5
+    correct = calls_up == (outcome >= 0.5)
+    return float(np.mean(correct))
 
 
 def reliability_table(prob: np.ndarray, outcome: np.ndarray, n_bins: int = 10) -> list[dict]:

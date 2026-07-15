@@ -28,7 +28,10 @@ use venue_api::Wallet;
 use venue_paper::PaperLedgerSnapshot;
 
 use crate::live_markout::{FairRing, LiveMarkout};
+use crate::model_taker::{DriverPnlState, ModelTakerState, ModelTakerTick};
+use crate::shadow::{ShadowState, ShadowTick};
 use crate::ws::{BreakerEvent, WsUpdate};
+use engine::FillDriver;
 
 /// Fills retained per mode for the blotter.
 pub(crate) const FILLS_RING_CAP: usize = 1_000;
@@ -87,6 +90,17 @@ pub(crate) struct PrintRow {
 pub(crate) struct EquityPoint {
     pub(crate) ts: TimestampMs,
     pub(crate) equity: Dollars,
+}
+
+/// A settled window plus the wall-clock time its resolution was observed. The
+/// [`SettlementSummary`]'s own `ts` is the window's *close* time; a window
+/// resolves (and the money moves) only when the `Resolved` event arrives, so
+/// `resolved_at` is the honest "settled at" timestamp the dashboard displays
+/// (CLAUDE.md §9 — settlement happens at the resolution event, not window close).
+#[derive(Debug, Clone)]
+pub(crate) struct SettledWindow {
+    pub(crate) summary: Arc<SettlementSummary>,
+    pub(crate) resolved_at: TimestampMs,
 }
 
 /// A currently-stale feed stream.
@@ -215,7 +229,7 @@ pub(crate) struct ModeState {
     pub(crate) fills: Ring<Arc<Fill>>,
     pub(crate) orders: HashMap<OrderId, Arc<OrderUpdate>>,
     pub(crate) inventory: HashMap<WindowId, Arc<InventorySnapshot>>,
-    pub(crate) settlements: Ring<Arc<SettlementSummary>>,
+    pub(crate) settlements: Ring<SettledWindow>,
     pub(crate) tripped: BTreeSet<BreakerKind>,
     pub(crate) last_cancel_all: Option<BreakerKind>,
     pub(crate) risk_snapshot: Option<RiskStateSnapshot>,
@@ -282,6 +296,12 @@ pub(crate) struct DashboardData {
     /// The latest control-plane state snapshot, pushed by the orchestrator after
     /// each command and read by `GET /api/control/status` (§10.6).
     pub(crate) control_state: Option<crate::command::ControlStateSnapshot>,
+    /// Observation-only shadow-model tile state (fed by `set_shadow`).
+    pub(crate) shadow: ShadowState,
+    /// Model-taker fires tile (fed by `set_model_taker`). Paper-only in this bot.
+    pub(crate) model_taker: ModelTakerState,
+    /// PnL attribution by driver (fed by `record_driver_fill` + window settlement).
+    pub(crate) driver_pnl: DriverPnlState,
     pub(crate) server_started: TimestampMs,
     pub(crate) last_now: TimestampMs,
 }
@@ -294,6 +314,9 @@ impl DashboardData {
             live: ModeState::new(Mode::Live),
             params: ParamsView::default(),
             control_state: None,
+            shadow: ShadowState::default(),
+            model_taker: ModelTakerState::default(),
+            driver_pnl: DriverPnlState::default(),
             server_started: now,
             last_now: now,
         }
@@ -311,6 +334,48 @@ impl DashboardData {
             Mode::Paper => &mut self.paper,
             Mode::Live => &mut self.live,
         }
+    }
+
+    /// Cost basis of the mode's open positions: the dollars still tied up in
+    /// shares of **unresolved** windows. The query ranges only over windows that
+    /// are still live and unresolved (the authoritative lifecycle in the shared
+    /// view), so settled windows are excluded by construction — a resolved
+    /// window's inventory lingers only for the Live-window display and never
+    /// counts here, and once the window is pruned its inventory is dropped too.
+    /// Valued at cost, not marked to the live book — the conservative choice
+    /// (§9): buying just moves cash into position cost, so equity is recognized
+    /// only when a window resolves.
+    pub(crate) fn open_positions_cost(&self, mode: Mode) -> Dollars {
+        let windows = &self.shared.windows;
+        self.mode(mode)
+            .inventory
+            .iter()
+            .filter(|(wid, _)| windows.get(wid).is_some_and(|v| v.outcome.is_none()))
+            .fold(Dollars::ZERO, |acc, (_, inv)| {
+                acc + inv.up.cost + inv.down.cost
+            })
+    }
+
+    /// The mode's account equity: cash (collateral) plus the cost basis of open
+    /// positions. For a fully-settled history (no open positions) this collapses
+    /// to cash, which equals starting capital plus total realized PnL. `None`
+    /// until the first wallet sample.
+    pub(crate) fn equity(&self, mode: Mode) -> Option<Dollars> {
+        self.mode(mode)
+            .wallet
+            .as_ref()
+            .map(|w| w.collateral_total + self.open_positions_cost(mode))
+    }
+
+    /// Number of windows that have closed but not yet resolved (their outcome —
+    /// and settlement — is still pending). Shared across modes since the market
+    /// lifecycle is mode-independent.
+    pub(crate) fn awaiting_resolution(&self) -> usize {
+        self.shared
+            .windows
+            .values()
+            .filter(|w| w.lifecycle == WindowLifecycle::Closed)
+            .count()
     }
 
     /// Folds one bus event into the store and returns the incremental
@@ -347,6 +412,13 @@ impl DashboardData {
                     outcome,
                 });
                 self.shared.prune(now);
+                // Drop per-mode inventory for windows that no longer exist so the
+                // 24/7 inventory maps stay bounded (they already excluded resolved
+                // windows from open positions, so no displayed figure changes —
+                // this is pure memory hygiene). Disjoint field borrows.
+                let live = &self.shared.windows;
+                self.paper.inventory.retain(|wid, _| live.contains_key(wid));
+                self.live.inventory.retain(|wid, _| live.contains_key(wid));
             }
             Event::Book(snap) => {
                 if let Some((wid, outcome)) = self.shared.locate_token(&snap.token_id)
@@ -514,7 +586,12 @@ impl DashboardData {
                     .insert(inv.window, Arc::clone(inv));
             }
             Event::Settlement(s) => {
-                self.mode_mut(mode).settlements.push(Arc::clone(s));
+                self.mode_mut(mode).settlements.push(SettledWindow {
+                    summary: Arc::clone(s),
+                    resolved_at: now,
+                });
+                // Mark this window's driver-tagged fills to the resolved outcome.
+                self.driver_pnl.settle(s.window, s.outcome);
             }
             Event::Risk(re) => {
                 let ms = self.mode_mut(mode);
@@ -573,8 +650,11 @@ impl DashboardData {
         updates
     }
 
-    /// Samples a mode's wallet (the equity-curve magnitude source). Pushes an
-    /// equity point and an `equity` update only when the value changed.
+    /// Samples a mode's wallet. Pushes an equity point (cash + open-position cost
+    /// basis) and an `equity` update only when the value changed. Because a buy
+    /// moves cash into position cost 1:1, equity is stable between resolutions and
+    /// steps only when a window settles (or on fees/capital), so the curve is the
+    /// honest account value, not a jittery mark-to-market.
     pub(crate) fn set_wallet(
         &mut self,
         mode: Mode,
@@ -582,9 +662,10 @@ impl DashboardData {
         now: TimestampMs,
     ) -> Vec<WsUpdate> {
         self.last_now = now;
-        let equity = wallet.collateral_total;
+        self.mode_mut(mode).wallet = Some(wallet);
+        // Wallet is now set, so `equity` is `Some`.
+        let equity = self.equity(mode).unwrap_or(Dollars::ZERO);
         let ms = self.mode_mut(mode);
-        ms.wallet = Some(wallet);
         if ms.last_equity == Some(equity) {
             return Vec::new();
         }
@@ -610,6 +691,45 @@ impl DashboardData {
     pub(crate) fn set_risk(&mut self, mode: Mode, snapshot: RiskStateSnapshot, now: TimestampMs) {
         self.last_now = now;
         self.mode_mut(mode).risk_snapshot = Some(snapshot);
+    }
+
+    /// Folds one shadow prediction into the tile state and emits a light WS nudge.
+    pub(crate) fn set_shadow(&mut self, tick: &ShadowTick, now: TimestampMs) -> Vec<WsUpdate> {
+        self.last_now = now;
+        self.shadow.record(tick);
+        vec![WsUpdate::Shadow {
+            ts_ms: now.as_millis(),
+            series: tick.series.to_string(),
+            p_up: tick.p_up,
+            finite_count: tick.finite_count,
+        }]
+    }
+
+    /// Folds one model-taker decision into the fires tile (polled via REST).
+    pub(crate) fn set_model_taker(&mut self, tick: &ModelTakerTick, now: TimestampMs) {
+        self.last_now = now;
+        self.model_taker.record(tick);
+    }
+
+    /// Buffers a driver-tagged fill for the PnL-by-driver accumulator (marked at
+    /// settlement). An untagged fill (`driver == None`) is skipped.
+    pub(crate) fn record_driver_fill(
+        &mut self,
+        driver: Option<FillDriver>,
+        fill: &Fill,
+        now: TimestampMs,
+    ) {
+        self.last_now = now;
+        if let Some(driver) = driver {
+            self.driver_pnl.record_fill(
+                fill.window,
+                driver,
+                fill.outcome,
+                fill.size,
+                fill.price,
+                fill.fee,
+            );
+        }
     }
 
     pub(crate) fn set_params(&mut self, params: ParamsView, now: TimestampMs) {

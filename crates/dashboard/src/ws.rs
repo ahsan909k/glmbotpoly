@@ -136,6 +136,17 @@ pub enum WsUpdate {
         /// Whether live is armed.
         armed: bool,
     },
+    /// A shadow-model prediction landed (observation only — informs the tile).
+    Shadow {
+        /// Receive time.
+        ts_ms: i64,
+        /// Series key.
+        series: String,
+        /// Model probability of Up.
+        p_up: f64,
+        /// How many of the 24 features were finite.
+        finite_count: u32,
+    },
     /// The client's broadcast receiver lagged and dropped updates — it should
     /// re-fetch the REST snapshots to resynchronize.
     Resync,

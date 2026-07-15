@@ -36,6 +36,24 @@ test:
 chaos:
     cargo test -p bot --features chaos --test chaos -- --test-threads=1
 
+# Shadow-mode export-parity gate (BUILD_PLAN 12–13): the pure-Rust LightGBM
+# tree-walker must reproduce `booster.predict` to 1e-6 on the committed fixture
+# (incl. NaN- and 0-bearing rows). Run after re-exporting the champion.
+shadow-parity:
+    cargo test -p shadow --test export_parity
+
+# Export the champion dir10_full booster + fixtures (needs the model-lab venv +
+# the [gbt] extra). Regenerates models/model_dir10_full.{txt,meta.json} and the
+# Rust export-parity fixtures.
+export-champion:
+    cd model-lab; & .\.venv\Scripts\python.exe -m model_lab.export_champion
+
+# Nightly LIVE feature-parity guard (the basis-bug tripwire): compares shadow's
+# journaled live features against the offline lab features. Requires the offline
+# reference first: `python -m model_lab.short_horizon` over the same journal period.
+shadow-parity-live:
+    cd model-lab; & .\.venv\Scripts\python.exe -m model_lab.short_horizon; & .\.venv\Scripts\python.exe -m model_lab.shadow_parity
+
 # Continuous check/clippy watcher (install: cargo install bacon)
 watch:
     bacon

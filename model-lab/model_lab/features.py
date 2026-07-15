@@ -21,20 +21,33 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .config import Paths, resolve_paths, stage_parser
+from .config import Paths, require_tables, resolve_paths, stage_parser
 
 FEATURE_COLS = [
     "asset", "sec", "ts_ms", "mid", "ret", "realized_vol", "chainlink",
-    "basis_bps", "depth_mid", "imbalance", "microprice", "spread",
+    "basis_bps", "basis_ewma", "depth_mid", "imbalance", "microprice", "spread",
 ]
+
+# Rolling Binance<->Chainlink basis (the offline analogue of the engine's basis
+# tracker): a causal EWMA of the log basis ln(chainlink/mid), used to project the
+# fast Binance mid onto the Chainlink strike's feed when computing z. Matches the
+# engine's tracker: halflife 120 s, warmup 30 samples.
+BASIS_HALFLIFE_SECS = 120.0
+BASIS_MIN_PERIODS = 30
 
 
 def _bars(sel: pd.DataFrame, value_name: str) -> pd.DataFrame:
-    """Collapses ticks to one-second bars: the last tick (by ms) closes the bar."""
+    """Collapses ticks to one-second bars: the last tick (by ms) closes the bar.
+
+    The sort is **stable** so that when two ticks share the exact same millisecond in
+    a second, ``groupby.last()`` keeps the later-arriving (last in journal order) — a
+    deterministic tie-break. This makes the collapse reproducible and lets the
+    streaming journal reader (which keeps the last max-ms tick per second) produce a
+    byte-identical result to the full-tick path. Not a change to *what* is computed
+    (still the last mid per second); only the same-ms tie-break becomes deterministic.
+    """
     ts = sel["ts_exchange"].fillna(sel["ts_local"]).astype("int64")
-    # Sort by the actual millisecond so groupby-last picks the latest tick in the
-    # second (sort_values on `sec` alone is not stable within a second).
-    sel = sel.assign(sec=(ts // 1000), _ts=ts).sort_values("_ts")
+    sel = sel.assign(sec=(ts // 1000), _ts=ts).sort_values("_ts", kind="stable")
     bars = sel.groupby("sec", as_index=False)["value"].last().rename(columns={"value": value_name})
     return bars[bars[value_name] > 0].sort_values("sec").reset_index(drop=True)
 
@@ -92,6 +105,15 @@ def build_asset_features(
     else:
         base["chainlink"] = np.nan
     base["basis_bps"] = 1e4 * (base["chainlink"] / base["mid"] - 1.0)
+    # Rolling log basis ln(chainlink/mid), a causal EWMA (halflife 120 s) — the
+    # offline reconstruction of the engine's basis tracker. Added to log(mid/strike)
+    # in z so the Binance mid is projected onto the Chainlink strike's feed. NaN
+    # where there is no Chainlink feed (binance_proxy = same feed ⇒ zero basis).
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_basis = np.log(base["chainlink"] / base["mid"])
+    base["basis_ewma"] = log_basis.ewm(
+        halflife=BASIS_HALFLIFE_SECS, min_periods=BASIS_MIN_PERIODS, ignore_na=True
+    ).mean()
 
     dep = _depth_bars(depth, asset)
     if not dep.empty:
@@ -107,6 +129,7 @@ def build_asset_features(
 
 def features(paths: Paths) -> int:
     """Runs the features stage; returns the feature-grid row count."""
+    require_tables(paths, "ticks")  # fail loudly on a truncated/absent ticks.parquet
     paths.ensure_out()
     ticks = pd.read_parquet(paths.table("ticks"), engine="pyarrow")
     depth_path = paths.table("depth")

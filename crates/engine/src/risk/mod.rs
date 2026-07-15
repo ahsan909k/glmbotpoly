@@ -34,6 +34,6 @@ mod params;
 mod state;
 
 pub use core::RiskOutput;
-pub use driver::RiskManager;
+pub use driver::{FillDriver, RiskManager};
 pub use params::RiskParams;
 pub use state::RiskStateSnapshot;

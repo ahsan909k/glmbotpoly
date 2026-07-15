@@ -172,6 +172,12 @@ impl RestingView {
         self.by_id.keys().cloned().collect()
     }
 
+    /// Whether `id` is a live order in this view (driver attribution).
+    #[must_use]
+    pub fn owns(&self, id: &OrderId) -> bool {
+        self.by_id.contains_key(id)
+    }
+
     /// True when no orders are held.
     #[must_use]
     pub fn is_empty(&self) -> bool {

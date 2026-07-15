@@ -31,7 +31,8 @@ use timeutil::wall_now;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::feed::{binance_params, clob_params, rtds_params};
+use crate::depth_capture::{self, DepthStats};
+use crate::feed::{binance_params, clob_params, depth_params, rtds_params};
 
 /// How often the status line prints.
 const STATUS_PERIOD: Duration = Duration::from_secs(5);
@@ -159,6 +160,19 @@ async fn run_record(
             shutdown_rx: shutdown_tx.subscribe(),
             backoff_seed: None,
         }));
+    // Binance depth20@100ms capture (self-contained side channel, not on the
+    // bus): its own WS connection → per-day gzip under `journal.depth_dir`, for
+    // the offline model-lab. Gated on the config flag; joined in the drain phase.
+    let depth_task: Option<JoinHandle<anyhow::Result<DepthStats>>> =
+        config.feeds.binance_depth_capture.then(|| {
+            tokio::spawn(depth_capture::run(
+                depth_params(&config.feeds, &config.journal),
+                WsTransport,
+                wall_now,
+                shutdown_tx.subscribe(),
+                None,
+            ))
+        });
     // The loop's keep-alive sender (the drivers hold their own clones); dropped
     // in the drain phase so `bus_rx.recv()` can reach `None`.
     let keepalive_tx = bus_tx;
@@ -239,6 +253,23 @@ async fn run_record(
         }
     }
 
+    // Join the depth capture (it saw the same shutdown signal): finalize its own
+    // gzip day-files and collect its stats.
+    let depth_stats = match depth_task {
+        Some(task) => match task.await {
+            Ok(Ok(stats)) => Some(stats),
+            Ok(Err(error)) => {
+                tracing::warn!(target: "record", %error, "depth capture failed");
+                None
+            }
+            Err(error) => {
+                tracing::warn!(target: "record", %error, "depth capture task panicked");
+                None
+            }
+        },
+        None => None,
+    };
+
     // Stop the recorder: drain its backlog, flush, finalize the gzip trailers.
     let stats = recorder.finish().context("finalizing the journal")?;
     let ran_for = wall_now().signed_duration_since(started);
@@ -264,6 +295,19 @@ async fn run_record(
             dropped = stats.dropped,
             "capture is incomplete — the disk could not keep up with the bus"
         );
+    }
+    if let Some(depth) = depth_stats {
+        println!(
+            "depth20 capture: {} frames written ({} dropped) in {} day-files, {} reconnects",
+            depth.frames_written, depth.frames_dropped, depth.files, depth.reconnects
+        );
+        if depth.frames_dropped > 0 {
+            tracing::warn!(
+                target: "record",
+                dropped = depth.frames_dropped,
+                "depth capture incomplete — the disk could not keep up"
+            );
+        }
     }
 
     // Surface a driver failure (a clean ctrl-c leaves these as Ok).

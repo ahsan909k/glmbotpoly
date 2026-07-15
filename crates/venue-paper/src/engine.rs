@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use core_types::{
     BookSnapshot, ConditionId, Decimal, Dollars, DurationMs, Fill, Liquidity, MarketInfo, NewOrder,
-    OrderId, OrderQty, OrderState, OrderUpdate, Price, Side, Size, TickSize, TimeInForce,
+    OrderId, OrderQty, OrderState, OrderUpdate, Outcome, Price, Side, Size, TickSize, TimeInForce,
     TimestampMs, TokenId, TopOfBook, WindowId, WindowLifecycle, taker_fee,
 };
 use venue_api::{Accepted, CancelReport, NotCanceled, RejectReason, VenueError, Wallet};
@@ -231,20 +231,50 @@ impl MatchEngine {
                 effects.push(PaperEffect::Order(order_update(o, now, None)));
             }
         }
-        // Settlement once the outcome is known. `Closed` never settles (the
-        // outcome is not yet known); `insert` returning false ⇒ already settled.
+        // Settlement once the outcome is known, at the resolution EVENT time
+        // (`now`), never at window close — `Closed` never settles because the
+        // outcome is not yet known; `insert` returning false ⇒ already settled.
         if let WindowLifecycle::Resolved { outcome } = lifecycle
             && self.settled.insert(market.window)
         {
+            // Snapshot each side's shares BEFORE settling (which zeroes them) so
+            // we can journal a per-position audit: window, side, shares, and the
+            // proceeds — $1 per winning share, $0 per losing share (signed, so a
+            // short winner correctly shows negative proceeds). The durable
+            // per-window settlement record is `Event::Settlement` (from the
+            // orchestrator's inventory manager); this is the paper venue's audit
+            // trail that mirrors what a live on-chain redeem would confirm (§9).
+            let up_shares = self.wallet.net_position(&market.tokens.up);
+            let down_shares = self.wallet.net_position(&market.tokens.down);
             let payout = self
                 .wallet
                 .settle_window(&market.tokens.up, &market.tokens.down, outcome);
+            for (side, shares) in [(Outcome::Up, up_shares), (Outcome::Down, down_shares)] {
+                if shares.is_zero() {
+                    continue;
+                }
+                let proceeds = if side == outcome {
+                    Dollars::new(shares) // $1 per winning share (signed)
+                } else {
+                    Dollars::ZERO // losing shares pay $0
+                };
+                tracing::info!(
+                    target: "paper-ledger",
+                    window = %market.event_slug,
+                    ?side,
+                    winner = ?outcome,
+                    shares = %shares,
+                    proceeds = %proceeds,
+                    "settled position at resolution",
+                );
+            }
             tracing::info!(
                 target: "paper-ledger",
                 window = %market.event_slug,
                 ?outcome,
                 payout = %payout,
-                "settled window"
+                ts = now.as_millis(),
+                "settled window at resolution",
             );
         }
         effects
@@ -278,7 +308,16 @@ impl MatchEngine {
             // Marketable BUY (notional): no share original; set at activation.
             OrderQty::Notional(_) => Size::ZERO,
         };
-        let activate_at = now.saturating_add(self.sampler.sample(&self.params.placement));
+        // Network round-trip for every order; the venue's taker delay is added
+        // on top for MARKETABLE orders only — resting makers never match on
+        // entry, so they eat no venue hold (§9 / 2026-07-09 audit).
+        let network = self.sampler.sample(&self.params.placement);
+        let venue_hold = if order.tif.is_marketable() {
+            self.params.venue_taker_delay_ms
+        } else {
+            DurationMs::ZERO
+        };
+        let activate_at = now.saturating_add(network).saturating_add(venue_hold);
         let expires_at = match order.tif {
             TimeInForce::Gtd { expires_at, .. } => Some(floor_gtd(expires_at, now)),
             _ => None,
@@ -526,6 +565,23 @@ impl MatchEngine {
                     "credited daily maker rebate"
                 );
             }
+            if self.params.taker_rebate_enabled {
+                // The tier is set by the trailing 30-day wV *before* today rolls in
+                // (docs: recalculated daily, effective next update). Report-only —
+                // `credit_taker_rebate` never touches cash.
+                let (tier, pct) = crate::wallet::taker_rebate_tier(self.wallet.taker_wv_30d());
+                let t_credited = self
+                    .wallet
+                    .credit_taker_rebate(pct, Dollars::new(Decimal::ONE));
+                if !t_credited.is_zero() {
+                    tracing::info!(
+                        target: "paper-ledger",
+                        credited = %t_credited,
+                        tier,
+                        "accrued daily taker rebate (report-only, not cash)"
+                    );
+                }
+            }
             self.rebate_next_credit_at = Some(due.saturating_add(REBATE_PERIOD));
         }
     }
@@ -685,6 +741,17 @@ impl MatchEngine {
                 ts_local: now,
             };
             self.wallet.apply_fill(&f, Dollars::ZERO);
+            if self.params.taker_rebate_enabled {
+                // Accrue this taker fill's weighted volume + fee for the tiered
+                // taker rebate (report-only; the daily cycle credits it). Arm the
+                // daily cycle here too — a taker-only session never hits the maker
+                // accrual that otherwise arms it.
+                let wv = crate::wallet::taker_weighted_volume(f.size, f.price);
+                self.wallet.accrue_taker(wv, f.fee);
+                if self.rebate_next_credit_at.is_none() {
+                    self.rebate_next_credit_at = Some(now.saturating_add(REBATE_PERIOD));
+                }
+            }
             total = total + *lvl_size;
             effects.push(PaperEffect::Fill(f));
         }
@@ -1012,6 +1079,13 @@ mod tests {
     }
 
     fn engine() -> MatchEngine {
+        engine_with_venue_delay(0)
+    }
+
+    /// Test engine with deterministic network latency (`PLACE_MS`/`CANCEL_MS`,
+    /// zero jitter) and an explicit venue taker delay. `engine()` uses `0` so
+    /// existing marketable tests keep activating at exactly `T0 + PLACE_MS`.
+    fn engine_with_venue_delay(venue_ms: i64) -> MatchEngine {
         MatchEngine::new(PaperParams {
             placement: LatencySpec {
                 mean_ms: DurationMs::from_millis(PLACE_MS),
@@ -1021,6 +1095,7 @@ mod tests {
                 mean_ms: DurationMs::from_millis(CANCEL_MS),
                 jitter_ms: DurationMs::ZERO,
             },
+            venue_taker_delay_ms: DurationMs::from_millis(venue_ms),
             rng_seed: Some(1),
             ..PaperParams::default()
         })
@@ -1200,6 +1275,55 @@ mod tests {
         let u = only_order(&fx);
         assert_eq!(u.state, OrderState::Open);
         assert_eq!(u.order_id, acc.order_id);
+    }
+
+    #[test]
+    fn marketable_order_eats_the_venue_taker_delay_but_a_maker_does_not() {
+        const VENUE_MS: i64 = 250;
+        let mut e = engine_with_venue_delay(VENUE_MS);
+        e.on_window(&market(), WindowLifecycle::Open, ts(T0));
+        e.on_book(&snapshot(
+            &[(dec!(0.49), dec!(30))],
+            &[(dec!(0.51), dec!(50))],
+            T0,
+        ));
+
+        // A resting maker and a marketable BUY placed at the same instant.
+        let maker = e
+            .place(&buy(dec!(0.49), dec!(20)), ts(T0))
+            .0
+            .expect("maker accepted")
+            .order_id;
+        let taker = e
+            .place(&marketable_buy(dec!(0.52), dec!(20), false), ts(T0))
+            .0
+            .expect("taker accepted")
+            .order_id;
+
+        // At network latency only: the maker rests Open; the marketable is still
+        // held by the venue delay — no fill yet.
+        let fx = e.on_clock(ts(T0 + PLACE_MS));
+        let updates = orders_of(&fx);
+        assert_eq!(
+            updates.len(),
+            1,
+            "only the maker activates at network latency, got {fx:?}"
+        );
+        assert_eq!(updates[0].order_id, maker);
+        assert_eq!(updates[0].state, OrderState::Open);
+        assert!(
+            fills_of(&fx).is_empty(),
+            "no taker fill before the venue delay elapses"
+        );
+        assert_eq!(e.dbg_state(&taker), Some(OrderState::PendingNew));
+
+        // Just before network + venue: the marketable is still pending.
+        assert!(e.on_clock(ts(T0 + PLACE_MS + VENUE_MS - 1)).is_empty());
+
+        // At network + venue: the marketable activates and walks the book.
+        let fx = e.on_clock(ts(T0 + PLACE_MS + VENUE_MS));
+        let fill = only_fill(&fx);
+        assert_eq!(fill.order_id, taker);
     }
 
     // ---- Rule 2 / 6: activation post-only cross + would NOT cross ----------
@@ -1824,6 +1948,65 @@ mod tests {
         assert_eq!(e.wallet().rebate_accrued(), expected);
     }
 
+    #[test]
+    fn taker_fill_accrues_weighted_volume_and_the_daily_cycle_reports_it() {
+        let mut e = engine();
+        let cash0 = e.balances().collateral_total;
+        e.on_window(&market(), WindowLifecycle::Open, ts(T0));
+        e.on_book(&snapshot(
+            &[(dec!(0.49), dec!(0))],
+            &[(dec!(0.50), dec!(1000))],
+            T0,
+        ));
+        // $50 at 0.50 → 100 shares taker; wV = 100·(1−0.50)·2.3 = 115.
+        let fx = e.on_clock_after_place(&marketable_buy(dec!(0.50), dec!(50), false));
+        assert_eq!(only_fill(&fx).liquidity, Liquidity::Taker);
+        // Before the cycle nothing has rolled into the 30-day ring yet.
+        assert_eq!(e.ledger_snapshot().taker_wv_30d, Dollars::ZERO);
+        // Advance a full rebate period so the daily cycle rolls today's wV in. The
+        // first cycle's tier is None (empty ring) → $0 rebate, but the wV is
+        // recorded and the report is report-only (cash unchanged aside from the fee).
+        let _ = e.on_clock(ts(T0 + REBATE_PERIOD.as_millis() * 2));
+        let snap = e.ledger_snapshot();
+        assert_eq!(snap.taker_wv_30d, Dollars::new(dec!(115)));
+        assert_eq!(snap.taker_tier, "None");
+        assert_eq!(snap.taker_rebate_accrued, Dollars::ZERO);
+        assert_eq!(snap.taker_rebate_credited, Dollars::ZERO);
+        // Cash only moved by the taker fee (the rebate never touches it).
+        assert_eq!(
+            e.balances().collateral_total,
+            cash0 - Dollars::new(dec!(50)) - snap.fees_paid
+        );
+    }
+
+    #[test]
+    fn taker_rebate_disabled_records_no_weighted_volume() {
+        // Same deterministic latency as `engine()`, but with the projection off.
+        let mut e = MatchEngine::new(PaperParams {
+            placement: LatencySpec {
+                mean_ms: DurationMs::from_millis(PLACE_MS),
+                jitter_ms: DurationMs::ZERO,
+            },
+            cancel: LatencySpec {
+                mean_ms: DurationMs::from_millis(CANCEL_MS),
+                jitter_ms: DurationMs::ZERO,
+            },
+            venue_taker_delay_ms: DurationMs::ZERO,
+            rng_seed: Some(1),
+            taker_rebate_enabled: false,
+            ..PaperParams::default()
+        });
+        e.on_window(&market(), WindowLifecycle::Open, ts(T0));
+        e.on_book(&snapshot(
+            &[(dec!(0.49), dec!(0))],
+            &[(dec!(0.50), dec!(1000))],
+            T0,
+        ));
+        let _ = e.on_clock_after_place(&marketable_buy(dec!(0.50), dec!(50), false));
+        let _ = e.on_clock(ts(T0 + REBATE_PERIOD.as_millis() * 2));
+        assert_eq!(e.ledger_snapshot().taker_wv_30d, Dollars::ZERO);
+    }
+
     // ---- Rule 22: next_deadline ------------------------------------------
 
     #[test]
@@ -1882,6 +2065,63 @@ mod tests {
             ts(T0 + 300_001),
         );
         assert_eq!(e.balances().collateral_total, after.collateral_total);
+    }
+
+    #[test]
+    fn resolved_pays_winner_and_zeroes_loser_two_sided() {
+        let mut e = engine();
+        e.on_window(&market(), WindowLifecycle::Open, ts(T0));
+        // 100 Up via a maker fill at 0.40 (collateral −40).
+        e.on_book(&snapshot(
+            &[(dec!(0.40), dec!(0))],
+            &[(dec!(0.60), dec!(50))],
+            T0,
+        ));
+        let _ = open_resting(&mut e, &buy(dec!(0.40), dec!(100)));
+        let _ = e.on_trade(
+            &up_token(),
+            px(dec!(0.40)),
+            sz(dec!(100)),
+            Side::Sell,
+            ts(T0 + 200),
+            ts(T0 + 200),
+        );
+        // 40 Down via a maker fill at 0.55 (collateral −22).
+        e.on_book(&down_snapshot(
+            &[(dec!(0.55), dec!(0))],
+            &[(dec!(0.70), dec!(50))],
+            T0,
+        ));
+        let down_order = NewOrder {
+            token_id: down_token(),
+            outcome: Outcome::Down,
+            ..resting(Side::Buy, dec!(0.55), dec!(40), true)
+        };
+        let did = e.place(&down_order, ts(T0)).0.expect("accepted").order_id;
+        let _ = e.on_clock(ts(T0 + PLACE_MS));
+        assert_eq!(e.dbg_state(&did), Some(OrderState::Open));
+        let _ = e.on_trade(
+            &down_token(),
+            px(dec!(0.55)),
+            sz(dec!(40)),
+            Side::Sell,
+            ts(T0 + 300),
+            ts(T0 + 300),
+        );
+
+        // Hold 100 Up + 40 Down. Resolve Up: the 100 winning Up shares pay $1
+        // each; the 40 losing Down shares pay $0; both positions close.
+        let before = e.balances().collateral_total;
+        let _ = e.on_window(
+            &market(),
+            WindowLifecycle::Resolved {
+                outcome: Outcome::Up,
+            },
+            ts(T0 + 300_000),
+        );
+        let after = e.balances();
+        assert_eq!(after.collateral_total, before + Dollars::new(dec!(100)));
+        assert!(after.positions.is_empty(), "both sides close at settlement");
     }
 
     #[test]

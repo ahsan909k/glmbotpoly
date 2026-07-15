@@ -48,7 +48,9 @@ use venue_api::{VenueEvent, VenuePort};
 use super::edge::{TakePlan, plan_take};
 use super::signal::SignalWindow;
 use super::{MomentumTakerParams, NoTakeReason};
+use crate::arbitration::{FireLedger, TakerId};
 use crate::normalize::{NormalizerParams, OrderDraft, normalize};
+use crate::quote_manager::RestingView;
 
 /// Seconds remaining to close, clamped at zero — computed inline so the driver
 /// needs no `timeutil` dependency (the `quote_manager` precedent).
@@ -152,12 +154,25 @@ impl MomentumTaker {
         self.standing_down
     }
 
+    /// Whether `id` is one of this taker's placed orders (driver attribution).
+    #[must_use]
+    pub fn owns(&self, id: &core_types::OrderId) -> bool {
+        self.our_orders.contains(id)
+    }
+
     /// Handles one bus event; attempts a take after a model or active-token book
     /// update (a fresh fair or a fresh book may have opened an opportunity). A
     /// price tick only updates the signal ring — the decision needs a fresh fair.
-    pub async fn on_event<P: VenuePort>(&mut self, event: &Event, port: &P, now: TimestampMs) {
+    pub async fn on_event<P: VenuePort>(
+        &mut self,
+        event: &Event,
+        port: &P,
+        now: TimestampMs,
+        arbiter: &mut FireLedger,
+        resting: Option<&RestingView>,
+    ) {
         if self.ingest(event) {
-            self.attempt_take(port, now).await;
+            self.attempt_take(port, now, arbiter, resting).await;
         }
     }
 
@@ -298,7 +313,12 @@ impl MomentumTaker {
 
     /// The full take gate ladder. Each gate maps to a typed [`NoTakeReason`] so
     /// every non-fire is explainable. Pure and synchronous.
-    fn decide(&self, now: TimestampMs) -> Result<Decision, NoTakeReason> {
+    fn decide(
+        &self,
+        now: TimestampMs,
+        arbiter: &FireLedger,
+        resting: Option<&RestingView>,
+    ) -> Result<Decision, NoTakeReason> {
         if self.standing_down {
             return Err(NoTakeReason::StandingDown);
         }
@@ -352,6 +372,13 @@ impl MomentumTaker {
                 need: Dollars::new(Decimal::ONE),
             });
         }
+        // Arbitration: momentum defers on assets where the model wins (§8).
+        if let Err(block) = arbiter.check(TakerId::Momentum, active.window, now) {
+            return Err(NoTakeReason::ArbitrationSuppressed {
+                winner: block.winner,
+                remaining_ms: block.remaining_ms,
+            });
+        }
         let outcome = confirmed.outcome;
         let token_id = active.market.tokens.get(outcome).clone();
         let book = self
@@ -369,10 +396,12 @@ impl MomentumTaker {
         } else {
             Decimal::ZERO
         };
+        // §7 self-match filter: never lift our own mirrored resting liquidity.
+        let asks = crate::self_match::filter_asks(outcome, &book.asks, active.window, resting);
         let plan = plan_take(
             outcome,
             fair,
-            &book.asks,
+            &asks,
             fee_rate,
             self.params.taker_rebate_pct,
             self.params.momentum_buffer,
@@ -388,16 +417,28 @@ impl MomentumTaker {
 
     // ---- firing (async) ----------------------------------------------------
 
-    async fn attempt_take<P: VenuePort>(&mut self, port: &P, now: TimestampMs) {
-        match self.decide(now) {
-            Ok(decision) => self.fire(port, decision, now).await,
+    async fn attempt_take<P: VenuePort>(
+        &mut self,
+        port: &P,
+        now: TimestampMs,
+        arbiter: &mut FireLedger,
+        resting: Option<&RestingView>,
+    ) {
+        match self.decide(now, arbiter, resting) {
+            Ok(decision) => self.fire(port, decision, now, arbiter).await,
             Err(reason) => {
                 tracing::debug!(target: "momentum-taker", reason = %reason, "no take");
             }
         }
     }
 
-    async fn fire<P: VenuePort>(&mut self, port: &P, decision: Decision, now: TimestampMs) {
+    async fn fire<P: VenuePort>(
+        &mut self,
+        port: &P,
+        decision: Decision,
+        now: TimestampMs,
+        arbiter: &mut FireLedger,
+    ) {
         let seq = self.next_seq();
         let open_ms = decision.market.window.open_time.as_millis();
         let draft = OrderDraft {
@@ -426,6 +467,7 @@ impl MomentumTaker {
                 self.pending.insert(acc.order_id, decision.plan.notional);
                 self.last_take_ms = Some(now.as_millis());
                 self.take_count += 1;
+                arbiter.record(TakerId::Momentum, decision.market.window, now);
                 tracing::info!(
                     target: "momentum-taker",
                     outcome = %decision.outcome,
@@ -628,7 +670,9 @@ mod tests {
     #[test]
     fn happy_path_decides_a_take() {
         let t = armed_up();
-        let d = t.decide(ts(OPEN_MS + 900)).expect("a take");
+        let d = t
+            .decide(ts(OPEN_MS + 900), &FireLedger::default(), None)
+            .expect("a take");
         assert_eq!(d.outcome, Outcome::Up);
         assert_eq!(d.token_id, up_token());
         assert_eq!(d.plan.worst_price.as_decimal(), dec!(0.80));
@@ -643,7 +687,9 @@ mod tests {
         t.ingest(&ready_model(0.15, 1e-4)); // fair_down = 0.85
         feed_down_move(&mut t);
         t.ingest(&book(down_token(), &[(dec!(0.80), dec!(50))]));
-        let d = t.decide(ts(OPEN_MS + 900)).expect("a down take");
+        let d = t
+            .decide(ts(OPEN_MS + 900), &FireLedger::default(), None)
+            .expect("a down take");
         assert_eq!(d.outcome, Outcome::Down);
         assert_eq!(d.token_id, down_token());
     }
@@ -652,7 +698,7 @@ mod tests {
     fn no_active_window() {
         let t = taker();
         assert!(matches!(
-            t.decide(ts(OPEN_MS)),
+            t.decide(ts(OPEN_MS), &FireLedger::default(), None),
             Err(NoTakeReason::NoActiveWindow)
         ));
     }
@@ -661,7 +707,10 @@ mod tests {
     fn no_model_yet() {
         let mut t = taker();
         t.ingest(&open_event());
-        assert!(matches!(t.decide(ts(OPEN_MS)), Err(NoTakeReason::NoModel)));
+        assert!(matches!(
+            t.decide(ts(OPEN_MS), &FireLedger::default(), None),
+            Err(NoTakeReason::NoModel)
+        ));
     }
 
     #[test]
@@ -675,7 +724,7 @@ mod tests {
             Some(other_window()),
         ));
         assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
+            t.decide(ts(OPEN_MS + 900), &FireLedger::default(), None),
             Err(NoTakeReason::WindowMismatch { .. })
         ));
     }
@@ -690,7 +739,7 @@ mod tests {
             t.ingest(&book(up_token(), &[(dec!(0.80), dec!(50))]));
             assert!(
                 matches!(
-                    t.decide(ts(OPEN_MS + 900)),
+                    t.decide(ts(OPEN_MS + 900), &FireLedger::default(), None),
                     Err(NoTakeReason::ModelNotReady { .. })
                 ),
                 "{health:?} should block"
@@ -705,7 +754,7 @@ mod tests {
         t.ingest(&ready_model(1.0, 1e-4)); // p_up at the domain edge
         feed_up_move(&mut t);
         assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
+            t.decide(ts(OPEN_MS + 900), &FireLedger::default(), None),
             Err(NoTakeReason::UnusableFair { .. })
         ));
 
@@ -714,7 +763,7 @@ mod tests {
         t2.ingest(&ready_model(0.85, 0.0)); // σ unusable
         feed_up_move(&mut t2);
         assert!(matches!(
-            t2.decide(ts(OPEN_MS + 900)),
+            t2.decide(ts(OPEN_MS + 900), &FireLedger::default(), None),
             Err(NoTakeReason::UnusableVol { .. })
         ));
     }
@@ -724,7 +773,7 @@ mod tests {
         let t = armed_up();
         // now past close.
         assert!(matches!(
-            t.decide(ts(CLOSE_MS + 1)),
+            t.decide(ts(CLOSE_MS + 1), &FireLedger::default(), None),
             Err(NoTakeReason::Expired { .. })
         ));
     }
@@ -741,7 +790,7 @@ mod tests {
         }
         t.ingest(&book(up_token(), &[(dec!(0.80), dec!(50))]));
         assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
+            t.decide(ts(OPEN_MS + 900), &FireLedger::default(), None),
             Err(NoTakeReason::NoConfirmedMove)
         ));
     }
@@ -764,7 +813,7 @@ mod tests {
         }
         t.ingest(&book(up_token(), &[(dec!(0.80), dec!(50))]));
         assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
+            t.decide(ts(OPEN_MS + 900), &FireLedger::default(), None),
             Err(NoTakeReason::NoConfirmedMove)
         ));
     }
@@ -774,12 +823,15 @@ mod tests {
         let mut t = armed_up();
         t.last_take_ms = Some(OPEN_MS + 800); // fired 100 ms ago < 5 s cooldown
         assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
+            t.decide(ts(OPEN_MS + 900), &FireLedger::default(), None),
             Err(NoTakeReason::InCooldown { .. })
         ));
         // After the cooldown elapses, the take is allowed again.
         t.last_take_ms = Some(OPEN_MS + 900 - 6_000);
-        assert!(t.decide(ts(OPEN_MS + 900)).is_ok());
+        assert!(
+            t.decide(ts(OPEN_MS + 900), &FireLedger::default(), None)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -788,7 +840,7 @@ mod tests {
         // Spend the whole $10 budget directly.
         t.realized_spent = Dollars::new(dec!(10));
         assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
+            t.decide(ts(OPEN_MS + 900), &FireLedger::default(), None),
             Err(NoTakeReason::BudgetExhausted { .. })
         ));
     }
@@ -801,7 +853,7 @@ mod tests {
         feed_up_move(&mut t);
         // No book ingested.
         assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
+            t.decide(ts(OPEN_MS + 900), &FireLedger::default(), None),
             Err(NoTakeReason::NoBookForToken)
         ));
     }
@@ -814,7 +866,7 @@ mod tests {
         feed_up_move(&mut t);
         t.ingest(&book(up_token(), &[(dec!(0.86), dec!(50))])); // ask ≥ fair
         assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
+            t.decide(ts(OPEN_MS + 900), &FireLedger::default(), None),
             Err(NoTakeReason::BookAlreadyRepriced { .. })
         ));
     }
@@ -827,7 +879,7 @@ mod tests {
         feed_up_move(&mut t);
         t.ingest(&book(up_token(), &[(dec!(0.50), dec!(100))])); // edge 0.022 < 0.0225
         assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
+            t.decide(ts(OPEN_MS + 900), &FireLedger::default(), None),
             Err(NoTakeReason::EdgeBelowFeePlusBuffer { .. })
         ));
     }
@@ -840,14 +892,17 @@ mod tests {
         });
         assert!(t.is_standing_down());
         assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
+            t.decide(ts(OPEN_MS + 900), &FireLedger::default(), None),
             Err(NoTakeReason::StandingDown)
         ));
         t.on_risk(RiskEvent::BreakerCleared {
             breaker: BreakerKind::FeedStale,
         });
         assert!(!t.is_standing_down());
-        assert!(t.decide(ts(OPEN_MS + 900)).is_ok());
+        assert!(
+            t.decide(ts(OPEN_MS + 900), &FireLedger::default(), None)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -946,7 +1001,7 @@ mod tests {
         t.pending.insert(oid, Dollars::new(dec!(9.50)));
         // Only $0.50 effective budget left (< $1) ⇒ no second take.
         assert!(matches!(
-            t.decide(ts(OPEN_MS + 900)),
+            t.decide(ts(OPEN_MS + 900), &FireLedger::default(), None),
             Err(NoTakeReason::BudgetExhausted { .. })
         ));
     }

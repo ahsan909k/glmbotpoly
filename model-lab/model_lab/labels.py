@@ -18,7 +18,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-from .config import Paths, resolve_paths, stage_parser
+from .config import Paths, require_tables, resolve_paths, stage_parser
 
 HORIZON_SECS = 5
 LABEL_COLS = ["asset", "sec", "ts_ms", "fwd_ret_5s", "fwd_up_5s"]
@@ -48,6 +48,10 @@ def _forward_labels(features: pd.DataFrame, asset: str, horizon: int) -> pd.Data
 
 def labels(paths: Paths) -> tuple[int, int]:
     """Runs the labels stage; returns ``(forward_label_rows, window_labels)``."""
+    require_tables(paths, "features")  # must be non-empty
+    # settlements/windows can legitimately be empty (no settled windows yet), so only
+    # verify the footer is intact (min_rows=0) — still fails loudly if truncated.
+    require_tables(paths, "settlements", "windows", min_rows=0)
     paths.ensure_out()
     features = pd.read_parquet(paths.table("features"), engine="pyarrow")
 

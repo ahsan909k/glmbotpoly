@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .config import Paths, resolve_paths, stage_parser
+from .config import Paths, _in_bounds, resolve_bounds, resolve_paths, stage_parser
 from .io import depth as depth_io
 from .io import journal as jio
 
@@ -50,8 +50,11 @@ def _write(rows: list[dict], columns: list[str], path: Path) -> int:
     return len(df)
 
 
-def ingest(paths: Paths) -> dict[str, int]:
-    """Runs the ingest stage, writing every table. Returns per-table row counts."""
+def ingest(paths: Paths, *, since_ms: int | None = None, until_ms: int | None = None) -> dict[str, int]:
+    """Runs the ingest stage, writing every table. Returns per-table row counts.
+    ``since_ms``/``until_ms`` bound the journal records by time (a bounded raw-tick
+    export; unlike ``dataset``/``short_horizon`` this stage keeps every raw tick, so
+    narrow the range on a large journal)."""
     paths.ensure_out()
 
     ticks: list[dict] = []
@@ -63,6 +66,10 @@ def ingest(paths: Paths) -> dict[str, int]:
     for rec in jio.read_records(paths.journal_dir):
         kind = rec.get("type")
         if kind == "price_tick":
+            te, tl = rec.get("ts_exchange"), rec.get("ts_local")
+            _ts = te if te is not None else tl
+            if not _in_bounds(int(_ts) if _ts is not None else None, since_ms, until_ms):
+                continue
             ticks.append(
                 {
                     "ts_local_ms": rec.get("ts_local_ms"),
@@ -70,11 +77,14 @@ def ingest(paths: Paths) -> dict[str, int]:
                     "asset": jio.asset_key(rec.get("asset")),
                     "kind": rec.get("kind"),
                     "value": jio.to_float(rec.get("value")),
-                    "ts_exchange": rec.get("ts_exchange"),
-                    "ts_local": rec.get("ts_local"),
+                    "ts_exchange": te,
+                    "ts_local": tl,
                 }
             )
         elif kind == "model":
+            ts = rec.get("ts")
+            if not _in_bounds(int(ts) if ts is not None else None, since_ms, until_ms):
+                continue
             series, open_time = jio.window_key(rec.get("window"))
             models.append(
                 {
@@ -93,6 +103,9 @@ def ingest(paths: Paths) -> dict[str, int]:
                 }
             )
         elif kind == "fill":
+            ts = rec.get("ts_venue")
+            if not _in_bounds(int(ts) if ts is not None else None, since_ms, until_ms):
+                continue
             series, open_time = jio.window_key(rec.get("window"))
             fills.append(
                 {
@@ -110,6 +123,9 @@ def ingest(paths: Paths) -> dict[str, int]:
                 }
             )
         elif kind == "settlement":
+            ts = rec.get("ts")
+            if not _in_bounds(int(ts) if ts is not None else None, since_ms, until_ms):
+                continue
             series, open_time = jio.window_key(rec.get("window"))
             up = rec.get("up") or {}
             down = rec.get("down") or {}
@@ -128,7 +144,7 @@ def ingest(paths: Paths) -> dict[str, int]:
         elif kind == "window":
             market = rec.get("market") or {}
             key = jio.window_key(market.get("window"))
-            if key not in windows and key != ("", 0):
+            if key not in windows and key != ("", 0) and _in_bounds(key[1], since_ms, until_ms):
                 tokens = market.get("tokens") or {}
                 windows[key] = {
                     "series": key[0],
@@ -157,10 +173,13 @@ def ingest(paths: Paths) -> dict[str, int]:
 def main(argv: list[str] | None = None) -> int:
     args = stage_parser(__doc__ or "ingest").parse_args(argv)
     paths = resolve_paths(args)
+    since_ms, until_ms = resolve_bounds(args)
     print(f"[ingest] journal={paths.journal_dir}")
     print(f"[ingest] depth  ={paths.depth_dir}")
     print(f"[ingest] out    ={paths.out_dir}")
-    counts = ingest(paths)
+    if since_ms is not None or until_ms is not None:
+        print(f"[ingest] bounds ={args.since}..{args.until}")
+    counts = ingest(paths, since_ms=since_ms, until_ms=until_ms)
     for name, n in counts.items():
         print(f"[ingest] {name:12s} {n:>10,} rows -> {paths.table(name).name}")
     if counts["depth"] == 0:

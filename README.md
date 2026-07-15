@@ -263,6 +263,17 @@ counts, settled-inventory prune) so a 24/7 session stays memory stable. The
 the cadences. **Acceptance:** a multi-hour session — six series rolling, dashboard
 live, the RSS line flat, clean shutdown leaving zero open paper orders.
 
+**Shadow mode (observation only).** Set `[shadow] enable = true` to run the
+champion `dir10_full` model live alongside the engine: it predicts every 5 s per
+active BTC/ETH × 5m/15m window and journals to `data/shadow/*.jsonl.gz`,
+**influencing nothing** (a non-critical, venue-free task — proven by
+`crates/bot/tests/shadow_order_flow.rs`). Export the model first
+(`python -m model_lab.export_champion` → `models/model_dir10_full.txt`); the
+dashboard's Summary view shows a "Shadow" tile (predictions/min, last p_up,
+coverage, and a "model stale, refit due" flag). The mandatory feature-parity
+guard is `just shadow-parity` (offline 1e-6) + `python -m model_lab.shadow_parity`
+(nightly live-vs-offline). See CLAUDE.md §15 (2026-07-12).
+
 ### 24-hour soak checklist
 
 Before a build is allowed near real money it must survive a 24-hour paper soak.

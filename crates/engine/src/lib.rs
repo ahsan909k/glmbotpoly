@@ -28,14 +28,22 @@ pub mod normalize;
 pub mod quoting;
 pub mod risk;
 
+// Cross-taker arbitration and self-match prevention are shared, sans-IO helpers
+// (CLAUDE.md §7/§8). Their public types are re-exported below (the bot needs
+// `TakerId` to build the precedence map); `self_match` is used only internally.
+pub(crate) mod arbitration;
+pub(crate) mod self_match;
+
 // The strategy drivers are crate-private: the only `pub` path from outside
 // `engine` to the venue port is `risk::RiskManager`, which always interposes the
 // `GuardedPort` (CLAUDE.md §5/§11 — the single-gateway invariant, enforced by
 // visibility). Their pure params/plan/view types stay re-exported below.
 pub(crate) mod late_window;
+pub(crate) mod model_taker;
 pub(crate) mod quote_manager;
 pub(crate) mod taker;
 
+pub use arbitration::{ArbitrationBlock, FireLedger, TakerId};
 pub use inventory::{
     ExcessConstraint, InventoryEffect, InventoryManager, InventoryParams, MergeIntent,
     WindowInventory, authorizes_passive_add_sides, excess_constraint_sides,
@@ -43,6 +51,10 @@ pub use inventory::{
 };
 pub use late_window::{
     CertaintyTakePlan, LateWindowTakerParams, NoLateTakeReason, plan_certainty_take,
+};
+pub use model_taker::{
+    ModelPrediction, ModelTakeOutcome, ModelTakePlan, ModelTakerParams, NoModelTakeReason,
+    plan_model_take,
 };
 pub use normalize::{
     Adjustments, NormalizeReject, Normalized, NormalizerParams, OrderDraft, PriceSnap, normalize,
@@ -55,7 +67,7 @@ pub use quoting::{
     FinalSecondsViolation, NoQuoteReason, PassiveLevelRef, QuoteDecision, QuoteLevel, QuoteParams,
     QuoteSet, SuppressReason, Suppressed, calculate_quotes, check_final_seconds_invariant,
 };
-pub use risk::{RiskManager, RiskOutput, RiskParams, RiskStateSnapshot};
+pub use risk::{FillDriver, RiskManager, RiskOutput, RiskParams, RiskStateSnapshot};
 pub use taker::{
     ConfirmedMove, MomentumTakerParams, NoTakeReason, SignalWindow, TakePlan, plan_take,
 };

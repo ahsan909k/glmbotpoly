@@ -1,0 +1,37 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\dev\new-bot\model-lab\model_lab\historical_dataset.py", line 581, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "C:\dev\new-bot\model-lab\model_lab\historical_dataset.py", line 548, in main
+    result = historical_dataset(
+             ^^^^^^^^^^^^^^^^^^^
+  File "C:\dev\new-bot\model-lab\model_lab\historical_dataset.py", line 342, in historical_dataset
+    jparts = _journal_partitions(
+             ^^^^^^^^^^^^^^^^^^^^
+  File "C:\dev\new-bot\model-lab\model_lab\historical_dataset.py", line 181, in _journal_partitions
+    sh.short_horizon(
+  File "C:\dev\new-bot\model-lab\model_lab\short_horizon.py", line 715, in short_horizon
+    pm_df = _read_pm_books(paths, up_tokens, since_ms=since_ms, until_ms=until_ms)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\dev\new-bot\model-lab\model_lab\short_horizon.py", line 417, in _read_pm_books
+    return pd.DataFrame(rows, columns=cols)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\dev\new-bot\model-lab\.venv\Lib\site-packages\pandas\core\frame.py", line 859, in __init__
+    mgr = arrays_to_mgr(
+          ^^^^^^^^^^^^^^
+  File "C:\dev\new-bot\model-lab\.venv\Lib\site-packages\pandas\core\internals\construction.py", line 119, in arrays_to_mgr
+    arrays, refs = _homogenize(arrays, index, dtype)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\dev\new-bot\model-lab\.venv\Lib\site-packages\pandas\core\internals\construction.py", line 629, in _homogenize
+    val = sanitize_array(val, index, dtype=dtype, copy=False)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\dev\new-bot\model-lab\.venv\Lib\site-packages\pandas\core\construction.py", line 606, in sanitize_array
+    subarr = maybe_infer_to_datetimelike(data)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\dev\new-bot\model-lab\.venv\Lib\site-packages\pandas\core\dtypes\cast.py", line 1189, in maybe_infer_to_datetimelike
+    return lib.maybe_convert_objects(  # type: ignore[return-value]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "lib.pyx", line 2541, in pandas._libs.lib.maybe_convert_objects
+numpy._core._exceptions._ArrayMemoryError: Unable to allocate 377. MiB for an array with shape (49391270,) and data type uint64

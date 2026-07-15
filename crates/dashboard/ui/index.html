@@ -55,6 +55,16 @@
         <div class="hl-tile"><label>Win rate</label><span id="hl-winrate">—</span></div>
       </div>
 
+      <!-- account identity: Cash + Open positions = Equity -->
+      <div class="account-id" id="account-id">
+        <div class="acct-card"><label>Cash</label><span id="acct-cash">—</span></div>
+        <div class="acct-op">+</div>
+        <div class="acct-card"><label>Open positions</label><span id="acct-open">—</span><small>unresolved windows, at cost</small></div>
+        <div class="acct-op">=</div>
+        <div class="acct-card equity"><label>Equity</label><span id="acct-equity">—</span></div>
+        <div class="acct-awaiting hidden" id="acct-awaiting"></div>
+      </div>
+
       <div class="status-banner" id="status-banner">
         <span class="status-dot" id="status-dot"></span>
         <span id="status-text">Waiting for data…</span>
@@ -84,13 +94,46 @@
           </div>
         </div>
         <div class="bucket-sub" id="bucket-sub"></div>
-        <p class="explainer-note" id="explainer-note">The two buckets add up to total profit/loss.</p>
+        <p class="explainer-note" id="explainer-note">Completed pairs + stuck legs = realized profit/loss.</p>
       </div>
 
       <!-- live activity strip -->
       <div class="card activity">
         <div class="card-head"><h2>Live activity</h2><span class="muted" id="activity-scope"></span></div>
         <div class="act-tiles" id="act-tiles"></div>
+      </div>
+
+      <!-- shadow model observer (observation only — influences nothing) -->
+      <div class="card shadow hidden" id="shadow-tile">
+        <div class="card-head">
+          <h2>Shadow model <span class="muted">observing — influences nothing</span></h2>
+          <span class="pill" id="shadow-status">—</span>
+        </div>
+        <div class="shadow-meta muted" id="shadow-meta"></div>
+        <div class="act-tiles" id="shadow-series"></div>
+      </div>
+
+      <!-- model taker (live PAPER taker on the shadow model's predictions) -->
+      <div class="card model-taker hidden" id="model-taker-tile">
+        <div class="card-head">
+          <h2>Model taker <span class="muted">live paper taker on the model signal</span></h2>
+          <span class="pill" id="mt-status">—</span>
+        </div>
+        <div class="act-tiles" id="mt-series"></div>
+        <h3 class="muted" style="margin:.6rem 0 .3rem">PnL by driver</h3>
+        <div class="table-wrap"><table id="mt-pnl"><thead><tr>
+          <th>Series</th><th>Driver</th><th>Fills</th><th>Taker $</th><th>Fees</th><th>Realized P&amp;L</th>
+        </tr></thead><tbody></tbody></table></div>
+      </div>
+
+      <!-- simulated taker rebate (report-only — never part of equity) -->
+      <div class="card taker-rebate hidden" id="taker-rebate-tile">
+        <div class="card-head">
+          <h2>Taker rebate <span class="muted">simulated — not in equity</span></h2>
+          <span class="pill" id="tr-tier">—</span>
+        </div>
+        <div class="act-tiles" id="tr-tiles"></div>
+        <p class="explainer-note muted" id="tr-note"></p>
       </div>
 
       <!-- collapsed-by-default detail dropdowns -->
@@ -131,7 +174,7 @@
         <div class="card-head"><h2>Paper capital</h2></div>
         <div class="capital-row">
           <div class="kv"><label>Starting capital</label><span id="cap-start">—</span></div>
-          <div class="kv"><label>Current equity</label><span id="cap-equity">—</span></div>
+          <div class="kv"><label>Cash balance</label><span id="cap-equity">—</span></div>
         </div>
         <div class="capital-edit">
           <input type="number" id="cap-input" step="100" min="0" inputmode="decimal" placeholder="set capital ($)" />

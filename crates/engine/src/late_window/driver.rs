@@ -37,6 +37,7 @@ use venue_api::{VenueEvent, VenuePort};
 use super::edge::{CertaintyTakePlan, plan_certainty_take};
 use super::{LateWindowTakerParams, NoLateTakeReason};
 use crate::normalize::{NormalizerParams, OrderDraft, normalize};
+use crate::quote_manager::RestingView;
 
 /// Seconds remaining to close, clamped at zero — computed inline so the driver
 /// needs no `timeutil` dependency (the `quote_manager`/`taker` precedent).
@@ -138,12 +139,24 @@ impl LateWindowTaker {
         self.standing_down
     }
 
+    /// Whether `id` is one of this taker's placed orders (driver attribution).
+    #[must_use]
+    pub fn owns(&self, id: &core_types::OrderId) -> bool {
+        self.our_orders.contains(id)
+    }
+
     /// Handles one bus event; attempts a take after a model or active-token book
     /// update (a fresh fair or a fresh book may have opened the endgame). A price
     /// tick is ignored — this taker uses no fast-feed signal.
-    pub async fn on_event<P: VenuePort>(&mut self, event: &Event, port: &P, now: TimestampMs) {
+    pub async fn on_event<P: VenuePort>(
+        &mut self,
+        event: &Event,
+        port: &P,
+        now: TimestampMs,
+        resting: Option<&RestingView>,
+    ) {
         if self.ingest(event) {
-            self.attempt_take(port, now).await;
+            self.attempt_take(port, now, resting).await;
         }
     }
 
@@ -276,7 +289,11 @@ impl LateWindowTaker {
 
     /// The full take gate ladder. Each gate maps to a typed [`NoLateTakeReason`] so
     /// every non-fire is explainable. Pure and synchronous.
-    fn decide(&self, now: TimestampMs) -> Result<Decision, NoLateTakeReason> {
+    fn decide(
+        &self,
+        now: TimestampMs,
+        resting: Option<&RestingView>,
+    ) -> Result<Decision, NoLateTakeReason> {
         if self.standing_down {
             return Err(NoLateTakeReason::StandingDown);
         }
@@ -362,13 +379,9 @@ impl LateWindowTaker {
         } else {
             Decimal::ZERO
         };
-        let plan = plan_certainty_take(
-            outcome,
-            &book.asks,
-            fee_rate,
-            self.params.price_cap,
-            remaining,
-        )?;
+        // §7 self-match filter: never lift our own mirrored resting liquidity.
+        let asks = crate::self_match::filter_asks(outcome, &book.asks, active.window, resting);
+        let plan = plan_certainty_take(outcome, &asks, fee_rate, self.params.price_cap, remaining)?;
         Ok(Decision {
             outcome,
             token_id,
@@ -379,8 +392,13 @@ impl LateWindowTaker {
 
     // ---- firing (async) ----------------------------------------------------
 
-    async fn attempt_take<P: VenuePort>(&mut self, port: &P, now: TimestampMs) {
-        match self.decide(now) {
+    async fn attempt_take<P: VenuePort>(
+        &mut self,
+        port: &P,
+        now: TimestampMs,
+        resting: Option<&RestingView>,
+    ) {
+        match self.decide(now, resting) {
             Ok(decision) => self.fire(port, decision, now).await,
             Err(reason) => {
                 tracing::debug!(target: "late-window-taker", reason = %reason, "no take");
@@ -621,7 +639,7 @@ mod tests {
     #[test]
     fn happy_path_decides_an_up_take() {
         let t = armed_up();
-        let d = t.decide(ts(LATE_MS)).expect("a take");
+        let d = t.decide(ts(LATE_MS), None).expect("a take");
         assert_eq!(d.outcome, Outcome::Up);
         assert_eq!(d.token_id, up_token());
         assert_eq!(d.plan.worst_price.as_decimal(), dec!(0.98));
@@ -639,7 +657,7 @@ mod tests {
             down_token(),
             &[(dec!(0.98), dec!(50))],
         );
-        let d = t.decide(ts(LATE_MS)).expect("a down take");
+        let d = t.decide(ts(LATE_MS), None).expect("a down take");
         assert_eq!(d.outcome, Outcome::Down);
         assert_eq!(d.token_id, down_token());
     }
@@ -656,7 +674,7 @@ mod tests {
             &[(dec!(0.95), dec!(50))],
         );
         assert_eq!(
-            up.decide(ts(LATE_MS)).expect("up take").outcome,
+            up.decide(ts(LATE_MS), None).expect("up take").outcome,
             Outcome::Up
         );
         // p_up == 0.969 ⇒ uncertain.
@@ -667,7 +685,7 @@ mod tests {
             &[(dec!(0.95), dec!(50))],
         );
         assert!(matches!(
-            near.decide(ts(LATE_MS)),
+            near.decide(ts(LATE_MS), None),
             Err(NoLateTakeReason::NotCertain { .. })
         ));
         // p_up == 0.03 == 1 − 0.97 ⇒ Down (inclusive).
@@ -678,7 +696,7 @@ mod tests {
             &[(dec!(0.95), dec!(50))],
         );
         assert_eq!(
-            down.decide(ts(LATE_MS)).expect("down take").outcome,
+            down.decide(ts(LATE_MS), None).expect("down take").outcome,
             Outcome::Down
         );
         // p_up == 0.031 ⇒ uncertain.
@@ -689,7 +707,7 @@ mod tests {
             &[(dec!(0.95), dec!(50))],
         );
         assert!(matches!(
-            near_down.decide(ts(LATE_MS)),
+            near_down.decide(ts(LATE_MS), None),
             Err(NoLateTakeReason::NotCertain { .. })
         ));
     }
@@ -706,7 +724,9 @@ mod tests {
             &[(dec!(0.98), dec!(50))],
         );
         assert_eq!(
-            up.decide(ts(LATE_MS)).expect("up take at p_up=1.0").outcome,
+            up.decide(ts(LATE_MS), None)
+                .expect("up take at p_up=1.0")
+                .outcome,
             Outcome::Up
         );
         let down = armed_with(
@@ -716,7 +736,7 @@ mod tests {
             &[(dec!(0.98), dec!(50))],
         );
         assert_eq!(
-            down.decide(ts(LATE_MS))
+            down.decide(ts(LATE_MS), None)
                 .expect("down take at p_up=0.0")
                 .outcome,
             Outcome::Down
@@ -735,7 +755,7 @@ mod tests {
             &[(dec!(0.98), dec!(50))],
         );
         assert!(matches!(
-            fast.decide(ts(LATE_MS)),
+            fast.decide(ts(LATE_MS), None),
             Err(NoLateTakeReason::NotChainlinkAnchored {
                 anchor: AnchorSource::BinanceCorrected
             })
@@ -746,14 +766,14 @@ mod tests {
             up_token(),
             &[(dec!(0.98), dec!(50))],
         );
-        assert!(chainlink.decide(ts(LATE_MS)).is_ok());
+        assert!(chainlink.decide(ts(LATE_MS), None).is_ok());
     }
 
     #[test]
     fn no_active_window() {
         let t = taker();
         assert!(matches!(
-            t.decide(ts(LATE_MS)),
+            t.decide(ts(LATE_MS), None),
             Err(NoLateTakeReason::NoActiveWindow)
         ));
     }
@@ -763,7 +783,7 @@ mod tests {
         let mut t = taker();
         t.ingest(&open_event());
         assert!(matches!(
-            t.decide(ts(LATE_MS)),
+            t.decide(ts(LATE_MS), None),
             Err(NoLateTakeReason::NoModel)
         ));
     }
@@ -779,7 +799,7 @@ mod tests {
             Some(other_window()),
         ));
         assert!(matches!(
-            t.decide(ts(LATE_MS)),
+            t.decide(ts(LATE_MS), None),
             Err(NoLateTakeReason::WindowMismatch { .. })
         ));
     }
@@ -802,7 +822,7 @@ mod tests {
             ));
             assert!(
                 matches!(
-                    t.decide(ts(LATE_MS)),
+                    t.decide(ts(LATE_MS), None),
                     Err(NoLateTakeReason::ModelNotReady { .. })
                 ),
                 "{health:?} should block"
@@ -827,7 +847,7 @@ mod tests {
             ));
             assert!(
                 matches!(
-                    t.decide(ts(LATE_MS)),
+                    t.decide(ts(LATE_MS), None),
                     Err(NoLateTakeReason::UnusableFair { .. })
                 ),
                 "{bad} should be unusable"
@@ -844,14 +864,14 @@ mod tests {
             up_token(),
             &[(dec!(0.98), dec!(50))],
         );
-        assert!(t.decide(ts(LATE_MS)).is_ok());
+        assert!(t.decide(ts(LATE_MS), None).is_ok());
     }
 
     #[test]
     fn expired_window_blocks() {
         let t = armed_up();
         assert!(matches!(
-            t.decide(ts(CLOSE_MS + 1)),
+            t.decide(ts(CLOSE_MS + 1), None),
             Err(NoLateTakeReason::Expired { .. })
         ));
     }
@@ -861,7 +881,7 @@ mod tests {
         let t = armed_up();
         // τ = 60 s > 30 s threshold.
         assert!(matches!(
-            t.decide(ts(CLOSE_MS - 60_000)),
+            t.decide(ts(CLOSE_MS - 60_000), None),
             Err(NoLateTakeReason::NotLateWindow { .. })
         ));
     }
@@ -875,7 +895,7 @@ mod tests {
             &[(dec!(0.78), dec!(50))],
         );
         assert!(matches!(
-            t.decide(ts(LATE_MS)),
+            t.decide(ts(LATE_MS), None),
             Err(NoLateTakeReason::NotCertain { .. })
         ));
     }
@@ -887,7 +907,7 @@ mod tests {
         t.ingest(&ready_chainlink(0.99));
         // No book ingested.
         assert!(matches!(
-            t.decide(ts(LATE_MS)),
+            t.decide(ts(LATE_MS), None),
             Err(NoLateTakeReason::NoBookForToken)
         ));
     }
@@ -904,7 +924,7 @@ mod tests {
         t.ingest(&ready_chainlink(0.99));
         t.ingest(&book(up_token(), &[(dec!(0.96), dec!(50))]));
         assert!(matches!(
-            t.decide(ts(LATE_MS)),
+            t.decide(ts(LATE_MS), None),
             Err(NoLateTakeReason::AllAsksAbovePriceCap { .. })
         ));
     }
@@ -914,12 +934,12 @@ mod tests {
         let mut t = armed_up();
         t.last_take_ms = Some(LATE_MS - 100); // fired 100 ms ago < 5 s cooldown
         assert!(matches!(
-            t.decide(ts(LATE_MS)),
+            t.decide(ts(LATE_MS), None),
             Err(NoLateTakeReason::InCooldown { .. })
         ));
         // After the cooldown elapses, the take is allowed again.
         t.last_take_ms = Some(LATE_MS - 6_000);
-        assert!(t.decide(ts(LATE_MS)).is_ok());
+        assert!(t.decide(ts(LATE_MS), None).is_ok());
     }
 
     /// Required case 4: budget exhaustion — directly, and via in-flight commitment.
@@ -928,7 +948,7 @@ mod tests {
         let mut t = armed_up();
         t.realized_spent = Dollars::new(dec!(10));
         assert!(matches!(
-            t.decide(ts(LATE_MS)),
+            t.decide(ts(LATE_MS), None),
             Err(NoLateTakeReason::BudgetExhausted { .. })
         ));
 
@@ -938,7 +958,7 @@ mod tests {
         t2.our_orders.insert(oid.clone());
         t2.pending.insert(oid, Dollars::new(dec!(9.50)));
         assert!(matches!(
-            t2.decide(ts(LATE_MS)),
+            t2.decide(ts(LATE_MS), None),
             Err(NoLateTakeReason::BudgetExhausted { .. })
         ));
     }
@@ -955,7 +975,7 @@ mod tests {
         t.ingest(&open_event());
         t.ingest(&ready_chainlink(0.99));
         t.ingest(&book(up_token(), &[(dec!(0.98), dec!(100))]));
-        let d = t.decide(ts(LATE_MS)).expect("a take");
+        let d = t.decide(ts(LATE_MS), None).expect("a take");
         // 49 / 0.98 = 50 shares, $49 notional ≤ budget.
         assert_eq!(d.plan.expected_shares, Size::new(dec!(50)).unwrap());
         assert!(d.plan.notional.as_decimal() <= dec!(49));
@@ -988,14 +1008,14 @@ mod tests {
         });
         assert!(t.is_standing_down());
         assert!(matches!(
-            t.decide(ts(LATE_MS)),
+            t.decide(ts(LATE_MS), None),
             Err(NoLateTakeReason::StandingDown)
         ));
         t.on_risk(RiskEvent::BreakerCleared {
             breaker: BreakerKind::FeedStale,
         });
         assert!(!t.is_standing_down());
-        assert!(t.decide(ts(LATE_MS)).is_ok());
+        assert!(t.decide(ts(LATE_MS), None).is_ok());
     }
 
     #[test]

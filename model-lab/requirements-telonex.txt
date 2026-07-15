@@ -1,0 +1,10 @@
+# Opt-in extra for the Telonex trial pull (model_lab.telonex_ingest / .telonex_validate).
+#
+# `zstandard` provides whole-file, bit-identical-roundtrip zstd compression of the raw
+# vendor parquet (pyarrow's parquet-internal zstd re-encodes the file, so it cannot
+# reproduce the original bytes). Kept out of the core so the base install stays a
+# pure-wheel scientific stack (numpy/pandas/pyarrow/matplotlib).
+#
+# Install on top of the core:  pip install -r requirements.txt -r requirements-telonex.txt
+# or:  pip install -e .[telonex]
+zstandard==0.23.0

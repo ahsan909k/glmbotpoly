@@ -59,6 +59,18 @@ pub fn validate(config: &AppConfig, secrets: &Secrets) -> Result<(), ConfigError
     config.paper.validate_into(&mut v);
     config.journal.validate_into(&mut v);
     config.log.validate_into(&mut v);
+    config.shadow.validate_into(&mut v);
+    config.model_taker.validate_into(&mut v);
+
+    // The model taker consumes the shadow model's prediction stream, so it
+    // cannot run unless shadow is enabled — a config error, not a silent no-op.
+    if config.model_taker.enable && !config.model_taker.kill_switch {
+        v.require(
+            config.shadow.enable,
+            "model_taker.enable",
+            "requires shadow.enable = true (the model taker's prediction source)",
+        );
+    }
 
     // Exposing the dashboard beyond loopback without auth would hand the
     // kill switch and live-arming UI to the local network.

@@ -313,6 +313,14 @@ pub fn ledger() -> PaperLedgerSnapshot {
         fees_paid: Dollars::new(dec!(1.25)),
         rebate_accrued: Dollars::new(dec!(0.30)),
         rebate_credited: Dollars::new(dec!(2)),
+        taker_rebate_accrued: Dollars::new(dec!(0)),
+        taker_rebate_credited: Dollars::new(dec!(0)),
+        taker_wv_30d: Dollars::new(dec!(0)),
+        taker_tier: "None",
+        taker_rebate_pct: dec!(0),
+        taker_next_tier: Some("Bronze"),
+        taker_wv_to_next: Dollars::new(dec!(2000)),
+        last_day_taker_fees: Dollars::new(dec!(0)),
     }
 }
 

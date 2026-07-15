@@ -24,7 +24,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-from .config import Paths, resolve_paths, stage_parser
+from .config import Paths, require_tables, resolve_paths, stage_parser
 from .lib import math as lm
 
 
@@ -61,6 +61,7 @@ def _asset_metrics(df: pd.DataFrame) -> dict:
 
 def research(paths: Paths) -> dict:
     """Runs the research stage; returns the metrics dict (also written to disk)."""
+    require_tables(paths, "features", "labels")  # fail loudly on truncated/absent inputs
     out_dir = paths.out_dir / "research"
     out_dir.mkdir(parents=True, exist_ok=True)
     features = pd.read_parquet(paths.table("features"), engine="pyarrow")

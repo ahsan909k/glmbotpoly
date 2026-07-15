@@ -43,6 +43,7 @@ reconnect_backoff_multiplier = 2.0
 rtds_stale_after_ms = 5000       # feed watchdog; RTDS cadence ~1/s per symbol, must be > 1000
 binance_stale_after_ms = 2500       # bookTicker streams are near-continuous on BTC/ETH; >= 500
 binance_trade_stale_after_ms = 30000 # trade prints gap legitimately in quiet markets; >= book threshold
+binance_depth_capture = true         # capture Binance depth20@100ms (BTC/ETH) to journal.depth_dir for the model-lab
 clob_ping_interval_ms = 5000         # market channel requires a PING every 10 s; we halve it; <= 10000
 clob_book_stale_after_ms = 10000     # active-window book silence past this = desync evidence; >= 2000
 clob_presubscribe_lead_ms = 90000    # connect to the next window this long before its open
@@ -135,6 +136,7 @@ max_worst_case_loss_per_window = 25  # THE binding sizing constraint (§8)
 # Hard-wired risk limits (CLAUDE.md §11).
 [risk]
 feed_staleness_ms = 500          # cancel-all beyond this; §11 ceiling, looser is rejected
+feed_staleness_grace_ms = 0      # 0 = strict §11 (VPS). Home-testing only: raise (e.g. 1500) so a jittery direct-Binance gap does not flap cancel-all; timer trips at feed_staleness_ms + this. Max 5000.
 daily_stop_loss = 200            # halt all trading until manual reset
 max_open_notional = 1000         # global cap across all windows
 sanity_bound = 0.10              # stand down when |fair - mid| exceeds this...
@@ -157,12 +159,22 @@ supervision_backoff_multiplier = 2.0
 stable_secs = 60                    # a task healthy this long before dying resets its backoff
 rss_report_secs = 60                # RSS + per-window count report + settled-inventory prune cadence
 risk_tick_ms = 500                  # §11 risk on_tick cadence (staleness/sanity recompute + converge)
+replay_journal_on_start = true      # replay journal at boot to rebuild state (currently unused → pure startup cost). Set false to start instantly on a large journal; recording is unaffected.
 
 # Paper trading (CLAUDE.md §9) — real market data, simulated money.
 [paper]
 starting_capital = 10000         # runtime-adjustable from the dashboard
 default_fee_rate = 0.07          # fallback only; per-market params read at discovery
 maker_rebate_share = 0.20        # crypto category
+# Venue taker delay (ms): added on top of placement latency for MARKETABLE
+# (FAK/marketable-limit) orders only — the ~250 ms hold Polymarket imposes
+# before a taker matches (`itode`, enabled on all four series 2026-07-09).
+# Resting makers get network latency only. 0 disables it.
+venue_taker_delay_ms = 250
+# Simulate the tiered Taker Fee Rebate Program (30-day rolling weighted volume ->
+# tier -> tier% x taker fees), reported as a separate line, never added to paper
+# cash/equity. false disables the projection.
+taker_rebate_enabled = true
 
 # Simulated latencies: uniform in [mean_ms, mean_ms + jitter_ms]. Pessimistic
 # placeholders until the latency harness measures real RTTs.
@@ -189,6 +201,7 @@ enabled = false
 # retention by age and total size (0 disables each).
 [journal]
 dir = "data/journal"
+depth_dir = "data/depth"           # separate Binance depth20 capture series (per-UTC-day gzip)
 sqlite_path = "data/journal.sqlite"
 max_segment_bytes = 134217728      # 128 MiB (uncompressed input)
 max_segment_age_ms = 3600000       # 1 h
@@ -208,3 +221,38 @@ rotation = "daily"               # hourly | daily | never
 max_files = 14
 default_filter = "info"          # used when RUST_LOG is unset; per-target works too,
                                  # e.g. "info,engine=debug,feed_clob=trace"
+
+# Shadow mode (BUILD_PLAN 12–13): observation-only live inference of the champion
+# model. Off by default. When enabled the bot runs a NON-critical, venue-free
+# shadow task that journals predictions to its own data/shadow/ gzip series and
+# never touches order flow. Export the model first: `python -m model_lab.export_champion`.
+[shadow]
+enable = false
+model_path = "models/model_dir10_full.txt"
+model_meta_path = "models/model_dir10_full.meta.json"
+sample_secs = 5                  # window-aligned inference cadence
+depth_ws_url = ""                # empty reuses feeds.binance_ws_url (own depth20 connection)
+shadow_dir = "data/shadow"
+staleness_alert_days = 30        # dashboard "model stale, refit due" threshold
+bus_channel_cap = 1024           # drop-on-full bus-event clone feeding shadow
+depth_channel_cap = 4096
+record_channel_cap = 16384
+max_staleness_secs = 120         # as-of feature null-out (the lab's 120 s)
+
+# Model taker (§8): the live PAPER taker driven by the shadow model's per-window
+# p_up stream. OFF by default; requires [shadow] enabled (its prediction source).
+# Replicates the tested walk-forward recipe (theta 0.03, $10/window, no edge gate
+# / price cap / cooldown). Arbitration = the "fortress map": momentum wins BTC
+# conflicts, the model wins ETH conflicts. See LIVE_PREFLIGHT.md before enabling.
+[model_taker]
+enable = false
+kill_switch = false              # emergency force-off even if enabled
+theta = 0.03                     # fire when |p_up - 0.5| >= theta
+budget_per_window = 10           # max taker notional per window ($)
+min_finite_count = 24            # required finite features (of 24) to act
+max_prediction_age_ms = 15000    # a prediction older than this stands the taker down
+max_book_staleness_ms = 2000     # a book older than this is not fresh -> no fire
+arbitration_window_ms = 3000     # conflict window for the fortress-map precedence
+series = ["BTC-5m", "BTC-15m", "ETH-5m", "ETH-15m"]  # allowlist (M5/M15 only)
+precedence_btc = "momentum"      # momentum wins BTC same-window conflicts
+precedence_eth = "model"         # the model wins ETH same-window conflicts

@@ -53,7 +53,7 @@ def test_calibration_audit(tmp_path):
     assert c["joined_snapshots"] > 0
     assert c["market_tops"] > 0
 
-    for fname in ("metrics.json", "scores.csv", "reliability.csv", "report.html"):
+    for fname in ("metrics.json", "scores.csv", "verdict_table.csv", "reliability.csv", "report.html"):
         assert (paths.out_dir / "calibration_audit" / fname).exists(), f"missing {fname}"
 
     overall = next(r for r in m["scope_rows"] if r["scope"] == "overall")
@@ -62,7 +62,11 @@ def test_calibration_audit(tmp_path):
     assert math.isfinite(overall["market_brier"])
     # The fixture's market mid = model p_up + noise, so the model must win.
     assert overall["model_brier"] <= overall["market_brier"]
+    # Self-baseline: the model under test IS the formula model → identity.
+    assert abs(overall["model_brier"] - overall["formula_brier"]) < 1e-12
     assert isinstance(m["verdict"], str) and m["verdict"]
+    # The standardized verdict table carries per-benchmark stability summaries.
+    assert set(m["verdict_table"]["day"]["stability"]) == {"formula", "market"}
 
     # Every τ bucket appears in the split, and scores.csv is parseable.
     scores = pd.read_csv(paths.out_dir / "calibration_audit" / "scores.csv")

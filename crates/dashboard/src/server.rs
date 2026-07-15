@@ -291,6 +291,14 @@ async fn params(State(app): State<AppState>) -> Json<ParamsDto> {
     Json(app.handle.with_data(dto::params))
 }
 
+async fn shadow(State(app): State<AppState>) -> Json<dto::ShadowDto> {
+    Json(app.handle.with_data(dto::shadow))
+}
+
+async fn model_taker(State(app): State<AppState>) -> Json<dto::ModelTakerDto> {
+    Json(app.handle.with_data(dto::model_taker))
+}
+
 async fn health(State(app): State<AppState>) -> Json<HealthReport> {
     Json(app.handle.with_data(health::health_report))
 }
@@ -525,6 +533,8 @@ pub fn router(
         .route("/api/fills", get(fills))
         .route("/api/risk", get(risk))
         .route("/api/params", get(params))
+        .route("/api/shadow", get(shadow))
+        .route("/api/model-taker", get(model_taker))
         .route("/api/control/kill", post(control_kill))
         .route("/api/control/reset", post(control_reset))
         .route(

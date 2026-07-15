@@ -203,6 +203,14 @@ pub enum NoTakeReason {
         /// The sub-minimum notional.
         got: Dollars,
     },
+    /// A higher-precedence driver owns this window right now (§8 fortress map).
+    #[error("suppressed by arbitration: {winner:?} fired this window {remaining_ms} ms ago")]
+    ArbitrationSuppressed {
+        /// The winning driver for this window's asset.
+        winner: crate::arbitration::TakerId,
+        /// Milliseconds until the loser may fire.
+        remaining_ms: i64,
+    },
 }
 
 #[cfg(test)]

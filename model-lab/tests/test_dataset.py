@@ -23,7 +23,7 @@ from datetime import date, datetime, timezone
 import numpy as np
 import pandas as pd
 
-from model_lab import dataset, features
+from model_lab import dataset, feature_set, features, historical_common, short_horizon
 from model_lab.config import Paths
 from model_lab.fixtures import make_aggtrades_fixture, make_fixture
 from model_lab.ingest import DEPTH_COLS
@@ -147,11 +147,33 @@ _FEATURE_FUNCS = [
     features._chainlink_bars,
     features._depth_bars,
     features._bars,
+    # The feature_set stage's per-second grid kernels — same no-look-ahead rule.
+    feature_set.build_price_grid,
+    feature_set.mid_return_grid,
+    feature_set.ewma_vol_grid,
+    feature_set._run_lengths,
+    feature_set.build_flow_grid,
+    feature_set._flow_rolls,
+    feature_set._attach_feature_set,
+    feature_set._derive_scalar_features,
+    # The short_horizon stage's microstructure (depth + PM book) feature kernels.
+    short_horizon._side_slope,
+    short_horizon._frame_depth_features,
+    short_horizon.build_depth_feature_grid,
+    short_horizon.build_pm_grid,
+    short_horizon._attach_asof,
+    # The historical (Telonex) reconstruction kernels — same no-look-ahead rule.
+    historical_common.telonex_depth_feature_grid,
+    historical_common.reconstruct_window_snapshots,
 ]
 
 # Names that would betray a forward read if they appeared in a feature function.
-_FORBIDDEN_LABELS = set(dataset.LABEL_COLS) | {
-    "fwd_mid", "fwd_ret_30s", "fwd_up_30s", "outcome", "outcome_up", "forward",
+# Includes the short_horizon stage's labels — the shared feature funcs (scanned below)
+# must never reference them either.
+_FORBIDDEN_LABELS = set(dataset.LABEL_COLS) | set(short_horizon.LABEL_COLS) | {
+    "fwd_mid", "fwd_ret_30s", "fwd_up_30s",
+    "fwd_ret_10s", "fwd_up_10s", "fwd_ret_15s", "fwd_up_15s",
+    "outcome", "outcome_up", "forward",
 }
 
 

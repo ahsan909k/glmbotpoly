@@ -27,10 +27,67 @@
 //! fees_paid + rebate_credited + realized_edge` holds exactly (Decimal) after
 //! any sequence of fills, merges, and settlements.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
-use core_types::{Decimal, Dollars, Fill, Outcome, Side, Size, TokenId};
+use core_types::{Decimal, Dollars, Fill, Outcome, Price, Side, Size, TokenId};
+use rust_decimal::dec;
 use venue_api::{TokenBalance, Wallet};
+
+/// The rolling window (in daily buckets) for the taker-rebate tier metric — the
+/// program's 30-day weighted-volume window (here: 30 daily-cycle buckets).
+const TAKER_WV_RING_DAYS: usize = 30;
+
+/// The Taker Fee Rebate Program tier table: `(30-day wV threshold, tier name,
+/// rebate fraction)`, ascending (docs.polymarket.com/trading/taker-rebates,
+/// verified 2026-07-13). Mirrors `model_lab/model_lab/lib/math.py::TAKER_TIERS`
+/// — keep the two in sync.
+fn taker_tiers() -> [(Decimal, &'static str, Decimal); 7] {
+    [
+        (dec!(0), "None", dec!(0)),
+        (dec!(2000), "Bronze", dec!(0.03)),
+        (dec!(20000), "Silver", dec!(0.08)),
+        (dec!(200000), "Gold", dec!(0.18)),
+        (dec!(1000000), "Platinum", dec!(0.32)),
+        (dec!(4000000), "Diamond", dec!(0.44)),
+        (dec!(10000000), "Obsidian", dec!(0.50)),
+    ]
+}
+
+/// One taker fill's contribution to weighted volume: `size · (1 − price) · 2.3`
+/// (crypto category weight; no crypto bonus). Mirrors
+/// `model_lab/model_lab/lib/math.py::weighted_volume`.
+pub(crate) fn taker_weighted_volume(size: Size, price: Price) -> Dollars {
+    Dollars::new(size.as_decimal() * (Decimal::ONE - price.as_decimal()) * dec!(2.3))
+}
+
+/// The tier a 30-day weighted volume sets: `(tier name, rebate fraction)`. The
+/// rebate paid is this fraction times the taker **fees** (a fee refund, not a % of
+/// notional).
+pub(crate) fn taker_rebate_tier(wv_30d: Dollars) -> (&'static str, Decimal) {
+    let wv = wv_30d.as_decimal();
+    let mut out = ("None", Decimal::ZERO);
+    for (threshold, name, pct) in taker_tiers() {
+        if wv >= threshold {
+            out = (name, pct);
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// The next tier up and the additional 30-day wV needed to reach it, or
+/// `(None, $0)` at the top tier (Obsidian). Mirrors
+/// `model_lab/model_lab/lib/math.py::taker_rebate_next_tier`.
+pub(crate) fn taker_rebate_next_tier(wv_30d: Dollars) -> (Option<&'static str>, Dollars) {
+    let wv = wv_30d.as_decimal();
+    for (threshold, name, _pct) in taker_tiers() {
+        if wv < threshold {
+            return (Some(name), Dollars::new(threshold - wv));
+        }
+    }
+    (None, Dollars::ZERO)
+}
 
 /// A richer ledger view than the venue-agnostic [`Wallet`]: keeps signed
 /// positions and exposes the fee/rebate income lines for the dashboard and the
@@ -47,6 +104,26 @@ pub struct PaperLedgerSnapshot {
     pub rebate_accrued: Dollars,
     /// Maker rebate credited to cash (separate income line).
     pub rebate_credited: Dollars,
+    /// **Report-only** simulated taker rebate accrued (below the $1 daily floor).
+    /// Never added to cash — the tiered taker rebate is a projection, not paper
+    /// collateral (operator decision).
+    pub taker_rebate_accrued: Dollars,
+    /// **Report-only** simulated taker rebate past the $1 floor (cumulative). Not
+    /// part of cash/equity.
+    pub taker_rebate_credited: Dollars,
+    /// Rolling 30-day taker weighted volume that sets the tier.
+    pub taker_wv_30d: Dollars,
+    /// Current taker-rebate tier name (`"None"`, `"Bronze"`, …).
+    pub taker_tier: &'static str,
+    /// Current taker-rebate fraction (the tier's rebate %).
+    pub taker_rebate_pct: Decimal,
+    /// The next tier up (`None` at the top tier).
+    pub taker_next_tier: Option<&'static str>,
+    /// Additional 30-day wV needed to reach the next tier (`$0` at the top).
+    pub taker_wv_to_next: Dollars,
+    /// Taker fees of the last completed daily bucket — the dashboard's projected
+    /// rebate-per-day input (`tier% × last_day_taker_fees`).
+    pub last_day_taker_fees: Dollars,
 }
 
 /// A simulated wallet backing the paper venue.
@@ -65,6 +142,22 @@ pub struct PaperWallet {
     /// Cumulative signed capital injected (start + runtime adjustments) — the
     /// conservation anchor, never spent.
     capital_injected: Dollars,
+    // --- Taker rebate (report-only; NEVER touches `collateral`) --------------
+    /// Simulated taker rebate accrued but below the $1 daily floor (carry bucket).
+    taker_rebate_accrued: Dollars,
+    /// Simulated taker rebate that has crossed the $1 floor (cumulative). A
+    /// reported income estimate only — deliberately NOT added to `collateral`
+    /// (the tier is path-dependent on trailing volume; this is a projection).
+    taker_rebate_credited: Dollars,
+    /// The last `TAKER_WV_RING_DAYS` completed daily taker-weighted-volume buckets
+    /// (oldest first); their sum sets the tier for the day being credited.
+    taker_wv_ring: VecDeque<Dollars>,
+    /// Taker weighted volume accrued for the current (open) daily bucket.
+    today_taker_wv: Dollars,
+    /// Taker fees accrued for the current daily bucket (the rebate base).
+    today_taker_fees: Dollars,
+    /// Taker fees of the last completed daily bucket (projection input).
+    last_day_taker_fees: Dollars,
 }
 
 impl PaperWallet {
@@ -78,6 +171,12 @@ impl PaperWallet {
             fees_paid: Dollars::ZERO,
             rebate_credited: Dollars::ZERO,
             capital_injected: starting_capital,
+            taker_rebate_accrued: Dollars::ZERO,
+            taker_rebate_credited: Dollars::ZERO,
+            taker_wv_ring: VecDeque::new(),
+            today_taker_wv: Dollars::ZERO,
+            today_taker_fees: Dollars::ZERO,
+            last_day_taker_fees: Dollars::ZERO,
         }
     }
 
@@ -177,6 +276,55 @@ impl PaperWallet {
         credited
     }
 
+    /// Accrues one taker fill's weighted volume and fee into the current daily
+    /// taker bucket (report-only — does **not** touch cash). The daily cycle
+    /// ([`PaperWallet::credit_taker_rebate`]) turns the accumulated fees into a
+    /// rebate estimate. `wv = size · (1 − price) · 2.3` (see
+    /// [`taker_weighted_volume`]).
+    pub fn accrue_taker(&mut self, wv: Dollars, fee: Dollars) {
+        self.today_taker_wv = self.today_taker_wv + wv;
+        self.today_taker_fees = self.today_taker_fees + fee;
+    }
+
+    /// The rolling 30-day taker weighted volume (the sum of the completed-day ring,
+    /// **excluding** the current open day) — the value that sets the tier.
+    #[must_use]
+    pub fn taker_wv_30d(&self) -> Dollars {
+        self.taker_wv_ring
+            .iter()
+            .copied()
+            .fold(Dollars::ZERO, |a, b| a + b)
+    }
+
+    /// Closes the current daily taker bucket on the daily cycle (§9). The rebate
+    /// estimate `tier_pct × today's taker fees` is accrued and, once past
+    /// `min_credit` (the $1 floor), moved accrued→credited — a **report-only**
+    /// income line that is deliberately **never added to `collateral`** (the
+    /// tier is a projection of trailing volume). Then today's weighted volume rolls
+    /// into the 30-day ring (oldest bucket evicted) and the day resets. `tier_pct`
+    /// is the fraction the trailing ring (before today) set — the docs'
+    /// non-retroactive "effective next update / going forward" rule. Returns the
+    /// amount moved to the credited line (0 below the floor).
+    pub fn credit_taker_rebate(&mut self, tier_pct: Decimal, min_credit: Dollars) -> Dollars {
+        let rebate = Dollars::new(tier_pct * self.today_taker_fees.as_decimal());
+        self.taker_rebate_accrued = self.taker_rebate_accrued + rebate;
+        self.last_day_taker_fees = self.today_taker_fees;
+        // Roll today's wV into the 30-day ring, evicting anything beyond 30 days.
+        self.taker_wv_ring.push_back(self.today_taker_wv);
+        while self.taker_wv_ring.len() > TAKER_WV_RING_DAYS {
+            self.taker_wv_ring.pop_front();
+        }
+        self.today_taker_wv = Dollars::ZERO;
+        self.today_taker_fees = Dollars::ZERO;
+        if self.taker_rebate_accrued.is_zero() || self.taker_rebate_accrued < min_credit {
+            return Dollars::ZERO;
+        }
+        let credited = self.taker_rebate_accrued;
+        self.taker_rebate_credited = self.taker_rebate_credited + credited;
+        self.taker_rebate_accrued = Dollars::ZERO;
+        credited
+    }
+
     /// Current collateral (signed).
     #[must_use]
     pub fn collateral(&self) -> Dollars {
@@ -213,6 +361,18 @@ impl PaperWallet {
         self.capital_injected
     }
 
+    /// Report-only simulated taker rebate accrued (below the $1 floor).
+    #[must_use]
+    pub fn taker_rebate_accrued(&self) -> Dollars {
+        self.taker_rebate_accrued
+    }
+
+    /// Report-only cumulative simulated taker rebate past the $1 floor.
+    #[must_use]
+    pub fn taker_rebate_credited(&self) -> Dollars {
+        self.taker_rebate_credited
+    }
+
     /// The signed non-zero net positions, sorted by token id (keeps shorts
     /// visible, unlike [`PaperWallet::to_wallet`] which drops non-positive nets).
     #[must_use]
@@ -230,12 +390,23 @@ impl PaperWallet {
     /// The richer ledger snapshot (signed positions + income lines).
     #[must_use]
     pub fn snapshot(&self) -> PaperLedgerSnapshot {
+        let wv_30d = self.taker_wv_30d();
+        let (taker_tier, taker_rebate_pct) = taker_rebate_tier(wv_30d);
+        let (taker_next_tier, taker_wv_to_next) = taker_rebate_next_tier(wv_30d);
         PaperLedgerSnapshot {
             collateral: self.collateral,
             positions: self.positions_view(),
             fees_paid: self.fees_paid,
             rebate_accrued: self.rebate_accrued,
             rebate_credited: self.rebate_credited,
+            taker_rebate_accrued: self.taker_rebate_accrued,
+            taker_rebate_credited: self.taker_rebate_credited,
+            taker_wv_30d: wv_30d,
+            taker_tier,
+            taker_rebate_pct,
+            taker_next_tier,
+            taker_wv_to_next,
+            last_day_taker_fees: self.last_day_taker_fees,
         }
     }
 
@@ -650,6 +821,113 @@ mod tests {
             w.capital_injected(),
             Dollars::new(dec!(1000)) + (Dollars::new(dec!(2500)) - before)
         );
+    }
+
+    // --- taker rebate (report-only) -----------------------------------------
+    #[test]
+    fn taker_weighted_volume_formula() {
+        // size · (1 − price) · 2.3.
+        assert_eq!(
+            taker_weighted_volume(Size::new(dec!(2000)).unwrap(), px(dec!(0.50))),
+            Dollars::new(dec!(2300))
+        );
+        assert_eq!(
+            taker_weighted_volume(Size::new(dec!(100)).unwrap(), px(dec!(0.90))),
+            Dollars::new(dec!(23))
+        );
+    }
+
+    #[test]
+    fn taker_rebate_tier_thresholds() {
+        assert_eq!(taker_rebate_tier(Dollars::new(dec!(0))), ("None", dec!(0)));
+        assert_eq!(
+            taker_rebate_tier(Dollars::new(dec!(1999.99))),
+            ("None", dec!(0))
+        );
+        assert_eq!(
+            taker_rebate_tier(Dollars::new(dec!(2000))),
+            ("Bronze", dec!(0.03))
+        );
+        assert_eq!(
+            taker_rebate_tier(Dollars::new(dec!(20000))),
+            ("Silver", dec!(0.08))
+        );
+        assert_eq!(
+            taker_rebate_tier(Dollars::new(dec!(200000))),
+            ("Gold", dec!(0.18))
+        );
+        assert_eq!(
+            taker_rebate_tier(Dollars::new(dec!(10000000))),
+            ("Obsidian", dec!(0.50))
+        );
+    }
+
+    #[test]
+    fn accrue_taker_never_moves_cash() {
+        let mut w = PaperWallet::new(Dollars::new(dec!(10000)));
+        let cash = w.collateral();
+        w.accrue_taker(Dollars::new(dec!(5000)), Dollars::new(dec!(12.34)));
+        // Report-only: the accrual does not touch collateral.
+        assert_eq!(w.collateral(), cash);
+        // The first cycle's tier comes from the empty ring (None, 0%), so nothing
+        // accrues; crediting also never touches cash.
+        let (_tier, pct) = taker_rebate_tier(w.taker_wv_30d());
+        assert_eq!(pct, dec!(0));
+        let credited = w.credit_taker_rebate(pct, Dollars::new(dec!(1)));
+        assert_eq!(w.collateral(), cash);
+        assert_eq!(credited, Dollars::ZERO);
+        assert_eq!(w.taker_rebate_accrued(), Dollars::ZERO);
+    }
+
+    #[test]
+    fn taker_rebate_report_only_with_trailing_tier_and_dollar_floor() {
+        // One taker fill/day: wV = 2000·(1−0.5)·2.3 = 2300, fee $10. Mirrors the
+        // Python rebate_sim crafted case: day0 None, days1..8 Bronze (3%), days9..39
+        // Silver (8%). Total rebate = 8·0.30 + 31·0.80 = $27.20, all report-only.
+        let mut w = PaperWallet::new(Dollars::new(dec!(10000)));
+        let cash0 = w.collateral();
+        let size = Size::new(dec!(2000)).unwrap();
+        let price = px(dec!(0.50));
+        let fee = Dollars::new(dec!(10));
+        let mut credited_total = Dollars::ZERO;
+        for day in 0..40 {
+            w.accrue_taker(taker_weighted_volume(size, price), fee);
+            let (_tier, pct) = taker_rebate_tier(w.taker_wv_30d());
+            credited_total = credited_total + w.credit_taker_rebate(pct, Dollars::new(dec!(1)));
+            assert_eq!(
+                w.collateral(),
+                cash0,
+                "taker rebate must not touch cash (day {day})"
+            );
+        }
+        let snap = w.snapshot();
+        // accrued + credited buckets hold the full gross rebate.
+        assert_eq!(
+            snap.taker_rebate_accrued + snap.taker_rebate_credited,
+            Dollars::new(dec!(27.20))
+        );
+        // What crossed the $1 floor + the sub-$1 residual == the gross total.
+        assert_eq!(
+            credited_total + w.taker_rebate_accrued(),
+            Dollars::new(dec!(27.20))
+        );
+        assert_eq!(credited_total, snap.taker_rebate_credited);
+        // Ending 30-day wV = 30·2300 = 69,000 → Silver reported by the snapshot.
+        assert_eq!(snap.taker_wv_30d, Dollars::new(dec!(69000)));
+        assert_eq!(snap.taker_tier, "Silver");
+        assert_eq!(snap.taker_rebate_pct, dec!(0.08));
+    }
+
+    #[test]
+    fn taker_wv_ring_caps_at_30_days() {
+        let mut w = PaperWallet::new(Dollars::new(dec!(10000)));
+        // 31 daily buckets of $1 wV each; the ring keeps only the last 30.
+        for _ in 0..31 {
+            w.accrue_taker(Dollars::new(dec!(1)), Dollars::ZERO);
+            let (_t, pct) = taker_rebate_tier(w.taker_wv_30d());
+            w.credit_taker_rebate(pct, Dollars::new(dec!(1)));
+        }
+        assert_eq!(w.taker_wv_30d(), Dollars::new(dec!(30)));
     }
 }
 

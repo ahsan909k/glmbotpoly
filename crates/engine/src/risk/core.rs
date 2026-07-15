@@ -15,7 +15,9 @@
 //!   (`BinanceDirect`/`Mid`, the only stream whose silence means we are blind to
 //!   a move), plus any latched `FeedHealth`/`BookHealth` stale report. Chainlink
 //!   (~1 Hz) and the book have their own watchdogs and report through those
-//!   events — a literal 500 ms bound on them would trip permanently.
+//!   events — a literal 500 ms bound on them would trip permanently. The timer
+//!   bound is `feed_staleness_ms + feed_staleness_grace_ms`; grace defaults to 0
+//!   (strict §11) and is a home-testing concession for jittery links only.
 //! - `WsDisconnect` — market-WS via `BookHealth::Unreliable{Disconnected}`,
 //!   user-WS via `VenueEvent::Connectivity{connected:false}`.
 //! - `ClockSkew` — honored as authoritative input from the `timeutil` skew
@@ -67,6 +69,7 @@ pub enum RiskOutput {
 pub(crate) struct RiskCore {
     // thresholds (copied from RiskParams at construction)
     feed_staleness_ms: i64,
+    feed_staleness_grace_ms: i64,
     daily_stop_loss: Dollars,
     max_open_notional: Dollars,
     sanity_bound: f64,
@@ -139,6 +142,7 @@ impl RiskCore {
     pub(crate) fn new(params: &RiskParams, series_caps: HashMap<Series, Dollars>) -> Self {
         Self {
             feed_staleness_ms: params.feed_staleness_ms,
+            feed_staleness_grace_ms: params.feed_staleness_grace_ms,
             daily_stop_loss: params.daily_stop_loss,
             max_open_notional: params.max_open_notional,
             sanity_bound: params.sanity_bound,
@@ -513,10 +517,18 @@ impl RiskCore {
     // ---- recompute helpers --------------------------------------------------
 
     fn feed_stale_now(&self, now: TimestampMs) -> bool {
+        // The trip threshold is the §11 bound plus the (default-0) home-testing
+        // grace: a fast feed continuously silent longer than the sum is stale.
+        // `binance_mid_last` resets on every fresh tick, so `now - last` measures
+        // one continuous gap — grace tolerates transient gaps but a real feed
+        // death (a gap past the sum) still trips.
+        let threshold = self
+            .feed_staleness_ms
+            .saturating_add(self.feed_staleness_grace_ms);
         let timer = self
             .binance_mid_last
             .values()
-            .any(|&t| now.as_millis().saturating_sub(t.as_millis()) > self.feed_staleness_ms);
+            .any(|&t| now.as_millis().saturating_sub(t.as_millis()) > threshold);
         timer || !self.stale_feeds.is_empty() || !self.stale_books.is_empty()
     }
 
@@ -855,6 +867,35 @@ mod tests {
         let out = c.on_event(&binance_mid(dec!(60010), OPEN_MS + 650), ts(OPEN_MS + 650));
         assert_eq!(cleared_in(&out), vec![BreakerKind::FeedStale]);
         assert!(!c.is_globally_halted());
+    }
+
+    #[test]
+    fn grace_tolerates_a_transient_gap_within_the_sum_but_a_real_death_still_trips() {
+        // Home-testing concession: with a 1500 ms grace, the fast-feed timer
+        // only trips past 500 + 1500 = 2000 ms of continuous silence.
+        let mut caps = HashMap::new();
+        caps.insert(series(), Dollars::new(Decimal::from(25)));
+        let params = RiskParams {
+            feed_staleness_grace_ms: 1500,
+            ..RiskParams::default()
+        };
+        let mut c = RiskCore::new(&params, caps);
+        open_window(&mut c);
+        let _ = c.on_event(&binance_mid(dec!(60000), OPEN_MS), ts(OPEN_MS));
+        // A 1200 ms gap — would trip the strict 500 ms bound, but is within the
+        // 2000 ms grace-extended threshold, so no trip and no cancel-all.
+        let out = c.on_tick(ts(OPEN_MS + 1200));
+        assert!(
+            tripped_in(&out).is_empty(),
+            "gap within grace must not trip"
+        );
+        assert!(!has_cancel_all(&out));
+        assert!(!c.is_globally_halted());
+        // A genuine feed death — 2100 ms of continuous silence — still trips.
+        let out = c.on_tick(ts(OPEN_MS + 2100));
+        assert_eq!(tripped_in(&out), vec![BreakerKind::FeedStale]);
+        assert!(has_cancel_all(&out));
+        assert!(c.is_globally_halted());
     }
 
     #[test]

@@ -122,6 +122,10 @@ pub(crate) fn params_view(config: &AppConfig) -> ParamsView {
                 p.maker_rebate_share.to_string(),
             ),
             (
+                "paper.taker_rebate_enabled".to_owned(),
+                p.taker_rebate_enabled.to_string(),
+            ),
+            (
                 "engine.no_atm_final_secs".to_owned(),
                 e.no_atm_final_secs.to_string(),
             ),
