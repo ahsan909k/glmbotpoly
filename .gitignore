@@ -28,3 +28,4 @@ Thumbs.db
 
 # Claude Code local state (memory, plans, locks, local settings)
 .claude/
+/target-check

@@ -87,6 +87,7 @@ pub(crate) struct RiskCore {
     // thresholds (copied from RiskParams at construction)
     feed_staleness_ms: i64,
     feed_staleness_grace_ms: i64,
+    book_staleness_dwell_ms: i64,
     daily_stop_loss: Dollars,
     max_open_notional: Dollars,
     sanity_bound: f64,
@@ -108,7 +109,12 @@ pub(crate) struct RiskCore {
     // feed staleness
     binance_mid_last: HashMap<Asset, TimestampMs>,
     stale_feeds: HashSet<(PriceSource, Asset, TickKind)>,
-    stale_books: HashSet<WindowId>,
+    // Windows whose CLOB book is currently Stale/Crossed/TopDivergence, mapped to
+    // the timestamp the (still-unrecovered) staleness began. A window counts
+    // toward the global `FeedStale` breaker only once it has been continuously
+    // stale for `book_staleness_dwell_ms` — filtering the transient rollover
+    // churn while still tripping on a sustained outage.
+    stale_books: HashMap<WindowId, TimestampMs>,
 
     // ws disconnect
     ws_down_windows: HashSet<WindowId>,
@@ -172,6 +178,7 @@ impl RiskCore {
         Self {
             feed_staleness_ms: params.feed_staleness_ms,
             feed_staleness_grace_ms: params.feed_staleness_grace_ms,
+            book_staleness_dwell_ms: params.book_staleness_dwell_ms,
             daily_stop_loss: params.daily_stop_loss,
             max_open_notional: params.max_open_notional,
             sanity_bound: params.sanity_bound,
@@ -185,7 +192,7 @@ impl RiskCore {
             trip_times: VecDeque::new(),
             binance_mid_last: HashMap::new(),
             stale_feeds: HashSet::new(),
-            stale_books: HashSet::new(),
+            stale_books: HashMap::new(),
             ws_down_windows: HashSet::new(),
             user_ws_down: false,
             ended_windows: HashSet::new(),
@@ -391,14 +398,16 @@ impl RiskCore {
                         self.ws_down_windows.insert(*window);
                         self.recompute_ws(now, &mut out);
                     } else {
-                        self.stale_books.insert(*window);
+                        // Keep the FIRST stale-since so a window that stays stale
+                        // accrues dwell across repeated Unreliable reports.
+                        self.stale_books.entry(*window).or_insert(now);
                         self.recompute_feed_stale(now, &mut out);
                     }
                 }
             }
             Event::BookHealth(BookHealth::Recovered { window, .. }) => {
                 let was_ws = self.ws_down_windows.remove(window);
-                let was_book = self.stale_books.remove(window);
+                let was_book = self.stale_books.remove(window).is_some();
                 if was_ws {
                     self.recompute_ws(now, &mut out);
                 }
@@ -566,7 +575,7 @@ impl RiskCore {
         if self.ws_down_windows.remove(&window) {
             self.recompute_ws(now, out);
         }
-        if self.stale_books.remove(&window) {
+        if self.stale_books.remove(&window).is_some() {
             self.recompute_feed_stale(now, out);
         }
     }
@@ -635,7 +644,17 @@ impl RiskCore {
             .binance_mid_last
             .values()
             .any(|&t| now.as_millis().saturating_sub(t.as_millis()) > threshold);
-        timer || !self.stale_feeds.is_empty() || !self.stale_books.is_empty()
+        // A stale book counts only once it has been continuously stale for the
+        // dwell (default 0 => immediate, strict §11). Transient rollover churn
+        // (Stale then Recover within the dwell) is dropped from stale_books
+        // before the next on_tick recompute catches it, so it never trips; a
+        // SUSTAINED outage crosses the dwell at the next 500 ms on_tick and does.
+        let dwell = self.book_staleness_dwell_ms;
+        let book_stale = self
+            .stale_books
+            .values()
+            .any(|&since| now.as_millis().saturating_sub(since.as_millis()) >= dwell);
+        timer || !self.stale_feeds.is_empty() || book_stale
     }
 
     fn recompute_feed_stale(&mut self, now: TimestampMs, out: &mut Vec<RiskOutput>) {
@@ -1171,6 +1190,91 @@ mod tests {
             ts(OPEN_MS),
         );
         assert_eq!(tripped_in(&out), vec![BreakerKind::FeedStale]);
+    }
+
+    fn dwell_core(book_staleness_dwell_ms: i64) -> RiskCore {
+        let mut caps = HashMap::new();
+        caps.insert(series(), Dollars::new(Decimal::from(25)));
+        let params = RiskParams {
+            book_staleness_dwell_ms,
+            ..RiskParams::default()
+        };
+        RiskCore::new(&params, caps)
+    }
+
+    #[test]
+    fn book_staleness_dwell_filters_transient_churn_but_sustained_outage_still_trips() {
+        // With a 1500 ms dwell, a book that flaps Stale then Recovers within the
+        // dwell must NOT trip FeedStale (the six-series rollover churn — snapshot
+        // gaps / per-pair reconnects momentarily flag Stale then Recover in well
+        // under a second). A book that STAYS stale past the dwell MUST still trip
+        // FeedStale at the next on_tick — the alarm is preserved.
+        let mut c = dwell_core(1500);
+        open_window(&mut c);
+
+        // --- transient: Stale @ OPEN, still stale at +1000 (< dwell), Recovered
+        //     at +1200 (< dwell). Never trips. ---
+        let out = c.on_event(
+            &Event::BookHealth(BookHealth::Unreliable {
+                window: window(),
+                reason: BookUnreliableReason::Stale,
+                ts: ts(OPEN_MS),
+            }),
+            ts(OPEN_MS),
+        );
+        assert!(
+            tripped_in(&out).is_empty(),
+            "a fresh book-stale is within the dwell — must not trip"
+        );
+        assert!(
+            c.on_tick(ts(OPEN_MS + 1000)).is_empty(),
+            "still within dwell"
+        );
+        assert!(!c.is_globally_halted());
+        let out = c.on_event(
+            &Event::BookHealth(BookHealth::Recovered {
+                window: window(),
+                outage: core_types::DurationMs::from_millis(1200),
+                ts: ts(OPEN_MS + 1200),
+            }),
+            ts(OPEN_MS + 1200),
+        );
+        assert!(tripped_in(&out).is_empty() && !c.is_globally_halted());
+        // A tick past what WOULD have been the dwell: the book already recovered,
+        // so nothing lingers to trip.
+        assert!(c.on_tick(ts(OPEN_MS + 2000)).is_empty());
+        assert!(!c.is_globally_halted(), "transient churn was filtered");
+
+        // --- sustained: Stale @ +3000 that never recovers. Must trip once the
+        //     dwell elapses (crossed at the +4500 on_tick). ---
+        let out = c.on_event(
+            &Event::BookHealth(BookHealth::Unreliable {
+                window: window(),
+                reason: BookUnreliableReason::Stale,
+                ts: ts(OPEN_MS + 3000),
+            }),
+            ts(OPEN_MS + 3000),
+        );
+        assert!(
+            tripped_in(&out).is_empty(),
+            "fresh stale-since, dwell not met"
+        );
+        assert!(
+            c.on_tick(ts(OPEN_MS + 4000)).is_empty(),
+            "1000 ms stale < 1500 ms dwell"
+        );
+        assert!(!c.is_globally_halted());
+        let out = c.on_tick(ts(OPEN_MS + 4500));
+        assert_eq!(
+            tripped_in(&out),
+            vec![BreakerKind::FeedStale],
+            "a sustained book outage past the dwell STILL trips FeedStale"
+        );
+        assert!(
+            has_cancel_all(&out),
+            "FeedStale is operational — cancel-all fires"
+        );
+        assert!(c.is_globally_halted());
     }
 
     #[test]

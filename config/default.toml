@@ -139,6 +139,7 @@ maker_deployment_budget_per_window = 0  # cumulative maker buy notional/window b
 [risk]
 feed_staleness_ms = 500          # cancel-all beyond this; §11 ceiling, looser is rejected
 feed_staleness_grace_ms = 0      # 0 = strict §11 (VPS). Home-testing only: raise (e.g. 1500) so a jittery direct-Binance gap does not flap cancel-all; timer trips at feed_staleness_ms + this. Max 5000.
+book_staleness_dwell_ms = 0      # 0 = strict §11. Raise (e.g. 1500) to filter transient CLOB book Stale/Crossed churn during six-series rollovers; a SUSTAINED outage past the dwell still trips FeedStale. Max 5000.
 daily_stop_loss = 200            # halt all trading until manual reset
 max_open_notional = 1000         # global cap across all windows
 sanity_bound = 0.10              # stand down when |fair - mid| exceeds this...

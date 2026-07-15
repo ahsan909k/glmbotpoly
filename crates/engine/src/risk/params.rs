@@ -51,6 +51,17 @@ pub struct RiskParams {
     /// transient gaps while a genuine feed death (a gap beyond the sum) still
     /// trips. Latched `FeedHealth`/`BookHealth` stale reports are unaffected.
     pub feed_staleness_grace_ms: i64,
+    /// **Default 0 (off, strict §11).** Dwell (ms) a window's CLOB book must be
+    /// continuously `BookHealth::Unreliable{Stale|Crossed|TopDivergence}` before
+    /// it counts toward the global `FeedStale` breaker. A book that recovers
+    /// within the dwell never trips — this filters the transient book-staleness
+    /// churn that fires during six-series window rollovers (snapshot gaps and
+    /// per-pair reconnects momentarily flag Stale/Crossed then Recover in well
+    /// under a second). A SUSTAINED book outage past the dwell STILL trips
+    /// `FeedStale` (the alarm is preserved). `Disconnected` book-health is
+    /// unaffected (it routes to `WsDisconnect`, not here), as are the fast-feed
+    /// timer and the Chainlink `FeedHealth` path.
+    pub book_staleness_dwell_ms: i64,
     /// Daily stop-loss: once cumulative realized PnL for the UTC day reaches
     /// this loss, all trading halts until a manual `ControlEvent::Reset`.
     pub daily_stop_loss: Dollars,
@@ -114,6 +125,7 @@ impl Default for RiskParams {
         Self {
             feed_staleness_ms: 500,
             feed_staleness_grace_ms: 0,
+            book_staleness_dwell_ms: 0,
             daily_stop_loss: Dollars::new(Decimal::from(200)),
             max_open_notional: Dollars::new(Decimal::from(1_000)),
             sanity_bound: 0.10,
@@ -151,6 +163,7 @@ mod tests {
         let p = RiskParams::default();
         assert_eq!(p.feed_staleness_ms, 500);
         assert_eq!(p.feed_staleness_grace_ms, 0);
+        assert_eq!(p.book_staleness_dwell_ms, 0);
         assert_eq!(p.daily_stop_loss, Dollars::new(Decimal::from(200)));
         assert_eq!(p.max_open_notional, Dollars::new(Decimal::from(1_000)));
         assert!((p.sanity_bound - 0.10).abs() < f64::EPSILON);

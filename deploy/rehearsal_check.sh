@@ -87,7 +87,21 @@ fi
 WL=$(q "SELECT COUNT(*) FROM breaker_trips WHERE breaker='window_loss' AND kind='tripped' AND ts_local_ms>=$T0;")
 pass independence "window_loss trips=$WL (offline proof: chaos.rs window_loss_halts_that_window_only + discovery_failure_at_rollover)"
 
-# 12. Journal summary (durable, ts-bounded)
+# 12. Event-loop decision-lag p95 < 100 ms. The bot logs `decision_lag_p95_ms`
+#     each resource report — the receive->loop-process delay for the fast
+#     Binance-mid tick (the single-thread runtime's responsiveness). A high p95
+#     would mean the loop is falling behind (the ruled-out FeedStale hypothesis);
+#     the gate takes the WORST p95 seen over the rehearsal.
+LAG=$(journalctl -u bot --since "@$((T0/1000))" 2>/dev/null \
+      | grep -oE 'decision_lag_p95_ms=[0-9]+' | cut -d= -f2 | sort -n | tail -1)
+if [ -n "$LAG" ]; then
+  { [ "$LAG" -lt 100 ]; } && pass loop-lag-p95<100ms "worst_p95_ms=$LAG" \
+    || fail loop-lag-p95<100ms "worst_p95_ms=$LAG (single-thread loop falling behind)"
+else
+  fail loop-lag-p95<100ms "no decision_lag_p95_ms in journal (metric not logged?)"
+fi
+
+# 13. Journal summary (durable, ts-bounded)
 echo "-- journal summary (epoch-bounded) --"
 q "SELECT 'maker_fills', COUNT(*) FROM fills WHERE liquidity='maker' AND ts_local_ms>=$T0
    UNION ALL SELECT 'taker_fills', COUNT(*) FROM fills WHERE liquidity='taker' AND ts_local_ms>=$T0

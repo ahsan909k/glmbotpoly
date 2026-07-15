@@ -45,6 +45,7 @@ want daily_stop_loss                     1000  'daily_stop_loss (1000, SHADOW)'
 want max_open_notional                   5000  'max_open_notional (5000, HARD backstop)'
 want starting_capital                    50000 'paper.starting_capital (50000 bankroll)'
 want feed_staleness_grace_ms             0     'feed_staleness_grace_ms (0, strict §11)'
+want book_staleness_dwell_ms             1500  'book_staleness_dwell_ms (1500, filters transient rollover book churn)'
 
 # Layer 3 — model-taker + shadow enabled; fortress arbitration + model-taker earned
 # config (theta 0.03, fortress BTC->momentum / ETH->model) are the TESTED engine

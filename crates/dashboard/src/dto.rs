@@ -632,8 +632,22 @@ pub struct RiskDto {
     pub feeds: Vec<FeedHealthDto>,
     /// Currently-unreliable window books.
     pub books: Vec<BookHealthDto>,
+    /// Per-series book-unreliable event rate over the trailing hour (events/hr) —
+    /// the rollover book-disconnect churn the risk `book_staleness_dwell_ms`
+    /// filters. A high number here that is NOT tripping FeedStale is the dwell
+    /// working as intended; a genuine sustained outage still trips.
+    pub book_stale_per_hour: Vec<BookStaleRateDto>,
     /// Per-asset model health.
     pub model_health: Vec<ModelHealthDto>,
+}
+
+/// One series' book-unreliable event rate over the trailing hour.
+#[derive(Debug, Clone, Serialize)]
+pub struct BookStaleRateDto {
+    /// Series key (e.g. "BTC-5m").
+    pub series: String,
+    /// Book-unreliable events in the trailing hour.
+    pub events_per_hour: u32,
 }
 
 /// Builds the risk panel for a mode.
@@ -665,6 +679,15 @@ pub(crate) fn risk(data: &DashboardData, mode: Mode) -> RiskDto {
             .map(|(wid, reason)| BookHealthDto {
                 window: wid.to_string(),
                 reason: *reason,
+            })
+            .collect(),
+        book_stale_per_hour: data
+            .shared
+            .book_stale_events_per_hour(data.last_now)
+            .into_iter()
+            .map(|(series, events_per_hour)| BookStaleRateDto {
+                series: series.to_string(),
+                events_per_hour,
             })
             .collect(),
         model_health: data

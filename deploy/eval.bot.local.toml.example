@@ -47,7 +47,9 @@ shadow_loss_stops = true      # PAPER EVAL: loss stops (DailyStop/WindowLoss) re
                               # never halt. Operational breakers stay HARD.
 daily_stop_loss = 1000        # 2% of $50k — SHADOW (computed, journaled, never halts).
 max_open_notional = 5000      # REAL backstop (~4× peak instantaneous deployment ~$1.2k).
-feed_staleness_grace_ms = 0   # strict §11 — colocated VPS, no grace.
+feed_staleness_grace_ms = 0   # strict §11 — colocated VPS, no grace (fast-feed timer).
+book_staleness_dwell_ms = 1500 # filter transient CLOB book Stale/Crossed churn during six-series
+                              # rollovers; a SUSTAINED book outage past 1500 ms STILL trips FeedStale.
 
 [feeds]
 binance_depth_capture = false   # research depth capture stays on the Windows box (division of labor).

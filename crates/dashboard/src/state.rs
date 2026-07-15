@@ -232,6 +232,10 @@ pub(crate) struct SharedView {
     pub(crate) model_health: HashMap<Asset, ModelHealthEvent>,
     pub(crate) feed_stale: BTreeMap<(PriceSource, Asset, TickKind), FeedStaleEntry>,
     pub(crate) book_unreliable: BTreeMap<WindowId, BookUnreliableReason>,
+    /// Per-series trailing-hour ring of `BookHealth::Unreliable` event times — the
+    /// book-disconnect churn rate (events/hr) the risk `book_staleness_dwell_ms`
+    /// filters. Pruned to the trailing hour on every insert. Shared (market data).
+    pub(crate) book_stale_events: BTreeMap<Series, VecDeque<TimestampMs>>,
     /// Per-window model-fair history feeding the live 5s markout (shared — the
     /// feeds are identical for both modes). Dropped with its window on prune.
     pub(crate) fair_rings: BTreeMap<WindowId, FairRing>,
@@ -246,8 +250,33 @@ impl SharedView {
             model_health: HashMap::new(),
             feed_stale: BTreeMap::new(),
             book_unreliable: BTreeMap::new(),
+            book_stale_events: BTreeMap::new(),
             fair_rings: BTreeMap::new(),
         }
+    }
+
+    /// Records a book-unreliable event for a series and prunes the ring to the
+    /// trailing hour. Returns nothing — read via [`Self::book_stale_events_per_hour`].
+    fn record_book_stale(&mut self, series: Series, now: TimestampMs) {
+        let cutoff = now.as_millis() - 3_600_000;
+        let ring = self.book_stale_events.entry(series).or_default();
+        ring.push_back(now);
+        while ring.front().is_some_and(|t| t.as_millis() < cutoff) {
+            ring.pop_front();
+        }
+    }
+
+    /// Per-series count of book-unreliable events in the trailing hour (events/hr),
+    /// pruning stale entries against `now`.
+    pub(crate) fn book_stale_events_per_hour(&self, now: TimestampMs) -> Vec<(Series, u32)> {
+        let cutoff = now.as_millis() - 3_600_000;
+        self.book_stale_events
+            .iter()
+            .map(|(series, ring)| {
+                let n = ring.iter().filter(|t| t.as_millis() >= cutoff).count();
+                (*series, u32::try_from(n).unwrap_or(u32::MAX))
+            })
+            .collect()
     }
 
     /// Finds the window and outcome a token belongs to (linear over the few
@@ -640,6 +669,7 @@ impl DashboardData {
             Event::BookHealth(bh) => match bh {
                 BookHealth::Unreliable { window, reason, .. } => {
                     self.shared.book_unreliable.insert(*window, *reason);
+                    self.shared.record_book_stale(window.series, now);
                 }
                 BookHealth::Recovered { window, .. } => {
                     self.shared.book_unreliable.remove(window);

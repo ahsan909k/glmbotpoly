@@ -30,7 +30,7 @@
 //! boundary maps (deferred by every prior engine task to "the engine-bus-wiring
 //! task" — this is it); the engine never depends on `config`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,7 +39,7 @@ use anyhow::Context;
 use config::{AppConfig, Driver, EngineParams, ModelTakerConfig, RunConfig, Secrets};
 use core_types::{
     BreakerKind, ControlEvent, Dollars, Event, MarketInfo, MarketLifecycleEvent, Mode, OrderId,
-    PriceSource, RiskEvent, Series, TimestampMs, WindowId, WindowLifecycle,
+    PriceSource, RiskEvent, Series, TickKind, TimestampMs, WindowId, WindowLifecycle,
 };
 use dashboard::{ControlRequest, DashboardHandle, DriverStatus, ModelTakerTick, ShadowTick};
 use discovery::DiscoveryService;
@@ -113,6 +113,8 @@ const MAX_CACHED_WINDOWS: usize = 32;
 const INVENTORY_RETENTION_MS: i64 = 2 * 3_600_000;
 /// How long to wait at shutdown for resting paper orders to terminalize.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Trailing samples in the event-loop decision-lag ring (~40 s at ~100 mid-ticks/s).
+const DECISION_LAG_RING: usize = 4_096;
 /// Assumed memory page size for the Linux RSS report (good enough for a trend).
 #[cfg(target_os = "linux")]
 const PAGE_KB: u64 = 4;
@@ -274,6 +276,7 @@ pub(crate) fn risk_params(config: &AppConfig) -> RiskParams {
     RiskParams {
         feed_staleness_ms: r.feed_staleness_ms.as_millis(),
         feed_staleness_grace_ms: r.feed_staleness_grace_ms.as_millis(),
+        book_staleness_dwell_ms: r.book_staleness_dwell_ms.as_millis(),
         daily_stop_loss: r.daily_stop_loss,
         max_open_notional: r.max_open_notional,
         sanity_bound: r.sanity_bound,
@@ -784,6 +787,15 @@ async fn run(
     let mut armed = false;
     let mut next_warn_at = boot_at + std_duration(config.run.readiness_timeout_ms);
 
+    // Permanent event-loop decision-lag metric: for each fast-feed (BinanceDirect
+    // Mid) tick, the delay from local receive (`ts_local`) to when the run loop
+    // processes it (`wall_now()`). This is the single-thread event-loop's
+    // responsiveness — a high p95 means the loop is falling behind, which was the
+    // suspected (and ruled-out) cause of the FeedStale flapping. Reported p95 each
+    // rss tick; the rehearsal gate is p95 < 100 ms. Bounded trailing ring (~40 s
+    // at ~100 mid-ticks/s).
+    let mut decision_lag: VecDeque<i64> = VecDeque::with_capacity(DECISION_LAG_RING);
+
     loop {
         // Order flow is allowed only once armed and while every critical
         // dependency is alive (a dead feed/scheduler gates placement until it
@@ -1000,6 +1012,18 @@ async fn run(
             maybe = bus_rx.recv() => match maybe {
                 Some(event) => {
                     let now = wall_now();
+                    // Event-loop decision-lag sample: receive→process delay for the
+                    // fast feed (the tick that drives every reprice/take).
+                    if let Event::PriceTick(t) = &event
+                        && t.source == PriceSource::BinanceDirect
+                        && t.kind == TickKind::Mid
+                    {
+                        let lag = now.as_millis().saturating_sub(t.ts_local.as_millis());
+                        if decision_lag.len() == DECISION_LAG_RING {
+                            decision_lag.pop_front();
+                        }
+                        decision_lag.push_back(lag);
+                    }
                     recorder.record(&event);
                     // Observation-only shadow: a drop-on-full clone of every bus
                     // event. It holds no venue port and no bus_tx, so it can never
@@ -1125,6 +1149,9 @@ async fn run(
                     working_orders = working.len(),
                     pruned_inv,
                     pruned_risk,
+                    decision_lag_p95_ms = percentile_ms(&decision_lag, 0.95),
+                    decision_lag_max_ms = decision_lag.iter().copied().max().unwrap_or(0),
+                    decision_lag_n = decision_lag.len(),
                     armed,
                     "resource report"
                 );
@@ -1484,6 +1511,20 @@ async fn drain_open_orders(
     drained
 }
 
+/// The `q`-quantile (0..=1) of a sample of millisecond lags, by
+/// nearest-rank on a sorted copy. Returns 0 for an empty sample. Used for the
+/// event-loop decision-lag p95 in the resource report (a diagnostic gauge, so a
+/// clone-and-sort each rss tick — every ~60 s — is fine).
+fn percentile_ms(samples: &VecDeque<i64>, q: f64) -> i64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let mut v: Vec<i64> = samples.iter().copied().collect();
+    v.sort_unstable();
+    let idx = ((q * (v.len() as f64)).ceil() as usize).saturating_sub(1);
+    v[idx.min(v.len() - 1)]
+}
+
 /// Reports resident set size in KiB on Linux (dependency-free `/proc/self/statm`),
 /// `None` elsewhere. Assumes a 4 KiB page — good enough for a memory trend.
 #[cfg(target_os = "linux")]
@@ -1712,6 +1753,18 @@ mod tests {
         Series { asset, duration }
     }
 
+    #[test]
+    fn percentile_ms_nearest_rank() {
+        assert_eq!(percentile_ms(&VecDeque::new(), 0.95), 0);
+        let one: VecDeque<i64> = VecDeque::from([7]);
+        assert_eq!(percentile_ms(&one, 0.95), 7);
+        // 1..=100: nearest-rank p95 = the 95th value; p100 = the max.
+        let hundred: VecDeque<i64> = (1..=100).collect();
+        assert_eq!(percentile_ms(&hundred, 0.95), 95);
+        assert_eq!(percentile_ms(&hundred, 1.0), 100);
+        assert_eq!(percentile_ms(&hundred, 0.50), 50);
+    }
+
     // ---- config → engine boundary maps (anti-drift) ------------------------
 
     #[test]
@@ -1723,6 +1776,10 @@ mod tests {
         assert_eq!(
             p.feed_staleness_grace_ms,
             c.risk.feed_staleness_grace_ms.as_millis()
+        );
+        assert_eq!(
+            p.book_staleness_dwell_ms,
+            c.risk.book_staleness_dwell_ms.as_millis()
         );
         assert_eq!(p.daily_stop_loss, c.risk.daily_stop_loss);
         assert_eq!(p.max_open_notional, c.risk.max_open_notional);

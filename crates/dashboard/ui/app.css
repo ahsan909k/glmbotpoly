@@ -224,6 +224,7 @@ th.col-time, td.col-time { text-align: left; }
 .health-item.bad { color: var(--neg); }
 .health-item.warn { color: var(--warn); }
 .health-none { color: var(--muted); font-size: 12px; }
+.health-sub { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; margin: 6px 0 2px; }
 #risk-halt.ok { background: rgba(46,204,113,.15); color: var(--pos); }
 #risk-halt.bad { background: rgba(226,59,78,.18); color: var(--danger); }
 

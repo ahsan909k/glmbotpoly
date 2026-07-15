@@ -21,6 +21,14 @@ pub struct RiskConfig {
     /// Leave at 0 on a colocated VPS. Capped at 5000 ms; latched feed/book
     /// stale reports and disconnects are unaffected.
     pub feed_staleness_grace_ms: DurationMs,
+    /// Dwell (ms) a window's CLOB book must be continuously stale (Stale/Crossed/
+    /// TopDivergence — NOT Disconnected, which is a WsDisconnect) before it counts
+    /// toward the global `FeedStale` breaker. Default 0 (off, strict §11). Raise
+    /// it (e.g. 1500) to filter the transient book-staleness churn that fires
+    /// during six-series window rollovers; a SUSTAINED outage past the dwell still
+    /// trips. Capped at 5000 ms. The fast-feed timer and Chainlink `FeedHealth`
+    /// path are unaffected.
+    pub book_staleness_dwell_ms: DurationMs,
     /// Daily stop-loss: once cumulative realized PnL for the day reaches
     /// this loss, all trading halts until manual reset.
     pub daily_stop_loss: Dollars,
@@ -50,6 +58,7 @@ impl Default for RiskConfig {
         Self {
             feed_staleness_ms: DurationMs::from_millis(500),
             feed_staleness_grace_ms: DurationMs::from_millis(0),
+            book_staleness_dwell_ms: DurationMs::from_millis(0),
             daily_stop_loss: Dollars::new(Decimal::from(200)),
             max_open_notional: Dollars::new(Decimal::from(1_000)),
             sanity_bound: 0.10,
@@ -74,6 +83,12 @@ impl RiskConfig {
             (0..=5_000).contains(&grace),
             "risk.feed_staleness_grace_ms",
             "must be in [0, 5000] — 0 is strict §11; raise it only for home testing on a jittery link",
+        );
+        let book_dwell = self.book_staleness_dwell_ms.as_millis();
+        v.require(
+            (0..=5_000).contains(&book_dwell),
+            "risk.book_staleness_dwell_ms",
+            "must be in [0, 5000] — 0 is strict §11; raise it to filter transient rollover book churn",
         );
         v.require(
             self.daily_stop_loss.as_decimal() > Decimal::ZERO,
@@ -165,6 +180,41 @@ mod tests {
             let mut v = Violations::default();
             cfg.validate_into(&mut v);
             assert!(v.into_result().is_ok(), "grace {ok} should be accepted");
+        }
+    }
+
+    #[test]
+    fn book_staleness_dwell_out_of_range_rejected() {
+        for bad in [-1i64, 5_001, 10_000] {
+            let cfg = RiskConfig {
+                book_staleness_dwell_ms: DurationMs::from_millis(bad),
+                ..RiskConfig::default()
+            };
+            let mut v = Violations::default();
+            cfg.validate_into(&mut v);
+            let violations = v.into_result().unwrap_err();
+            assert!(
+                violations
+                    .iter()
+                    .any(|x| x.key == "risk.book_staleness_dwell_ms"),
+                "book dwell {bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn book_staleness_dwell_in_range_accepted() {
+        for ok in [0i64, 1_500, 5_000] {
+            let cfg = RiskConfig {
+                book_staleness_dwell_ms: DurationMs::from_millis(ok),
+                ..RiskConfig::default()
+            };
+            let mut v = Violations::default();
+            cfg.validate_into(&mut v);
+            assert!(
+                v.into_result().is_ok(),
+                "book dwell {ok} should be accepted"
+            );
         }
     }
 

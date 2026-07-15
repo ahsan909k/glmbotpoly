@@ -968,9 +968,19 @@ function renderRisk() {
         return `<div class="health-item ${cls}"><span>${m.asset}</span><span>${m.health} (${m.reason})</span></div>`;
       }).join("")
     : `<div class="health-none">no model health (run with --with-model)</div>`;
-  $("book-health").innerHTML = (r.books && r.books.length)
+  const bookNow = (r.books && r.books.length)
     ? r.books.map((b) => `<div class="health-item bad"><span>${seriesOf(b.window)}</span><span>${b.reason}</span></div>`).join("")
     : `<div class="health-item ok"><span>all books reliable</span><span>✓</span></div>`;
+  // Per-series book-disconnect churn rate (events/hr). A high rate that is NOT
+  // tripping FeedStale is the book_staleness_dwell filter working as intended.
+  const bookRate = (r.book_stale_per_hour && r.book_stale_per_hour.length)
+    ? `<div class="health-sub">book-disconnect churn (events/hr):</div>` +
+      r.book_stale_per_hour
+        .filter((s) => s.events_per_hour > 0)
+        .map((s) => `<div class="health-item ${s.events_per_hour >= 60 ? "warn" : "ok"}"><span>${s.series}</span><span>${s.events_per_hour}/hr</span></div>`)
+        .join("")
+    : "";
+  $("book-health").innerHTML = bookNow + bookRate;
 }
 
 // ============================================ STATUS STRIP (global, always on)
