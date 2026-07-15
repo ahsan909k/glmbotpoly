@@ -90,9 +90,115 @@ def _verdict(rows: list[dict]) -> str:
             f"Fully consistent with every prior finding — momentum is the only edge.")
 
 
+# --- Benchmark references tile (anchor-verified) ------------------------------
+# PRIMARY = the reference-class PURE MAKER on our exact BTC/ETH 5m/15m series whose
+# OUR-series reconstruction reconciles with the account-wide official P/L. Only
+# anchor-CONSISTENT accounts get money shown; SUSPECT accounts render behavioral
+# distributions only (money greyed) — the reconstruction, not the profile, is the error.
+PRIMARY_REF = "gabigol"
+REF_DISPLAY = {
+    "gabigol": "gabigol",
+    "0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82": "0xb27b",
+    "nagi777": "nagi777",
+    "0xf3531b23b504cf0aed4ff21325232b2a2d496685": "xrang2731",
+    "takerner": "takerner", "bonereaper": "bonereaper", "wolf9478": "wolf9478",
+}
+BENCH_NOTE = ("price-vs-book comparisons are <b>same-method-relative only</b> — a pure maker shows "
+              "~40% “crossing” from tape-snapshot alignment (its resting price vs a book snapshot "
+              "taken a fraction of a second apart), NOT aggressive taking. Read touch/cross across accounts "
+              "relatively, never as an absolute aggression rate.")
+
+
+def _load_all_manuals() -> dict:
+    """Every manual JSON on disk keyed by handle (filename stem); fails loud on an unflagged anchor."""
+    out = {}
+    for f in sorted((out_dir() / "manuals").glob("*.json")):
+        m = json.loads(f.read_text(encoding="utf-8"))
+        if m.get("anchor"):
+            assert_anchor_consistent(m["anchor"])
+        out[f.stem] = m
+    return out
+
+
+def _ref_stats(m: dict) -> dict:
+    pv = m.get("price_vs_book", {}); cov = m.get("coverage", {}); a = m.get("anchor", {})
+    pwc = m.get("per_window_capital", {}).get("gross_deployed_usd", {})
+    wins, days = cov.get("our_windows_traded"), cov.get("active_days")
+    return {
+        "at_touch": _price_frac(pv, "at_touch") if pv.get("windows_with_book") else None,
+        "crossing": _price_frac(pv, "crossing") if pv.get("windows_with_book") else None,
+        "cap_p50": pwc.get("p50"), "cap_p90": pwc.get("p90"), "windows": wins, "days": days,
+        "wpd": (wins / days) if (wins and days) else None,
+        "velocity": m.get("capital_velocity_hold", {}).get("turns_per_day", {}).get("p50"),
+        "official": a.get("official_all_usd"), "recon": a.get("reconstructed_our_net_usd"),
+        "suspect": bool(a.get("suspect")),
+    }
+
+
+def _rank_refs(manuals: dict):
+    """(consistent [PRIMARY first, then by name], suspect [by name]) handle lists, by the anchor flag."""
+    cons = [h for h, m in manuals.items() if not m.get("anchor", {}).get("suspect")]
+    cons.sort(key=lambda h: (0 if h == PRIMARY_REF else 1, REF_DISPLAY.get(h, h)))
+    susp = sorted(h for h, m in manuals.items() if m.get("anchor", {}).get("suspect"))
+    return cons, susp
+
+
+def build_benchmark_tile_html(manuals: dict) -> str:
+    cons, susp = _rank_refs(manuals)
+    p = ["<h2>0. Benchmark references (anchor-verified)</h2>",
+         "<p class='muted'>Only <b>anchor-consistent</b> accounts (OUR-series reconstruction reconciles with "
+         "the account-wide official P/L) are trusted for money. gabigol is the <b>PRIMARY</b> reference — a "
+         "pure maker on our exact BTC/ETH 5m/15m series with a full-history consistent anchor.</p>",
+         "<table><tr><th>Reference</th><th>Role</th><th>At-touch</th><th>Per-window cap<br>p50 / p90</th>"
+         "<th>Windows/day · uptime</th><th>Velocity<br>turns/day</th><th>Official P/L (recon ✓)</th></tr>"]
+    for h in cons:
+        s = _ref_stats(manuals[h]); disp = REF_DISPLAY.get(h, h)
+        role = "<b>PRIMARY</b>" if h == PRIMARY_REF else "secondary"
+        cav = " <span class='muted' style='font-size:.8em'>(window-scoped fetch)</span>" if REF_DISPLAY.get(h, h) in TRUNCATED_FETCH else ""
+        money = (f"<span class='pos'>+${_f(s['official'])}</span> (recon +${_f(s['recon'])} ✓)"
+                 if isinstance(s["official"], (int, float)) else "—")
+        p.append(f"<tr><td><b>{html.escape(disp)}</b>{cav}</td><td>{role}</td><td>{_pct(s['at_touch'])}</td>"
+                 f"<td>${_f(s['cap_p50'])} / ${_f(s['cap_p90'])}</td><td>{_f(s['wpd'])}/day · {_f(s['days'])}d</td>"
+                 f"<td>{_f(s['velocity'],0)}</td><td>{money}</td></tr>")
+    p.append("</table>")
+    if susp:
+        p.append("<p class='muted' style='margin-top:.6rem'><b>SUSPECT — behavioral distributions only, money "
+                 "greyed:</b> their OUR-series reconstruction contradicts the account-wide official P/L, so the "
+                 "reconstructed money is unreliable. Use their at-touch / sizing / sequencing shapes, ignore the $.</p>")
+        p.append("<table><tr><th>Account</th><th>At-touch</th><th>Per-window cap p50</th><th>Windows</th><th>Money</th></tr>")
+        for h in susp:
+            s = _ref_stats(manuals[h])
+            p.append(f"<tr><td><b>{html.escape(REF_DISPLAY.get(h,h))}</b> <span class='red'>SUSPECT</span></td>"
+                     f"<td>{_pct(s['at_touch'])}</td><td>${_f(s['cap_p50'])}</td><td>{_f(s['windows'])}</td>"
+                     f"<td class='muted'>reconstruction contradicts official — unreliable</td></tr>")
+        p.append("</table>")
+    p.append(f"<p class='muted'><b>Tile note:</b> {BENCH_NOTE}</p>")
+    return "".join(p)
+
+
+def build_benchmark_tile_md(manuals: dict) -> list[str]:
+    cons, susp = _rank_refs(manuals)
+    L = ["## 0. Benchmark references (anchor-verified)", "",
+         "| Reference | Role | At-touch | Per-window cap p50/p90 | Windows/day · uptime | Velocity | Official P/L (recon) |",
+         "|---|---|---|---|---|---|---|"]
+    for h in cons:
+        s = _ref_stats(manuals[h]); role = "**PRIMARY**" if h == PRIMARY_REF else "secondary"
+        cav = " (window-scoped)" if REF_DISPLAY.get(h, h) in TRUNCATED_FETCH else ""
+        money = f"+${_f(s['official'])} (recon +${_f(s['recon'])} ✓)" if isinstance(s["official"], (int, float)) else "—"
+        L.append(f"| {REF_DISPLAY.get(h,h)}{cav} | {role} | {_pct(s['at_touch'])} | ${_f(s['cap_p50'])}/${_f(s['cap_p90'])} | "
+                 f"{_f(s['wpd'])}/day · {_f(s['days'])}d | {_f(s['velocity'],0)} | {money} |")
+    if susp:
+        L += ["", "**SUSPECT (behavioral distributions only — money greyed):** "
+              + ", ".join(REF_DISPLAY.get(h, h) for h in susp)
+              + " — reconstruction contradicts official; use shapes not $."]
+    L += ["", "_Tile note: " + BENCH_NOTE.replace("<b>", "**").replace("</b>", "**") + "_", ""]
+    return L
+
+
 def build_md(rows: list[dict]) -> str:
     L = ["# Competitor operating manuals + strategy clones — final report", ""]
     L.append("**Verdict.** " + _verdict(rows).replace("<b>", "**").replace("</b>", "**"))
+    L += [""] + build_benchmark_tile_md(_load_all_manuals())
     L += ["", "## 1. How each account trades (operating manuals — real Telonex tape)", "",
           "| Account | Template | Fills / windows | Price-vs-book (touch/in/cross) | Merge velocity | Hold-velocity | Anchor |",
           "|---|---|---|---|---|---|---|"]
@@ -196,6 +302,9 @@ def build_html(rows: list[dict]) -> str:
 </style></head><body>
 <h1>Competitor operating manuals + strategy clones</h1>
 <div class='verdict'>{_verdict(rows)}</div>"""]
+
+    # 0. benchmark references tile (anchor-verified; loads ALL manuals, not just the cloned ones)
+    parts.append(build_benchmark_tile_html(_load_all_manuals()))
 
     # 1. manuals
     parts.append("<h2>1. How each account trades (operating manuals — real Telonex tape)</h2><table>"
