@@ -95,6 +95,23 @@ def test_log_loss_known_values():
     assert math.isnan(lm.log_loss(np.array([]), np.array([])))
 
 
+def test_directional_accuracy():
+    # Every call on the right side → 1.0; every call wrong → 0.0.
+    prob = np.array([0.9, 0.8, 0.1, 0.2])
+    outcome = np.array([1, 1, 0, 0])
+    assert lm.directional_accuracy(prob, outcome) == 1.0
+    assert lm.directional_accuracy(prob, 1 - outcome) == 0.0
+    # Half right, half wrong → 0.5.
+    assert lm.directional_accuracy(np.array([0.9, 0.9]), np.array([1, 0])) == 0.5
+    # p == 0.5 counts as Up under the ≥-ties-Up rule (default).
+    assert lm.directional_accuracy(np.array([0.5]), np.array([1])) == 1.0
+    assert lm.directional_accuracy(np.array([0.5]), np.array([0])) == 0.0
+    assert lm.directional_accuracy(np.array([0.5]), np.array([0]), tie_is_up=False) == 1.0
+    # nan predictions are dropped; empty → nan.
+    assert lm.directional_accuracy(np.array([np.nan, 0.9]), np.array([0, 1])) == 1.0
+    assert math.isnan(lm.directional_accuracy(np.array([]), np.array([])))
+
+
 def test_reliability_table_counts():
     prob = np.array([0.05, 0.15, 0.15, 0.95, 1.0])
     outcome = np.array([0, 1, 0, 1, 1])

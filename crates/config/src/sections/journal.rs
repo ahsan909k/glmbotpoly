@@ -15,6 +15,12 @@ pub struct JournalConfig {
     /// Directory holding the `journal-*.jsonl.gz` segment log (the source of
     /// truth for replay and restart-rebuild).
     pub dir: PathBuf,
+    /// Directory holding the separate `binance-depth20-*.jsonl.gz` capture
+    /// series (Binance `depth20@100ms`, per-UTC-day rotated) — research data for
+    /// the offline `model-lab`, distinct from the `dir` journal segments and
+    /// invisible to replay/retention. Written when `feeds.binance_depth_capture`
+    /// is enabled.
+    pub depth_dir: PathBuf,
     /// SQLite database file for the queryable structured index.
     pub sqlite_path: PathBuf,
     /// Rotate to a new segment after this many **uncompressed** input bytes.
@@ -45,6 +51,7 @@ impl Default for JournalConfig {
     fn default() -> Self {
         Self {
             dir: PathBuf::from("data/journal"),
+            depth_dir: PathBuf::from("data/depth"),
             sqlite_path: PathBuf::from("data/journal.sqlite"),
             max_segment_bytes: 134_217_728, // 128 MiB
             max_segment_age_ms: 3_600_000,  // 1 h
@@ -62,6 +69,11 @@ impl JournalConfig {
         v.require(
             !self.dir.as_os_str().is_empty(),
             "journal.dir",
+            "must not be empty",
+        );
+        v.require(
+            !self.depth_dir.as_os_str().is_empty(),
+            "journal.depth_dir",
             "must not be empty",
         );
         v.require(
@@ -120,6 +132,7 @@ mod tests {
     fn rejects_bad_values() {
         let cfg = JournalConfig {
             dir: PathBuf::new(),
+            depth_dir: PathBuf::new(),
             sqlite_path: PathBuf::new(),
             max_segment_bytes: 10,
             max_segment_age_ms: 0,
@@ -132,10 +145,10 @@ mod tests {
         };
         let mut v = Violations::default();
         cfg.validate_into(&mut v);
-        // dir, sqlite_path, max_segment_bytes, max_segment_age_ms,
+        // dir, depth_dir, sqlite_path, max_segment_bytes, max_segment_age_ms,
         // channel_capacity, flush_interval_ms, retention_max_age_ms,
-        // retention_max_total_bytes = 8 violations.
-        assert_eq!(v.into_result().unwrap_err().len(), 8);
+        // retention_max_total_bytes = 9 violations.
+        assert_eq!(v.into_result().unwrap_err().len(), 9);
     }
 
     #[test]

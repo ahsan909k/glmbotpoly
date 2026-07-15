@@ -1,0 +1,36 @@
+[package]
+name = "shadow"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Observation-only live inference of the champion model (never touches order flow)"
+
+[lints]
+workspace = true
+
+[dependencies]
+core-types = { path = "../core-types" }
+# Reused parity-by-construction: VolEstimator (sigma_1s) + norm_cdf (p_up_model).
+model = { path = "../model" }
+# The WebSocket transport seam + jittered backoff for shadow's own depth20 feed.
+feed-util = { path = "../feed-util" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Boundary-only (model/meta load errors surface as anyhow at the bot).
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+# UTC-day rotation of the shadow prediction gzip series.
+time = { workspace = true }
+# The shadow prediction gzip segments (pure-Rust backend; journal precedent).
+flate2 = { workspace = true }
+# Decimal prices/sizes convert to f64 at the feature boundary.
+rust_decimal = { workspace = true }
+
+[dev-dependencies]
+# Scripted fake transport for the depth-feed driver tests.
+feed-util = { path = "../feed-util", features = ["fake"] }
+# test-util enables start_paused deterministic-time tests.
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "test-util"] }

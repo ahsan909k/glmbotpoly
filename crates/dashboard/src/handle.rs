@@ -21,6 +21,7 @@ use venue_paper::PaperLedgerSnapshot;
 use crate::command::{
     ControlError, ControlOutcome, ControlRequest, ControlStateSnapshot, DashboardCommand,
 };
+use crate::shadow::ShadowTick;
 use crate::state::{DashboardData, ParamsView};
 use crate::ws::WsUpdate;
 
@@ -138,6 +139,30 @@ impl DashboardHandle {
     /// Pushes the richer risk-manager projection for a mode's risk panel.
     pub fn set_risk(&self, mode: Mode, snapshot: RiskStateSnapshot, now: TimestampMs) {
         self.lock().set_risk(mode, snapshot, now);
+    }
+
+    /// Records one shadow-model prediction for the "Shadow" tile (observation
+    /// only). Fed by the shadow observer via a dashboard-owned [`ShadowTick`].
+    pub fn set_shadow(&self, tick: &ShadowTick, now: TimestampMs) {
+        let updates = self.lock().set_shadow(tick, now);
+        self.broadcast(updates);
+    }
+
+    /// Records one model-taker decision for the "Model taker" tile (fires/day,
+    /// last p_up per series). Polled via `GET /api/model-taker`.
+    pub fn set_model_taker(&self, tick: &crate::ModelTakerTick, now: TimestampMs) {
+        self.lock().set_model_taker(tick, now);
+    }
+
+    /// Buffers one driver-tagged fill for PnL-by-driver (marked at settlement).
+    /// The orchestrator tags the fill via `RiskManager::driver_of`.
+    pub fn record_driver_fill(
+        &self,
+        driver: Option<engine::FillDriver>,
+        fill: &core_types::Fill,
+        now: TimestampMs,
+    ) {
+        self.lock().record_driver_fill(driver, fill, now);
     }
 
     /// Sets the displayed parameters view.

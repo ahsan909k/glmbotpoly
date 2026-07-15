@@ -1,0 +1,12 @@
+# model-lab GBT extra — the opt-in second challenger (gradient-boosted trees).
+#
+# LightGBM is a compiled OpenMP library and pulls scipy, a heavier footprint than
+# the pure numpy/pandas/pyarrow core in requirements.txt. Install it ON TOP of the
+# core only when you want the `learn_gbt` / `compare` stages:
+#
+#     pip install -r requirements.txt -r requirements-gbt.txt   (or: pip install -e .[gbt])
+#
+# Pinned exactly: LightGBM determinism (and even its model-file format) can vary
+# across builds, so reproducible artifacts require a fixed version.
+lightgbm==4.6.0
+scipy==1.18.0

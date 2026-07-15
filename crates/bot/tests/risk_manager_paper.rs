@@ -163,6 +163,9 @@ fn params() -> PaperParams {
             jitter_ms: DurationMs::ZERO,
         },
         rng_seed: Some(1),
+        // Risk-gateway scenarios assert order-flow gating at network-latency fill timing; zero
+        // the venue taker delay so a mid-delay taker never shifts the asserted deadlines.
+        venue_taker_delay_ms: DurationMs::ZERO,
         ..PaperParams::default()
     }
 }

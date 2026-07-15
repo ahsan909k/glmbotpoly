@@ -1,0 +1,4 @@
+# Opt-in extra: the XGBoost challenger (model_lab/lib/xgb.py, challenger_bakeoff).
+# Pinned exactly — like LightGBM, XGBoost determinism can vary across builds, so reproducible
+# artifacts require a fixed version. numpy-2 compatible; scipy is already pinned by requirements-gbt.txt.
+xgboost==2.1.4

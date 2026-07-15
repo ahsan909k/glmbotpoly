@@ -31,20 +31,22 @@
 //! task" — this is it); the engine never depends on `config`.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use config::{AppConfig, EngineParams, RunConfig, Secrets};
+use config::{AppConfig, Driver, EngineParams, ModelTakerConfig, RunConfig, Secrets};
 use core_types::{
     BreakerKind, ControlEvent, Dollars, Event, MarketInfo, MarketLifecycleEvent, Mode, OrderId,
     PriceSource, RiskEvent, Series, TimestampMs, WindowId, WindowLifecycle,
 };
-use dashboard::{ControlRequest, DashboardHandle};
+use dashboard::{ControlRequest, DashboardHandle, ModelTakerTick, ShadowTick};
 use discovery::DiscoveryService;
 use engine::{
-    InventoryEffect, InventoryManager, LateWindowTakerParams, MomentumTakerParams,
-    NormalizerParams, QuoteManagerParams, QuoteParams, RiskManager, RiskParams,
+    InventoryEffect, InventoryManager, LateWindowTakerParams, ModelPrediction, ModelTakeOutcome,
+    ModelTakerParams, MomentumTakerParams, NoModelTakeReason, NormalizerParams, QuoteManagerParams,
+    QuoteParams, RiskManager, RiskParams, TakerId,
 };
 use feed_binance::{BinanceArgs, BinanceParams, BinanceSub};
 use feed_clob::{ClobArgs, ClobParams};
@@ -52,6 +54,7 @@ use feed_rtds::{FeedSub, RtdsArgs, RtdsParams};
 use feed_util::{Backoff, BackoffParams, WsTransport};
 use journal::Recorder;
 use scheduler::{SchedulerArgs, Timing};
+use shadow::{LgbmModel, ModelIdentity, ShadowUpdate};
 use timeutil::{
     NtpOffsetSource, NtpParams, SkewMonitorArgs, SkewParams, SystemClock, run_skew_monitor,
     wall_now,
@@ -65,8 +68,10 @@ use venue_paper::PaperVenue;
 use crate::boot::journal_params;
 use crate::control::{ControlPlane, Decision, RuntimeControlState, VenueAction};
 use crate::dashboard::params_view;
-use crate::feed::{binance_params, clob_params, rtds_params};
+use crate::depth_capture::{self, DepthCaptureParams};
+use crate::feed::{binance_params, clob_params, depth_params, rtds_params, shadow_params};
 use crate::model_runtime::ModelRuntime;
+use crate::model_taker_record::{ModelTakerDecision, ModelTakerRecorder};
 use crate::paper::paper_params;
 use crate::timecfg::{ntp_params, skew_params, std_duration};
 
@@ -76,6 +81,10 @@ use crate::timecfg::{ntp_params, skew_params, std_duration};
 const WS_BROADCAST_CAP: usize = 1_024;
 /// Central bus capacity (await-send backpressure; a retained sender keeps it open).
 const BUS_CAP: usize = 256;
+/// Shadow → dashboard update channel capacity (drop-on-full, display-only).
+const SHADOW_UPDATE_CAP: usize = 256;
+/// Directory for the model-taker decision side-channel (`model-taker-*.jsonl.gz`).
+const MODEL_TAKER_DIR: &str = "data/model-taker";
 /// Window-announcement (→ clob) and market-lifecycle (clob → scheduler) capacity.
 const WINDOW_CAP: usize = 64;
 /// Control-request channel capacity (dashboard → loop).
@@ -170,6 +179,71 @@ pub(crate) fn normalizer_params(_e: &EngineParams) -> NormalizerParams {
     NormalizerParams::default()
 }
 
+/// Maps `config.model_taker` into the model taker's engine params (`price_cap`
+/// has no config key — the recipe takes at the displayed ask, so `None`).
+#[must_use]
+pub(crate) fn model_taker_params(m: &ModelTakerConfig) -> ModelTakerParams {
+    ModelTakerParams {
+        theta: m.theta,
+        budget_per_window: m.budget_per_window,
+        min_finite_count: m.min_finite_count,
+        price_cap: None,
+        max_book_staleness_ms: m.max_book_staleness_ms,
+    }
+}
+
+/// Maps the config's per-asset precedence into the engine's arbitration ledger
+/// keys (the §8 fortress map).
+#[must_use]
+fn series_precedence(m: &ModelTakerConfig) -> HashMap<core_types::Asset, TakerId> {
+    let to_id = |d: Driver| match d {
+        Driver::Momentum => TakerId::Momentum,
+        Driver::Model => TakerId::Model,
+    };
+    HashMap::from([
+        (core_types::Asset::Btc, to_id(m.precedence_btc)),
+        (core_types::Asset::Eth, to_id(m.precedence_eth)),
+    ])
+}
+
+/// A short, stable category label for a model-taker suppression (the dashboard
+/// tile's `last_reason`; the full typed reason is in the decision journal).
+fn model_reason_label(r: &NoModelTakeReason) -> &'static str {
+    match r {
+        NoModelTakeReason::StandingDown => "standing-down",
+        NoModelTakeReason::NoWindowState => "no-window",
+        NoModelTakeReason::ModelStale => "model-stale",
+        NoModelTakeReason::InsufficientCoverage { .. } => "low-coverage",
+        NoModelTakeReason::UnusableFair { .. } => "unusable-fair",
+        NoModelTakeReason::BelowTheta { .. } => "below-theta",
+        NoModelTakeReason::Expired { .. } => "expired",
+        NoModelTakeReason::ArbitrationSuppressed { .. } => "arbitration",
+        NoModelTakeReason::BudgetExhausted { .. } => "budget-exhausted",
+        NoModelTakeReason::NoBookForToken => "no-book",
+        NoModelTakeReason::BookStale { .. } => "book-stale",
+        NoModelTakeReason::NoAsks => "no-asks",
+        NoModelTakeReason::AllAsksAbovePriceCap { .. } => "above-price-cap",
+        NoModelTakeReason::BelowMinNotional { .. } => "below-min-notional",
+        NoModelTakeReason::PlaceRejected => "place-rejected",
+    }
+}
+
+/// Builds a dashboard model-taker tile tick from a prediction + its outcome.
+#[must_use]
+fn model_tick(pred: &ModelPrediction, out: &ModelTakeOutcome) -> ModelTakerTick {
+    let (fired, reason) = match out {
+        ModelTakeOutcome::Fired { .. } => (true, "fired".to_owned()),
+        ModelTakeOutcome::Suppressed(r) => (false, model_reason_label(r).to_owned()),
+    };
+    ModelTakerTick {
+        series: pred.series,
+        ts: pred.ts,
+        p_up: pred.p_up,
+        fired,
+        reason,
+    }
+}
+
 /// Maps `config.risk` + `config.engine.defaults` into the [`RiskManager`]'s full
 /// parameter bundle. `engine_restart_cooldown_ms` has no config key — the engine
 /// default (a few seconds after the last 425/503) stands.
@@ -179,6 +253,7 @@ pub(crate) fn risk_params(config: &AppConfig) -> RiskParams {
     let e = &config.engine.defaults;
     RiskParams {
         feed_staleness_ms: r.feed_staleness_ms.as_millis(),
+        feed_staleness_grace_ms: r.feed_staleness_grace_ms.as_millis(),
         daily_stop_loss: r.daily_stop_loss,
         max_open_notional: r.max_open_notional,
         sanity_bound: r.sanity_bound,
@@ -189,11 +264,18 @@ pub(crate) fn risk_params(config: &AppConfig) -> RiskParams {
         quoter_enabled: true,
         momentum_enabled: true,
         late_window_enabled: true,
+        // The model taker is engine-enabled iff config enables it and the kill
+        // switch is off; the bot additionally allowlist-filters which predictions
+        // it forwards. Off by default keeps the anti-drift pin (below) holding.
+        model_enabled: config.model_taker.enable && !config.model_taker.kill_switch,
+        arbitration_window_ms: config.model_taker.arbitration_window_ms,
+        series_precedence: series_precedence(&config.model_taker),
         quote_manager: quote_manager_params(e),
         quote: quote_params(e),
         normalizer: normalizer_params(e),
         momentum: momentum_params(e),
         late_window: late_window_params(e),
+        model: model_taker_params(&config.model_taker),
     }
 }
 
@@ -212,8 +294,9 @@ pub(crate) fn series_caps(config: &AppConfig, enabled: &[Series]) -> HashMap<Ser
 // ============================================================================
 
 /// Which supervised task this is. Critical tasks (the feeds + scheduler) trigger
-/// a cancel-all-first on death; the skew monitor does not (its death only stops
-/// clock monitoring).
+/// a cancel-all-first on death; the skew monitor and the depth capture do not
+/// (the skew monitor's death only stops clock monitoring; the depth capture is
+/// research-only and never reaches a venue).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Task {
     Scheduler,
@@ -221,6 +304,8 @@ enum Task {
     Rtds,
     Binance,
     Skew,
+    Depth,
+    Shadow,
 }
 
 impl Task {
@@ -231,13 +316,17 @@ impl Task {
             Task::Rtds => "rtds",
             Task::Binance => "binance",
             Task::Skew => "skew",
+            Task::Depth => "depth",
+            Task::Shadow => "shadow",
         }
     }
 
     /// Whether the engine's order flow depends on this task (so its death must
-    /// cancel-all and gate new orders until it recovers).
+    /// cancel-all and gate new orders until it recovers). The skew monitor, the
+    /// research depth capture, and the observation-only shadow observer are NOT
+    /// critical — their death never touches a venue.
     const fn critical(self) -> bool {
-        !matches!(self, Task::Skew)
+        !matches!(self, Task::Skew | Task::Depth | Task::Shadow)
     }
 }
 
@@ -432,7 +521,18 @@ async fn run(
 
     // Restore prior inventory + order state from the journal (§3/§9); the live
     // engine wiring that *seeds* the engine from it is a documented follow-up.
-    let _restored = crate::boot::rebuild_and_log(config);
+    // The rebuilt state is currently unused, so `run.replay_journal_on_start`
+    // lets a large-journal deployment skip this pure startup cost. Recording to
+    // `journal.dir` is unaffected either way.
+    if config.run.replay_journal_on_start {
+        let _restored = crate::boot::rebuild_and_log(config);
+    } else {
+        tracing::info!(
+            target: "run",
+            "skipping journal replay at startup (run.replay_journal_on_start = false); \
+             recording is unaffected"
+        );
+    }
 
     // Control plane (single venue owner) + dashboard handle.
     let mut control = ControlPlane::new(config, secrets);
@@ -462,6 +562,37 @@ async fn run(
         .await
     });
     tracing::info!(target: "run", %local, "dashboard listening (waiting to arm — self-check pending)");
+
+    // Shadow observer (BUILD_PLAN 12–13): load the deployed model + identity up
+    // front (fail-fast on a bad path) only when enabled. Held as `Option`s so a
+    // disabled shadow costs nothing and the restart path can respawn it.
+    let shadow_model: Option<Arc<LgbmModel>> = if config.shadow.enable {
+        let model = LgbmModel::load(&config.shadow.model_path).with_context(|| {
+            format!(
+                "loading shadow model {}",
+                config.shadow.model_path.display()
+            )
+        })?;
+        tracing::info!(
+            target: "run", trees = model.num_trees(), features = model.num_features(),
+            path = %config.shadow.model_path.display(), "shadow model loaded"
+        );
+        Some(Arc::new(model))
+    } else {
+        None
+    };
+    let shadow_identity: Option<ModelIdentity> = if config.shadow.enable {
+        Some(
+            ModelIdentity::load(&config.shadow.model_meta_path).with_context(|| {
+                format!(
+                    "loading shadow model meta {}",
+                    config.shadow.model_meta_path.display()
+                )
+            })?,
+        )
+    } else {
+        None
+    };
 
     // The bus + its retained senders (so `bus_rx.recv()` never closes mid-run).
     let (bus_tx, mut bus_rx) = mpsc::channel::<Event>(BUS_CAP);
@@ -502,6 +633,8 @@ async fn run(
     let mut rtds_sup = SupState::new(backoff, 0x52, boot_at);
     let mut binance_sup = SupState::new(backoff, 0xB1, boot_at);
     let mut skew_sup = SupState::new(backoff, 0x53, boot_at);
+    let mut depth_sup = SupState::new(backoff, 0xD1, boot_at);
+    let mut shadow_sup = SupState::new(backoff, 0x5A, boot_at);
 
     // Initial spawns.
     let mut sched_handle = build_discovery(config).map(|service| {
@@ -541,6 +674,51 @@ async fn run(
         bus_tx.clone(),
         shutdown_tx.subscribe(),
     ));
+    // Binance depth20 capture — a supervised but NON-critical side channel (its
+    // death never cancels orders). Only spawned when enabled in config.
+    let mut depth_handle = config.feeds.binance_depth_capture.then(|| {
+        spawn_depth(
+            depth_params(&config.feeds, &config.journal),
+            shutdown_tx.subscribe(),
+        )
+    });
+
+    // Shadow observer channels: a drop-on-full bus-event clone (in) and a
+    // dashboard-update channel (out). Both exist even when disabled (nothing is
+    // sent to them then); the task is spawned only when the model loaded.
+    let (mut shadow_tx, shadow_rx) = mpsc::channel::<Event>(config.shadow.bus_channel_cap.max(1));
+    let (shadow_update_tx, mut shadow_update_rx) = mpsc::channel::<ShadowUpdate>(SHADOW_UPDATE_CAP);
+    let mut shadow_handle = match (&shadow_model, &shadow_identity) {
+        (Some(model), Some(identity)) => Some(spawn_shadow(
+            shadow_params(config),
+            Arc::clone(model),
+            identity.clone(),
+            shadow_rx,
+            shadow_update_tx.clone(),
+            shutdown_tx.subscribe(),
+        )),
+        _ => {
+            drop(shadow_rx); // disabled: never spawned
+            None
+        }
+    };
+
+    // Model-taker decision recorder (fired/suppressed/why → its own gzip series).
+    // Spawned only when the model taker can fire; reuses shadow's writer-channel cap.
+    let mut mt_recorder = if config.model_taker.enable && !config.model_taker.kill_switch {
+        match ModelTakerRecorder::spawn(
+            PathBuf::from(MODEL_TAKER_DIR),
+            config.shadow.record_channel_cap,
+        ) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::warn!(target: "model-taker", error = %e, "decision recorder disabled (dir unwritable)");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Timers.
     let mut sample = interval(SAMPLE_PERIOD);
@@ -567,11 +745,19 @@ async fn run(
             && rtds_handle.is_some()
             && binance_handle.is_some();
 
-        let restart_deadline = [&sched_sup, &clob_sup, &rtds_sup, &binance_sup, &skew_sup]
-            .iter()
-            .filter_map(|s| s.restart_at)
-            .min()
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(3_600));
+        let restart_deadline = [
+            &sched_sup,
+            &clob_sup,
+            &rtds_sup,
+            &binance_sup,
+            &skew_sup,
+            &depth_sup,
+            &shadow_sup,
+        ]
+        .iter()
+        .filter_map(|s| s.restart_at)
+        .min()
+        .unwrap_or_else(|| Instant::now() + Duration::from_secs(3_600));
 
         tokio::select! {
             res = join_opt(&mut sched_handle) => {
@@ -593,6 +779,58 @@ async fn run(
             res = join_opt(&mut skew_handle) => {
                 skew_handle = None;
                 handle_exit(Task::Skew, res, &mut skew_sup, &venue, stable).await;
+            }
+            res = join_opt(&mut depth_handle) => {
+                depth_handle = None;
+                handle_exit(Task::Depth, res, &mut depth_sup, &venue, stable).await;
+            }
+            res = join_opt(&mut shadow_handle) => {
+                shadow_handle = None;
+                handle_exit(Task::Shadow, res, &mut shadow_sup, &venue, stable).await;
+            }
+            // Shadow's dashboard updates. The tile is observation-only; the model
+            // TAKER (when enabled) additionally consumes the same prediction to fire.
+            maybe = shadow_update_rx.recv(), if shadow_handle.is_some() => {
+                if let Some(u) = maybe {
+                    let now = wall_now();
+                    handle.set_shadow(&ShadowTick {
+                        series: u.series,
+                        ts: u.ts,
+                        p_up: u.p_up,
+                        finite_count: u.finite_count,
+                        trained_through_ms: u.model_trained_through_ms,
+                        short_sha: u.model_short_sha.clone(),
+                        staleness_alert_days: u.staleness_alert_days,
+                    }, now);
+                    // Model taker: only when enabled/allowlisted, the order path is
+                    // open (armed + not halted + critical deps alive), and the
+                    // prediction is fresh (a >15 s or missing prediction stands the
+                    // taker down silently — it never blocks quoting or momentum).
+                    if config.model_taker.is_active(u.series) && order_path_open {
+                        let age_ms = now.as_millis() - u.ts.as_millis();
+                        if age_ms <= config.model_taker.max_prediction_age_ms {
+                            const MS_PER_DAY: i64 = 86_400_000;
+                            let model_stale = u.staleness_alert_days > 0
+                                && now.as_millis() - u.model_trained_through_ms
+                                    > u.staleness_alert_days * MS_PER_DAY;
+                            let pred = ModelPrediction {
+                                series: u.series,
+                                window_open_ms: u.window_open_ms,
+                                ts: u.ts,
+                                p_up: u.p_up,
+                                finite_count: u.finite_count,
+                                model_stale,
+                            };
+                            if let Some(out) = risk.on_model_prediction(&pred, &venue, now).await {
+                                drain_risk(&mut risk, &recorder, &handle, now);
+                                if let Some(rec) = mt_recorder.as_ref() {
+                                    rec.record(ModelTakerDecision::build(&pred, &out));
+                                }
+                                handle.set_model_taker(&model_tick(&pred, &out), now);
+                            }
+                        }
+                    }
+                }
             }
             () = tokio::time::sleep_until(restart_deadline) => {
                 let now = Instant::now();
@@ -669,11 +907,55 @@ async fn run(
                     skew_sup.restarted(now);
                     tracing::info!(target: "run", "skew monitor restarted");
                 }
+                // Depth capture only rearms when it was enabled + previously spawned
+                // (a disabled capture leaves `depth_sup.restart_at` unset forever).
+                if depth_handle.is_none() && depth_sup.due(now) {
+                    depth_handle = Some(spawn_depth(
+                        depth_params(&config.feeds, &config.journal),
+                        shutdown_tx.subscribe(),
+                    ));
+                    depth_sup.restarted(now);
+                    tracing::info!(target: "run", "depth capture restarted");
+                }
+                // Shadow observer: a fresh event-clone channel + re-seed the
+                // current windows so it re-registers them immediately.
+                if shadow_handle.is_none()
+                    && shadow_sup.due(now)
+                    && let (Some(model), Some(identity)) = (&shadow_model, &shadow_identity)
+                {
+                    let (tx, rx) = mpsc::channel::<Event>(config.shadow.bus_channel_cap.max(1));
+                    shadow_tx = tx;
+                    shadow_handle = Some(spawn_shadow(
+                        shadow_params(config),
+                        Arc::clone(model),
+                        identity.clone(),
+                        rx,
+                        shadow_update_tx.clone(),
+                        shutdown_tx.subscribe(),
+                    ));
+                    shadow_sup.restarted(now);
+                    for (m, lc) in current_windows.values() {
+                        let _ = shadow_tx.try_send(Event::Window {
+                            market: Arc::clone(m),
+                            lifecycle: *lc,
+                        });
+                    }
+                    tracing::info!(
+                        target: "run", windows = current_windows.len(),
+                        "shadow restarted + re-seeded"
+                    );
+                }
             }
             maybe = bus_rx.recv() => match maybe {
                 Some(event) => {
                     let now = wall_now();
                     recorder.record(&event);
+                    // Observation-only shadow: a drop-on-full clone of every bus
+                    // event. It holds no venue port and no bus_tx, so it can never
+                    // reach a venue or gate order flow (proven by shadow_order_flow).
+                    if config.shadow.enable {
+                        let _ = shadow_tx.try_send(event.clone());
+                    }
                     if let Event::Window { market, lifecycle } = &event {
                         let _ = window_tx.try_send((Arc::clone(market), *lifecycle));
                         cache_window(&mut current_windows, market, *lifecycle);
@@ -823,6 +1105,8 @@ async fn run(
         || rtds_handle.is_some()
         || binance_handle.is_some()
         || skew_handle.is_some()
+        || depth_handle.is_some()
+        || shadow_handle.is_some()
     {
         tokio::select! {
             _ = join_opt(&mut sched_handle), if sched_handle.is_some() => { sched_handle = None; }
@@ -830,6 +1114,8 @@ async fn run(
             _ = join_opt(&mut rtds_handle), if rtds_handle.is_some() => { rtds_handle = None; }
             _ = join_opt(&mut binance_handle), if binance_handle.is_some() => { binance_handle = None; }
             _ = join_opt(&mut skew_handle), if skew_handle.is_some() => { skew_handle = None; }
+            _ = join_opt(&mut depth_handle), if depth_handle.is_some() => { depth_handle = None; }
+            _ = join_opt(&mut shadow_handle), if shadow_handle.is_some() => { shadow_handle = None; }
             maybe = bus_rx.recv(), if bus_open => { bus_open = maybe.is_some(); }
         }
     }
@@ -852,6 +1138,16 @@ async fn run(
             "journal flushed"
         ),
         Err(e) => tracing::warn!(target: "run", error = %e, "journal flush error"),
+    }
+    // Flush + finalize the model-taker decision side channel.
+    if let Some(rec) = mt_recorder.take() {
+        let stats = rec.finish();
+        tracing::info!(
+            target: "model-taker",
+            written = stats.written,
+            dropped = stats.dropped,
+            "decision journal flushed"
+        );
     }
     tracing::info!(target: "run", "bot run shut down cleanly");
     Ok(())
@@ -955,9 +1251,13 @@ async fn handle_venue_event(
             handle.project(Mode::Paper, &event, now);
         }
         VenueEvent::Fill(f) => {
+            // Tag the fill with its driver (§10 PnL-by-driver) while the order is
+            // still owned by its strategy — before its terminal update evicts it.
+            let driver = risk.driver_of(&f.order_id);
             let event = Event::Fill(Arc::clone(f));
             recorder.record(&event);
             handle.project(Mode::Paper, &event, now);
+            handle.record_driver_fill(driver, f, now);
             for effect in inventory.on_event(&event) {
                 publish_inventory_effect(handle, recorder, effect, now);
             }
@@ -1245,6 +1545,53 @@ fn spawn_skew(
     })
 }
 
+/// Spawns the Binance depth20 capture (research-only, off the bus). It reconnects
+/// internally forever; the supervisor restarts it if it exits, without a
+/// cancel-all (it never reaches a venue).
+fn spawn_depth(params: DepthCaptureParams, shutdown_rx: watch::Receiver<bool>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        match depth_capture::run(params, WsTransport, wall_now, shutdown_rx, None).await {
+            Ok(stats) => tracing::info!(
+                target: "run", task = "depth",
+                frames = stats.frames_written, files = stats.files,
+                reconnects = stats.reconnects, dropped = stats.frames_dropped,
+                "depth capture stopped"
+            ),
+            Err(error) => {
+                tracing::error!(target: "run", task = "depth", %error, "depth capture failed");
+            }
+        }
+    })
+}
+
+/// Spawns the observation-only shadow observer (BUILD_PLAN 12–13). It runs its
+/// own Binance depth20 feed over [`WsTransport`], samples every 5 s per active
+/// window, journals predictions, and pushes updates to the dashboard — holding
+/// no venue port and no `bus_tx`, so it cannot reach a venue or stall the engine.
+fn spawn_shadow(
+    params: shadow::ShadowParams,
+    model: Arc<LgbmModel>,
+    identity: ModelIdentity,
+    bus_rx: mpsc::Receiver<Event>,
+    update_tx: mpsc::Sender<ShadowUpdate>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let stats = shadow::run(
+            params,
+            model,
+            identity,
+            bus_rx,
+            update_tx,
+            WsTransport,
+            wall_now,
+            shutdown_rx,
+        )
+        .await;
+        let _ = stats; // logged inside shadow::run
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
@@ -1263,6 +1610,10 @@ mod tests {
         let p = risk_params(&c);
         // Spot-check the explicit mappings.
         assert_eq!(p.feed_staleness_ms, c.risk.feed_staleness_ms.as_millis());
+        assert_eq!(
+            p.feed_staleness_grace_ms,
+            c.risk.feed_staleness_grace_ms.as_millis()
+        );
         assert_eq!(p.daily_stop_loss, c.risk.daily_stop_loss);
         assert_eq!(p.max_open_notional, c.risk.max_open_notional);
         assert_eq!(p.error_breaker_max_errors, c.risk.error_breaker_max_errors);
@@ -1296,6 +1647,18 @@ mod tests {
             c.engine.defaults.late_taker_price_cap
         );
         assert!(p.quoter_enabled && p.momentum_enabled && p.late_window_enabled);
+        // Model taker off by default; the fortress map is the default precedence.
+        assert!(!p.model_enabled);
+        assert_eq!(p.arbitration_window_ms, c.model_taker.arbitration_window_ms);
+        assert_eq!(
+            p.series_precedence.get(&core_types::Asset::Btc),
+            Some(&TakerId::Momentum)
+        );
+        assert_eq!(
+            p.series_precedence.get(&core_types::Asset::Eth),
+            Some(&TakerId::Model)
+        );
+        assert_eq!(p.model, model_taker_params(&c.model_taker));
         // The strongest anti-drift pin: the committed defaults must map exactly
         // onto the engine defaults, so the whole bundle equals RiskParams::default().
         assert_eq!(p, RiskParams::default());

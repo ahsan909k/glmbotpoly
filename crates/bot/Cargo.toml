@@ -39,6 +39,7 @@ engine = { path = "../engine" }
 journal = { path = "../journal" }
 analytics = { path = "../analytics" }
 dashboard = { path = "../dashboard" }
+shadow = { path = "../shadow" }
 anyhow = { workspace = true }
 rust_decimal = { workspace = true }
 # `bot control` is an HTTP client to the running dashboard's control API.
@@ -46,6 +47,11 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Binance depth20@100ms capture (`depth_capture`): gzip the per-day segments and
+# derive the UTC calendar day for rotation. Both already transitive via `journal`;
+# named directly here because `bot` writes the depth series itself.
+flate2 = { workspace = true }
+time = { workspace = true }
 # net + time so the current-thread runtime can enable the IO/timer drivers
 # reqwest needs; sync (channels) + signal (ctrl-c) + macros (select!) for the
 # scheduler smoke loop.
@@ -58,3 +64,7 @@ tracing-subscriber = { workspace = true }
 # `test-util` adds tokio's paused-clock (`start_paused`) for the venue-parity
 # golden tests; the other features mirror the lib's so the test target builds.
 tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "test-util"] }
+# The scripted fake transport for the `depth_capture` unit tests. A dev-dep, so
+# the `fake` feature is enabled only for `bot`'s test builds (resolver v2), never
+# in production.
+feed-util = { path = "../feed-util", features = ["fake"] }

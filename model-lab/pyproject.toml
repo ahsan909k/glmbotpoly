@@ -16,6 +16,19 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest==8.3.4"]
+# The opt-in second challenger (gradient-boosted trees). Compiled + pulls scipy —
+# kept out of the core so the base install stays a pure-wheel scientific stack.
+gbt = ["lightgbm==4.6.0", "scipy==1.18.0"]
+# The opt-in XGBoost challenger for the model bake-off (model_lab/lib/xgb.py). scipy is
+# already pinned by the gbt extra. See model_lab.challenger_bakeoff.
+xgb = ["xgboost==2.1.4"]
+# Convenience meta-extra: everything the challenger bake-off needs (GBT + XGBoost).
+# The MLP and logistic-regression challengers are pure numpy — no extra required.
+bakeoff = ["lightgbm==4.6.0", "scipy==1.18.0", "xgboost==2.1.4"]
+# The opt-in Telonex trial pull — whole-file, bit-identical zstd compression of the
+# purchased vendor parquet. Kept out of the core (pyarrow's parquet-zstd can't do a
+# bit-identical whole-file roundtrip). See model_lab.telonex_ingest / .telonex_validate.
+telonex = ["zstandard==0.23.0"]
 
 [tool.setuptools.packages.find]
 include = ["model_lab*"]

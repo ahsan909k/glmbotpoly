@@ -53,6 +53,15 @@ pub struct RunConfig {
     /// Cadence of the risk manager's periodic tick (the §11 staleness / sanity /
     /// error-window recomputes and the quoter's debounced converge).
     pub risk_tick_ms: DurationMs,
+    /// Replay the whole journal at startup to rebuild prior inventory/order
+    /// state (`boot::rebuild_and_log`). When `true` (default) the bot reads
+    /// every committed segment before it binds and trades. That rebuilt state is
+    /// currently **unused** (the live-seed wiring is a documented follow-up), so
+    /// on a large journal this is pure startup latency — a multi-GB journal can
+    /// take many minutes to replay before anything happens. Set `false` to skip
+    /// the replay and start immediately; recording to `journal.dir` is
+    /// unaffected (the recorder keeps appending new segments as always).
+    pub replay_journal_on_start: bool,
 }
 
 impl Default for RunConfig {
@@ -68,6 +77,7 @@ impl Default for RunConfig {
             stable_secs: 60,
             rss_report_secs: 60,
             risk_tick_ms: DurationMs::from_millis(500),
+            replay_journal_on_start: true,
         }
     }
 }
@@ -124,6 +134,11 @@ mod tests {
         let mut v = Violations::default();
         RunConfig::default().validate_into(&mut v);
         assert!(v.into_result().is_ok());
+    }
+
+    #[test]
+    fn replay_defaults_on_to_preserve_prior_behavior() {
+        assert!(RunConfig::default().replay_journal_on_start);
     }
 
     #[test]

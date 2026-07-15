@@ -79,12 +79,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from . import features as feat
-from .config import Paths, resolve_paths, stage_parser
+from .config import Paths, _in_bounds, resolve_bounds, resolve_paths, stage_parser
 from .io import binance_archive as ba
 from .io import depth as depth_io
 from .io import journal as jio
 from .ingest import DEPTH_COLS, TICK_COLS
 from .lib import math as lm
+from .lib import procmem
 
 # --- defaults ---------------------------------------------------------------
 DEFAULT_GRID_SECS = 15
@@ -134,9 +135,10 @@ COLUMN_SPEC: list[tuple[str, str, str, str]] = [
     ("realized_vol", "float64", "feature", "Practical EWMA std of 1s returns (halflife 60s), as-of."),
     ("sigma_1s", "float64", "feature", "Engine σ_1s EWMA (`crates/model::vol`), as-of; NaN during warmup."),
     ("chainlink", "float64", "feature", "Chainlink price (LOCF ≤ sample), USD; NaN for `binance_proxy` rows (no Chainlink feed)."),
-    ("basis_bps", "float64", "feature", "`1e4·(chainlink/mid − 1)` — Chainlink-minus-Binance basis, as-of; NaN for `binance_proxy` rows."),
-    ("log_s_k", "float64", "feature", "Moneyness `log(mid/strike)` — mid as-of, strike from open."),
-    ("z", "float64", "feature", "`log_s_k / (σ_1s·√τ)`, clipped ±39 (all inputs as-of)."),
+    ("basis_bps", "float64", "feature", "`1e4·(chainlink/mid − 1)` — instantaneous Chainlink-minus-Binance basis, as-of; NaN for `binance_proxy` rows."),
+    ("basis_ewma", "float64", "feature", "Rolling log basis `EWMA(ln(chainlink/mid))` (halflife 120s), as-of — the offline reconstruction of the engine's basis tracker. Added to `log_s_k` in `z` so the Binance mid is projected onto the Chainlink strike's feed. NaN ⇒ zero correction for `binance_proxy` rows (same feed)."),
+    ("log_s_k", "float64", "feature", "Raw moneyness `log(mid/strike)` — mid as-of, strike from open (basis correction applied in `z`, not here)."),
+    ("z", "float64", "feature", "Basis-corrected `(log_s_k + basis_ewma) / (σ_1s·√τ)`, clipped ±39 (all inputs as-of; basis_ewma treated as 0 on `binance_proxy`). One consistent definition on both sources."),
     ("p_up_model", "float64", "feature", "Reconstructed engine `p_up = Φ(z)` (as-of)."),
     ("imbalance", "float64", "feature", "Order-book imbalance from depth, as-of (NaN if no depth; always NaN for `binance_proxy`)."),
     ("microprice", "float64", "feature", "Size-weighted microprice from depth, as-of."),
@@ -183,43 +185,93 @@ def _in_scope(series: str, series_filter: tuple[str, ...] | None) -> bool:
 
 # --- journal → frames -------------------------------------------------------
 def _read_journal(
-    paths: Paths, series_filter: tuple[str, ...] | None
+    paths: Paths,
+    series_filter: tuple[str, ...] | None,
+    *,
+    since_ms: int | None = None,
+    until_ms: int | None = None,
+    stream: bool = True,
 ) -> tuple[pd.DataFrame, dict, dict, dict, dict]:
     """One pass over the journal. Returns ``(ticks_df, win_meta, outcome_resolved,
     outcome_settle, top_ts_by_token)``.
 
-    ``ticks_df`` has the ``ingest.TICK_COLS`` shape (every ``price_tick``, all
-    sources/assets). ``win_meta[(series, open)] = {close_time, up_token,
-    down_token}`` for in-scope windows; outcomes from the ``Resolved`` lifecycle
-    (preferred) and ``settlement`` (fallback). ``top_ts_by_token[token] = [ts…]``
-    are the ``top_of_book`` timestamps used for the live-coverage flag.
+    ``ticks_df`` has the ``ingest.TICK_COLS`` shape. ``win_meta[(series, open)] =
+    {close_time, up_token, down_token}`` for in-scope windows; outcomes from the
+    ``Resolved`` lifecycle (preferred) and ``settlement`` (fallback).
+    ``top_ts_by_token[token] = [ts…]`` are the ``top_of_book`` timestamps used for the
+    live-coverage flag.
+
+    **Streaming (``stream=True``, the default): bounded memory.** Instead of
+    materializing every raw tick (~100/s → tens of GB on a multi-day journal), the
+    pass keeps only what the downstream feature grid + strike reconstruction actually
+    read — ``BinanceDirect``/``Mid`` collapsed to **per-second bars** (the last tick
+    per second, matching :func:`features._bars`) and **all** ``ChainlinkRtds`` ticks
+    raw (~1/s, needed exactly for the strike). ``BinanceDirect``/``Trade`` and
+    ``BinanceRtds`` ticks — read by nothing downstream — are dropped. The resulting
+    ``ticks_df`` yields **byte-identical** dataset/short_horizon parquets to the
+    full-tick path (proven by the diff test), at ~40× less memory that grows with the
+    time *range*, not the tick rate. ``stream=False`` keeps every raw tick (the
+    original behaviour) — used only to prove the equivalence.
+
+    ``since_ms`` / ``until_ms`` bound which records are processed by time (ticks by
+    exchange/local ts, windows/settlements by open time, books by their ts), applied
+    identically in both modes.
     """
-    cols: dict[str, list] = {c: [] for c in TICK_COLS}
     win_meta: dict[tuple[str, int], dict] = {}
     outcome_resolved: dict[tuple[str, int], str] = {}
     outcome_settle: dict[tuple[str, int], str] = {}
     top_ts_by_token: dict[str, list[int]] = defaultdict(list)
 
+    # Streaming accumulators: per-(asset, sec) last BinanceDirect/Mid tick, and all
+    # ChainlinkRtds ticks raw. Non-streaming: every tick, every field (original).
+    mid_last: dict[tuple[str, int], list] = {}  # -> [ts_local_ms, source, asset, kind, value, ts_exchange, ts_local, _ts]
+    chain_cols: dict[str, list] = {c: [] for c in TICK_COLS}
+    cols: dict[str, list] = {c: [] for c in TICK_COLS}
+
     for rec in jio.read_records(paths.journal_dir):
         kind = rec.get("type")
         if kind == "price_tick":
-            cols["ts_local_ms"].append(rec.get("ts_local_ms"))
-            cols["source"].append(rec.get("source"))
-            cols["asset"].append(jio.asset_key(rec.get("asset")))
-            cols["kind"].append(rec.get("kind"))
-            cols["value"].append(jio.to_float(rec.get("value")))
-            cols["ts_exchange"].append(rec.get("ts_exchange"))
-            cols["ts_local"].append(rec.get("ts_local"))
+            te, tl = rec.get("ts_exchange"), rec.get("ts_local")
+            _ts = te if te is not None else tl
+            if not _in_bounds(int(_ts) if _ts is not None else None, since_ms, until_ms):
+                continue
+            if not stream:
+                cols["ts_local_ms"].append(rec.get("ts_local_ms"))
+                cols["source"].append(rec.get("source"))
+                cols["asset"].append(jio.asset_key(rec.get("asset")))
+                cols["kind"].append(rec.get("kind"))
+                cols["value"].append(jio.to_float(rec.get("value")))
+                cols["ts_exchange"].append(te)
+                cols["ts_local"].append(tl)
+                continue
+            src, k = rec.get("source"), rec.get("kind")
+            if src == "BinanceDirect" and k == "Mid" and _ts is not None:
+                asset = jio.asset_key(rec.get("asset"))
+                its = int(_ts)
+                key = (asset, its // 1000)
+                prev = mid_last.get(key)
+                if prev is None or its >= prev[7]:  # keep the last max-ms tick in the second
+                    mid_last[key] = [rec.get("ts_local_ms"), src, asset, k,
+                                     jio.to_float(rec.get("value")), te, tl, its]
+            elif src == "ChainlinkRtds":  # kept raw — the strike needs exact ts, ~1/s
+                chain_cols["ts_local_ms"].append(rec.get("ts_local_ms"))
+                chain_cols["source"].append(src)
+                chain_cols["asset"].append(jio.asset_key(rec.get("asset")))
+                chain_cols["kind"].append(k)
+                chain_cols["value"].append(jio.to_float(rec.get("value")))
+                chain_cols["ts_exchange"].append(te)
+                chain_cols["ts_local"].append(tl)
+            # else: BinanceDirect/Trade, BinanceRtds/* — read by nothing downstream, dropped.
         elif kind == "top_of_book":
             top = rec.get("top") or {}
             ts = top.get("ts")
             token = rec.get("token_id")
-            if token is not None and ts is not None:
+            if token is not None and ts is not None and _in_bounds(int(ts), since_ms, until_ms):
                 top_ts_by_token[token].append(int(ts))
         elif kind == "window":
             market = rec.get("market") or {}
             key = jio.window_key(market.get("window"))
-            if key == ("", 0) or not _in_scope(key[0], series_filter):
+            if key == ("", 0) or not _in_scope(key[0], series_filter) or not _in_bounds(key[1], since_ms, until_ms):
                 continue
             if key not in win_meta:
                 tokens = market.get("tokens") or {}
@@ -235,13 +287,20 @@ def _read_journal(
                     outcome_resolved[key] = outcome
         elif kind == "settlement":
             key = jio.window_key(rec.get("window"))
-            if key == ("", 0) or not _in_scope(key[0], series_filter):
+            if key == ("", 0) or not _in_scope(key[0], series_filter) or not _in_bounds(key[1], since_ms, until_ms):
                 continue
             outcome = rec.get("outcome")
             if outcome in ("Up", "Down"):
                 outcome_settle[key] = outcome
 
-    ticks_df = pd.DataFrame(cols, columns=TICK_COLS)
+    if stream:
+        mid_df = (pd.DataFrame([r[:7] for r in mid_last.values()], columns=TICK_COLS)
+                  if mid_last else pd.DataFrame(columns=TICK_COLS))
+        chain_df = pd.DataFrame(chain_cols, columns=TICK_COLS)
+        ticks_df = (pd.concat([mid_df, chain_df], ignore_index=True)
+                    if (len(mid_df) or len(chain_df)) else pd.DataFrame(columns=TICK_COLS))
+    else:
+        ticks_df = pd.DataFrame(cols, columns=TICK_COLS)
     return ticks_df, win_meta, outcome_resolved, outcome_settle, top_ts_by_token
 
 
@@ -381,13 +440,21 @@ def build_feature_grid(ticks_df: pd.DataFrame, depth_df: pd.DataFrame, asset: st
 
 def _derive_asof_features(df: pd.DataFrame) -> pd.DataFrame:
     """Add the derived as-of features ``log_s_k, z, p_up_model`` from the matched
-    feature bar (``mid``, ``sigma_1s`` — as-of) and per-window scalars (``strike``
-    captured at open, ``tau_secs`` known at sample time). No future data is read."""
+    feature bar (``mid``, ``sigma_1s``, ``basis_ewma`` — as-of) and per-window scalars
+    (``strike`` captured at open, ``tau_secs`` known at sample time). No future data
+    is read.
+
+    ``z`` is **basis-corrected**: it adds the rolling log basis ``basis_ewma``
+    (``EWMA(ln(chainlink/mid))``) to the raw moneyness ``log(mid/strike)`` so the fast
+    Binance mid is projected onto the Chainlink strike's feed. On ``binance_proxy``
+    rows (same feed) ``basis_ewma`` is NaN and treated as 0, so ``z`` reduces to the
+    uncorrected moneyness — one consistent definition on both sources."""
     df = df.copy()
+    basis = df["basis_ewma"].fillna(0.0) if "basis_ewma" in df.columns else 0.0
     with np.errstate(divide="ignore", invalid="ignore"):
         df["log_s_k"] = np.log(df["mid"] / df["strike"])
         sigma_tau = df["sigma_1s"] * np.sqrt(df["tau_secs"])
-        z = (df["log_s_k"] / sigma_tau).clip(-lm.Z_CLAMP, lm.Z_CLAMP)
+        z = ((df["log_s_k"] + basis) / sigma_tau).clip(-lm.Z_CLAMP, lm.Z_CLAMP)
     df["z"] = z
     df["p_up_model"] = lm.norm_cdf(z.to_numpy(dtype=float))
     return df
@@ -406,7 +473,7 @@ def _attach_features(
     nulled and ``feature_asof_ts_ms`` set to NA — strictly more conservative, never
     a forward read."""
     value_cols = ["mid", "ret", "realized_vol", "sigma_1s", "chainlink",
-                  "basis_bps", "imbalance", "microprice", "spread", "depth_mid"]
+                  "basis_bps", "basis_ewma", "imbalance", "microprice", "spread", "depth_mid"]
     if grid.empty:
         out = samples.copy()
         for col in value_cols:
@@ -849,12 +916,19 @@ def dataset(
     strike_tolerance_secs: float = DEFAULT_STRIKE_TOLERANCE_SECS,
     max_feature_staleness_secs: int = DEFAULT_MAX_FEATURE_STALENESS_SECS,
     include_history: bool = True,
+    since_ms: int | None = None,
+    until_ms: int | None = None,
+    stream: bool = True,
 ) -> dict:
     """Builds the window-aligned training dataset — the journal (Chainlink) windows
     plus, when ``include_history`` and an aggTrades store is present, the historical
     Binance-proxy windows streamed **month by month**. Writes ``out/dataset.parquet``
     + ``out/dataset/{SCHEMA.md, metadata.json}``; returns ``{params, counts,
-    integrity, history, journal_subset}``."""
+    integrity, history, journal_subset}``.
+
+    The journal first pass is streaming/bounded (:func:`_read_journal`, ``stream``);
+    ``since_ms``/``until_ms`` bound the journal by time. ``stream=False`` runs the old
+    full-tick pass (for the equivalence proof)."""
     paths.ensure_out()
     out_dir = paths.out_dir / "dataset"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -868,12 +942,16 @@ def dataset(
         "strike_tolerance_secs": float(strike_tolerance_secs),
         "max_feature_staleness_secs": int(max_feature_staleness_secs),
         "include_history": bool(include_history),
+        "since_ms": since_ms,
+        "until_ms": until_ms,
+        "stream": bool(stream),
     }
     strike_tol_ms = strike_tolerance_secs * 1000.0
     max_staleness_ms = max_feature_staleness_secs * 1000
 
     # --- journal (Chainlink strike/outcome) — the unchanged path -------------
-    ticks_df, win_meta, res, settle, top_ts = _read_journal(paths, series)
+    ticks_df, win_meta, res, settle, top_ts = _read_journal(
+        paths, series, since_ms=since_ms, until_ms=until_ms, stream=stream)
     jwindows = _windows_frame(win_meta, res, settle)
     journal_keys: set[tuple[str, int]] = (
         set(zip(jwindows["series"], jwindows["window_open_ms"].astype("int64").tolist()))
@@ -1028,6 +1106,7 @@ def dataset(
         "series": sorted(series_seen),
         "history": history,
         "journal_subset": journal_subset,
+        "peak_rss_mb": procmem.peak_rss_mb(),
     }
     _write_metadata(out_dir, result)
     _write_schema(out_dir)
@@ -1162,11 +1241,17 @@ def main(argv: list[str] | None = None) -> int:
                         help=f"null as-of features older than this (recording-gap relics) (default {DEFAULT_MAX_FEATURE_STALENESS_SECS})")
     parser.add_argument("--no-history", action="store_true",
                         help="journal-only: skip the Binance aggTrades historical proxy windows")
+    parser.add_argument("--no-stream", action="store_true",
+                        help="read every raw tick into memory (the pre-streaming path; may OOM on a large journal) — for debugging / equivalence checks")
     args = parser.parse_args(argv)
     paths = resolve_paths(args)
+    since_ms, until_ms = resolve_bounds(args)
     print(f"[dataset] journal={paths.journal_dir}")
     print(f"[dataset] hist   ={paths.hist_dir} (history {'off' if args.no_history else 'on'})")
     print(f"[dataset] out    ={paths.table('dataset')}")
+    if since_ms is not None or until_ms is not None:
+        print(f"[dataset] bounds : since={args.since} until={args.until} "
+              f"(stream={'off' if args.no_stream else 'on'})")
 
     result = dataset(
         paths,
@@ -1178,6 +1263,9 @@ def main(argv: list[str] | None = None) -> int:
         strike_tolerance_secs=args.strike_tolerance_secs,
         max_feature_staleness_secs=args.max_feature_staleness_secs,
         include_history=not args.no_history,
+        since_ms=since_ms,
+        until_ms=until_ms,
+        stream=not args.no_stream,
     )
     c = result["counts"]
     print(f"[dataset] {c['windows']:,} windows -> {c['samples']:,} samples "
@@ -1207,6 +1295,7 @@ def main(argv: list[str] | None = None) -> int:
               f"(run `python -m model_lab.hist` to download) — journal-only.")
     print(f"[dataset] journal subset: {js['windows']:,} windows / {js['samples']:,} samples, "
           f"unchanged (dedup dropped {js['dedup_collisions']:,} colliding proxy windows)")
+    procmem.report_peak_rss("dataset", result.get("peak_rss_mb"), args.max_rss_mb)
     print(f"[dataset] wrote {paths.table('dataset').name} + dataset/SCHEMA.md, metadata.json")
     if c["samples"] == 0:
         print("[dataset] WARNING: no samples produced — check --journal-dir / --series.")

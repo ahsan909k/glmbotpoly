@@ -261,6 +261,17 @@ th.col-time, td.col-time { text-align: left; }
 @media (min-width: 640px) { .hl-tile.big { grid-column: auto; } }
 .hl-tile.big span { font-size: 34px; }
 
+/* account identity: Cash + Open positions = Equity */
+.account-id { display: flex; align-items: stretch; gap: 10px; flex-wrap: wrap; }
+.acct-card { flex: 1 1 0; min-width: 120px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+.acct-card label { color: var(--muted); font-size: 12px; }
+.acct-card span { font-size: 22px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.acct-card small { color: var(--muted); font-size: 10px; }
+.acct-card.equity { border-color: rgba(120,160,255,.5); background: rgba(120,160,255,.07); }
+.acct-op { display: flex; align-items: center; font-size: 24px; font-weight: 700; color: var(--muted); }
+.acct-awaiting { flex-basis: 100%; color: var(--muted); font-size: 12px; padding-top: 2px; }
+.acct-awaiting::before { content: "⏳ "; }
+
 /* status sentence banner */
 .status-banner { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-radius: var(--radius); border: 1px solid var(--line); background: var(--panel); font-size: 15px; font-weight: 600; }
 .status-dot { width: 12px; height: 12px; border-radius: 50%; background: var(--muted); flex: 0 0 auto; }
@@ -310,3 +321,6 @@ th.col-time, td.col-time { text-align: left; }
 .tag { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 700; }
 .tag.pair { background: rgba(46,204,113,.15); color: var(--pos); }
 .tag.stuck { background: rgba(240,169,59,.15); color: var(--warn); }
+
+/* shadow model observer tile (observation only) */
+.card.shadow .shadow-meta { font-size: 12px; margin: 2px 0 10px; }

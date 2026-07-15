@@ -216,6 +216,9 @@ fn params() -> PaperParams {
             jitter_ms: core_types::DurationMs::ZERO,
         },
         rng_seed: Some(1),
+        // Golden VenueEvent parity is defined against network-latency-only fill timing; the
+        // venue taker delay is exercised separately (venue-paper unit test), so zero it here.
+        venue_taker_delay_ms: core_types::DurationMs::ZERO,
         ..PaperParams::default()
     }
 }

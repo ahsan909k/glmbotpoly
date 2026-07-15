@@ -76,7 +76,38 @@ def _img_tag(b64: str | None, alt: str) -> str:
     return f"<img alt='{alt}' src='data:image/png;base64,{b64}'/>"
 
 
-def build_html(validation: dict, research: dict) -> str:
+def _evaluation_section(evaluation: dict) -> str:
+    """A compact model-vs-benchmark headline folded in from the evaluation harness."""
+    if not evaluation:
+        return ("<h2>Model evaluation</h2><p class='muted'>No evaluation metrics yet — run "
+                "<code>python -m model_lab.evaluate</code> (the single source of truth for scoring).</p>")
+    day = evaluation.get("verdict_table", {}).get("day", {})
+    rows = day.get("rows", [])
+    stab = day.get("stability", {})
+
+    def allrow(bench: str) -> dict:
+        return next((r for r in rows if r.get("benchmark") == bench and r.get("period") == "ALL"), {})
+
+    def f(v) -> str:
+        return "n/a" if v is None or (isinstance(v, float) and v != v) else (f"{v:.4f}" if isinstance(v, float) else str(v))
+
+    lines = []
+    for bench in ("formula", "market"):
+        a = allrow(bench)
+        s = stab.get(bench, {})
+        lines.append(
+            f"<tr><th>vs {bench}</th><td>Brier {f(a.get('model_brier'))} vs {f(a.get('bench_brier'))}</td>"
+            f"<td>Δ {f(a.get('brier_improve_pct'))}%</td>"
+            f"<td>win rate {f(s.get('win_rate'))} over {s.get('periods_evaluated', 0)} day(s)</td></tr>"
+        )
+    return f"""<h2>Model evaluation</h2>
+<p>{evaluation.get('verdict', '')}</p>
+<table>{''.join(lines)}</table>
+<p class="muted">Full standardized verdict table (per-period, both benchmarks) in
+<code>out/evaluate/report.html</code>.</p>"""
+
+
+def build_html(validation: dict, research: dict, evaluation: dict | None = None) -> str:
     cal = validation.get("calibration", {})
     phi = validation.get("phi_identity", {})
     sig = validation.get("sigma_reproduction", {})
@@ -126,6 +157,8 @@ def build_html(validation: dict, research: dict) -> str:
  <tr><th>AUC(momentum → up) [baseline]</th><td>{g(pooled, 'auc_momentum_baseline')}</td></tr>
 </table>
 {ic_img}
+
+{_evaluation_section(evaluation or {})}
 </body></html>
 """
 
@@ -134,7 +167,8 @@ def report(paths: Paths) -> str:
     """Runs the report stage; returns the output HTML path as a string."""
     validation = _load_json(paths.out_dir / "validation" / "metrics.json")
     research_metrics = _load_json(paths.out_dir / "research" / "metrics.json")
-    html = build_html(validation, research_metrics)
+    evaluation = _load_json(paths.out_dir / "evaluate" / "metrics.json")
+    html = build_html(validation, research_metrics, evaluation)
     out = paths.out_dir / "report.html"
     out.write_text(html, encoding="utf-8")
     return str(out)

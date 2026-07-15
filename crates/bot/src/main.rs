@@ -19,6 +19,7 @@ mod compare;
 mod control;
 mod control_cli;
 mod dashboard;
+mod depth_capture;
 mod discover;
 mod fair;
 mod feed;
@@ -26,6 +27,7 @@ mod ladder;
 mod latency;
 mod live;
 mod model_runtime;
+mod model_taker_record;
 mod paper;
 mod record;
 #[cfg(feature = "replay")]

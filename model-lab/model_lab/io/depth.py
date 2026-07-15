@@ -24,6 +24,8 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 
 def depth_paths(depth_dir: Path) -> list[Path]:
     """All ``binance-depth20-*.jsonl.gz`` day-files, chronological order."""
@@ -116,6 +118,66 @@ def read_depth_rows(depth_dir: Path) -> Iterator[dict[str, Any]]:
             # Unreadable file, or a partial trailing deflate member from a
             # still-being-written (live-capture) file: yield the decoded prefix and
             # move on (mirrors the journal reader).
+            continue
+
+
+def _level_arrays(raw: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Parse one raw side (``[[price, size], …]``, best first) into ``(prices,
+    sizes)`` float arrays. Malformed levels are skipped; order is preserved."""
+    px: list[float] = []
+    sz: list[float] = []
+    if isinstance(raw, list):
+        for level in raw:
+            try:
+                p, q = float(level[0]), float(level[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            px.append(p)
+            sz.append(q)
+    return np.asarray(px, dtype=float), np.asarray(sz, dtype=float)
+
+
+def read_depth_levels(depth_dir: Path) -> Iterator[dict[str, Any]]:
+    """Yields the **full multi-level ladder** for every parseable depth frame::
+
+        {"recv_ms": int, "asset": "btc"/"eth",
+         "bid_px": np.ndarray, "bid_sz": np.ndarray,   # best (highest) first
+         "ask_px": np.ndarray, "ask_sz": np.ndarray}   # best (lowest) first
+
+    A separate reader from :func:`read_depth_rows` (which collapses each frame to
+    top-of-book aggregates), for the microstructure features that need the whole
+    20-level book — multi-level imbalance, depth slopes. Deliberately leaves
+    :func:`parse_frame` / :func:`read_depth_rows` / ``DEPTH_COLS`` untouched, so
+    ``ingest`` / ``dataset`` / ``feature_set`` are unaffected. Same resilience to a
+    truncated trailing gzip member of a still-being-written live capture."""
+    for path in depth_paths(depth_dir):
+        try:
+            with gzip.open(path, "rt", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        break
+                    data = obj.get("data")
+                    if not isinstance(data, dict):
+                        continue
+                    bid_px, bid_sz = _level_arrays(data.get("bids"))
+                    ask_px, ask_sz = _level_arrays(data.get("asks"))
+                    if bid_px.size == 0 or ask_px.size == 0:
+                        continue
+                    if bid_px[0] <= 0.0 or ask_px[0] <= 0.0:
+                        continue
+                    symbol = str(obj.get("stream", "")).split("@", 1)[0]
+                    yield {
+                        "recv_ms": int(obj.get("recv_ms", 0)),
+                        "asset": _symbol_asset(symbol),
+                        "bid_px": bid_px, "bid_sz": bid_sz,
+                        "ask_px": ask_px, "ask_sz": ask_sz,
+                    }
+        except (OSError, EOFError, zlib.error):
             continue
 
 

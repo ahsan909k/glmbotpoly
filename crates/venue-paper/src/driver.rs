@@ -475,4 +475,83 @@ mod tests {
         assert_eq!(wallet.collateral_total, Dollars::new(dec!(9995.10)));
         venue.shutdown();
     }
+
+    /// Paper settlement smoke over the full venue: buy a side, resolve the window,
+    /// and confirm the account equity converges to `starting + realized PnL` with
+    /// positions closed (§9 — the money is back in the wallet at resolution).
+    #[tokio::test(start_paused = true)]
+    async fn settlement_returns_cash_equity_equals_starting_plus_realized() {
+        let start = tokio::time::Instant::now();
+        let now_fn = move || {
+            let elapsed = i64::try_from(start.elapsed().as_millis()).unwrap_or(0);
+            TimestampMs::from_millis(BASE_MS + elapsed)
+        };
+        let mut venue = PaperVenue::spawn(params(), now_fn);
+        let mut rx = venue.take_event_rx().expect("event rx");
+
+        let starting = venue.balances().await.expect("balances").collateral_total;
+
+        venue
+            .on_bus_event(&Event::Window {
+                market: market(),
+                lifecycle: WindowLifecycle::Open,
+            })
+            .await;
+        // Empty bid at our price → queue 0, so the print fills us fully.
+        venue
+            .on_bus_event(&book_event(
+                &[(dec!(0.49), dec!(0))],
+                &[(dec!(0.51), dec!(50))],
+                BASE_MS,
+            ))
+            .await;
+
+        // Place + activate a maker BUY of 100 Up @ 0.49 (cost $49).
+        let order = NewOrder {
+            qty: core_types::OrderQty::Shares(sz(dec!(100))),
+            ..buy_gtc()
+        };
+        let _ = venue.place(&order).await.expect("accepted");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = rx.recv().await.expect("open update");
+
+        // Fill fully via a sell-aggressor print.
+        venue
+            .on_bus_event(&Event::LastTrade {
+                token_id: Arc::new(token()),
+                price: px(dec!(0.49)),
+                size: sz(dec!(100)),
+                side: Side::Sell,
+                ts: TimestampMs::from_millis(BASE_MS + 250),
+            })
+            .await;
+        let _ = rx.recv().await.expect("fill");
+        let _ = rx.recv().await.expect("fill update");
+
+        // Cash after the buy = starting − 49.
+        let after_buy = venue.balances().await.expect("balances").collateral_total;
+        assert_eq!(after_buy, starting - Dollars::new(dec!(49)));
+
+        // Resolve Up: 100 winning shares pay $1 each, positions close, cash returns.
+        venue
+            .on_bus_event(&Event::Window {
+                market: market(),
+                lifecycle: WindowLifecycle::Resolved {
+                    outcome: Outcome::Up,
+                },
+            })
+            .await;
+
+        let final_bal = venue.balances().await.expect("balances");
+        // realized PnL = payout(100) − cost(49) = 51.
+        assert_eq!(
+            final_bal.collateral_total,
+            starting + Dollars::new(dec!(51))
+        );
+        assert!(
+            final_bal.positions.is_empty(),
+            "positions close at settlement"
+        );
+        venue.shutdown();
+    }
 }

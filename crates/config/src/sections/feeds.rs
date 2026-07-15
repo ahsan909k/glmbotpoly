@@ -55,6 +55,13 @@ pub struct FeedsConfig {
     /// far looser than the top-of-book threshold or a quiet-but-healthy
     /// stream flaps Stale/Recovered on the bus.
     pub binance_trade_stale_after_ms: DurationMs,
+    /// Capture Binance `depth20@100ms` L2 depth for BTCUSDT + ETHUSDT alongside
+    /// the current streams (research data for the offline `model-lab`). A
+    /// self-contained side channel over its own Binance WebSocket connection,
+    /// written to the separate `[journal] depth_dir` gzip series — it never
+    /// touches the event bus or the engine. Enabled for `bot record` and
+    /// `bot run`; set `false` to disable capture.
+    pub binance_depth_capture: bool,
     /// CLOB market-channel keepalive PING interval. The docs require a PING
     /// every 10 s; the default halves it (latency-harness precedent), and
     /// values above 10000 ms are rejected.
@@ -97,6 +104,7 @@ impl Default for FeedsConfig {
             rtds_stale_after_ms: DurationMs::from_millis(5_000),
             binance_stale_after_ms: DurationMs::from_millis(2_500),
             binance_trade_stale_after_ms: DurationMs::from_millis(30_000),
+            binance_depth_capture: true,
             clob_ping_interval_ms: DurationMs::from_millis(5_000),
             clob_book_stale_after_ms: DurationMs::from_millis(10_000),
             clob_presubscribe_lead_ms: DurationMs::from_millis(90_000),

@@ -36,16 +36,27 @@ pub struct PaperParams {
     /// Starting capital of the paper wallet (boot value; runtime-adjustable
     /// later from the dashboard — that seam is `PaperWallet::set_capital`).
     pub starting_capital: Dollars,
-    /// Simulated order-placement latency.
+    /// Simulated order-placement (network round-trip) latency.
     pub placement: LatencySpec,
     /// Simulated cancel round-trip latency.
     pub cancel: LatencySpec,
+    /// Venue-imposed **taker** delay, added on top of `placement` for
+    /// **marketable** (FAK / marketable-limit) orders only — the ~250 ms hold
+    /// Polymarket imposes before a taker matches (CLAUDE.md 2026-07-09 audit;
+    /// `itode` enabled on all four series). Resting makers get network latency
+    /// only. `0` disables it.
+    pub venue_taker_delay_ms: DurationMs,
     /// Fallback taker fee rate, used **only** when a market's own fee params
     /// have not arrived yet (§7: never hardcode 0.07 in logic).
     pub default_fee_rate: Decimal,
     /// Maker rebate share of collected taker fees (crypto category: 20%) —
     /// used by the rebate-estimate accumulator (reported, not yet credited).
     pub maker_rebate_share: Decimal,
+    /// Whether to simulate the tiered **Taker Fee Rebate Program** (a report-only
+    /// projection: 30-day rolling weighted volume → tier → `tier% × taker fees`,
+    /// credited on the daily cycle but NEVER added to cash/equity). `false`
+    /// disables the projection entirely.
+    pub taker_rebate_enabled: bool,
     /// Capacity of the order/fill event channel.
     pub event_channel_capacity: usize,
     /// Seed for the deterministic latency RNG. `None` ⇒ a fixed default seed;
@@ -59,8 +70,10 @@ impl Default for PaperParams {
             starting_capital: Dollars::new(Decimal::from(10_000)),
             placement: LatencySpec::default(),
             cancel: LatencySpec::default(),
+            venue_taker_delay_ms: DurationMs::from_millis(250),
             default_fee_rate: dec!(0.07),
             maker_rebate_share: dec!(0.20),
+            taker_rebate_enabled: true,
             event_channel_capacity: 1024,
             rng_seed: None,
         }
@@ -84,6 +97,13 @@ pub enum PaperParamsError {
     LatencyJitterNegative {
         /// `"placement"` or `"cancel"`.
         which: &'static str,
+        /// The offending value in milliseconds.
+        got: i64,
+    },
+    /// The venue taker delay was negative — would fill takers earlier than
+    /// reality (§9).
+    #[error("venue_taker_delay_ms must be >= 0 (got {got}ms)")]
+    VenueTakerDelayNegative {
         /// The offending value in milliseconds.
         got: i64,
     },
@@ -118,6 +138,11 @@ impl PaperParams {
                     got: spec.jitter_ms.as_millis(),
                 });
             }
+        }
+        if self.venue_taker_delay_ms.is_negative() {
+            return Err(PaperParamsError::VenueTakerDelayNegative {
+                got: self.venue_taker_delay_ms.as_millis(),
+            });
         }
         if self.starting_capital.as_decimal() <= Decimal::ZERO {
             return Err(PaperParamsError::NonPositiveCapital(self.starting_capital));

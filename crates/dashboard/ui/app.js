@@ -190,6 +190,19 @@ function renderSummary(s) {
   setSigned($("hl-today"), h.today_pl);
   $("hl-winrate").textContent = h.win_rate != null ? (h.win_rate * 100).toFixed(0) + "%" : "—";
 
+  // account identity: Cash + Open positions = Equity
+  const ac = s.account;
+  $("acct-cash").textContent = ac.cash != null ? fmtUsd(ac.cash, false) : "—";
+  $("acct-open").textContent = fmtUsd(ac.open_positions, false);
+  $("acct-equity").textContent = ac.equity != null ? fmtUsd(ac.equity, false) : "—";
+  const aw = $("acct-awaiting");
+  if (ac.awaiting_resolution > 0) {
+    aw.classList.remove("hidden");
+    aw.textContent = `${ac.awaiting_resolution} window${ac.awaiting_resolution === 1 ? "" : "s"} awaiting resolution`;
+  } else {
+    aw.classList.add("hidden");
+  }
+
   // status sentence
   const st = s.status;
   const banner = $("status-banner");
@@ -203,19 +216,47 @@ function renderSummary(s) {
   const e = s.explainer;
   setSigned($("bk-completed"), e.completed_pair_pnl);
   setSigned($("bk-stuck"), e.stuck_leg_pnl);
+  // Sub-metrics with explicit units (pairs vs shares vs $/pair vs $/share).
   const sub = (label, val) => `<div class="sub"><label>${label}</label><span>${val}</span></div>`;
   $("bucket-sub").innerHTML =
-    sub("Pairs completed", num(e.pairs_completed).toLocaleString()) +
-    sub("Legs stranded", num(e.legs_stranded).toLocaleString()) +
-    sub("Avg cost per pair", e.avg_pair_cost != null ? "$" + num(e.avg_pair_cost).toFixed(3) : "—") +
-    sub("Avg per stranded leg", e.avg_loss_per_stranded != null ? fmtUsd(e.avg_loss_per_stranded, true) : "—");
+    sub("Pairs completed", num(e.pairs_completed).toLocaleString() + " pairs") +
+    sub("Shares stranded", num(e.legs_stranded).toLocaleString() + " shares") +
+    sub("Avg cost to complete a pair", e.avg_pair_cost != null ? "$" + num(e.avg_pair_cost).toFixed(3) + " / pair" : "—") +
+    sub("Avg P/L per stranded share", e.avg_loss_per_stranded != null ? fmtUsd(e.avg_loss_per_stranded, true) + " / share" : "—");
+  // Full reconciliation: the two buckets sum to realized P/L; adding the
+  // separately-credited rebate reaches the comprehensive total.
   $("explainer-note").textContent =
-    `The two buckets add up to total profit/loss (${fmtUsd(e.total_pnl, true)}). ` +
-    `Estimated maker rebate of ${fmtUsd(e.rebate_estimate, false)} is credited separately.`;
+    `Completed pairs + stuck legs = realized P/L (${fmtUsd(e.total_pnl, true)}). ` +
+    `Plus estimated maker rebate (${fmtUsd(e.rebate_estimate, false)}, credited separately on a daily cycle) ` +
+    `→ total ${fmtUsd(e.comprehensive_pnl, true)}.`;
 
   // activity strip
   renderActivity(s.activity);
   $("activity-scope").textContent = state.summary.series ? state.summary.series : "all series";
+
+  // simulated taker rebate (report-only)
+  renderTakerRebate(s.taker_rebate);
+}
+
+function renderTakerRebate(tr) {
+  const tile = $("taker-rebate-tile");
+  if (!tile) return;
+  if (!tr) { tile.classList.add("hidden"); return; }
+  tile.classList.remove("hidden");
+  const pill = $("tr-tier");
+  pill.textContent = tr.tier + " · " + (num(tr.rebate_pct) * 100).toFixed(0) + "%";
+  pill.className = "pill " + (tr.tier === "None" ? "" : "ok");
+  const tiles = [
+    { label: "30-day weighted volume", val: fmtUsd(tr.wv_30d, false) },
+    { label: "Projected rebate / day", val: fmtUsd(tr.projected_per_day, false) },
+    { label: "Rebate credited (sim)", val: fmtUsd(tr.credited, false) },
+  ];
+  $("tr-tiles").innerHTML = tiles.map((t) =>
+    `<div class="act-tile"><label>${t.label}</label><span>${t.val}</span></div>`).join("");
+  $("tr-note").textContent = (tr.next_tier
+    ? `${fmtUsd(tr.wv_to_next_tier, false)} more 30-day volume to reach ${tr.next_tier}. `
+    : `Top tier reached. `) +
+    `Rebate = tier% × taker fees, reported separately (never added to equity).`;
 }
 
 function renderActivity(a) {
@@ -241,6 +282,70 @@ function renderActivity(a) {
     `<div class="act-tile ${t.cls || ""}"><label>${t.label}</label><span>${t.val}</span>` +
     (t.target ? `<span class="target">${t.target}</span>` : "") + `</div>`
   ).join("");
+}
+
+// ---- shadow model observer tile (observation only) ----
+async function loadShadow() {
+  try {
+    const s = await api("/api/shadow");
+    renderShadow(s);
+  } catch (e) { /* best-effort; tile stays hidden */ }
+}
+
+function renderShadow(s) {
+  const tile = $("shadow-tile");
+  if (!tile) return;
+  if (!s || !s.active) { tile.classList.add("hidden"); return; }
+  tile.classList.remove("hidden");
+  const pill = $("shadow-status");
+  if (s.model_stale) {
+    pill.textContent = "model stale, refit due";
+    pill.className = "pill alarm";
+  } else {
+    pill.textContent = "observing";
+    pill.className = "pill ok";
+  }
+  const trained = s.trained_through_ms ? new Date(s.trained_through_ms).toISOString().slice(0, 10) : "—";
+  $("shadow-meta").textContent =
+    `model ${s.model_short_sha || "?"} · trained through ${trained} · stale after ${s.staleness_alert_days}d`;
+  const rows = (s.series || []).map((r) => {
+    const pu = r.last_p_up == null ? "—" : px3(r.last_p_up);
+    return `<div class="act-tile"><label>${r.series}</label><span>${pu}</span>` +
+      `<span class="target">${r.per_min}/min · ${r.last_finite}/24 feat</span></div>`;
+  }).join("");
+  $("shadow-series").innerHTML = rows || `<div class="muted">no predictions yet</div>`;
+}
+
+async function loadModelTaker() {
+  try {
+    const m = await api("/api/model-taker");
+    renderModelTaker(m);
+  } catch (e) { /* best-effort; tile stays hidden */ }
+}
+
+function renderModelTaker(m) {
+  const tile = $("model-taker-tile");
+  if (!tile) return;
+  if (!m || !m.active) { tile.classList.add("hidden"); return; }
+  tile.classList.remove("hidden");
+  const totalFires = (m.series || []).reduce((a, r) => a + (r.fires_total || 0), 0);
+  const pill = $("mt-status");
+  pill.textContent = `${totalFires} fires`;
+  pill.className = "pill ok";
+  const rows = (m.series || []).map((r) => {
+    const pu = r.last_p_up == null ? "—" : px3(r.last_p_up);
+    return `<div class="act-tile"><label>${r.series}</label><span>${r.fires_total} fires</span>` +
+      `<span class="target">${r.fires_per_min}/min · p ${pu} · ${r.suppressed_total} skip</span></div>`;
+  }).join("");
+  $("mt-series").innerHTML = rows || `<div class="muted">no decisions yet</div>`;
+  const body = document.querySelector("#mt-pnl tbody");
+  if (body) {
+    body.innerHTML = (m.pnl_by_driver || []).map((r) =>
+      `<tr><td>${r.series}</td><td>${r.driver}</td><td>${r.fills}</td>` +
+      `<td>${fmtUsd(r.taker_notional)}</td><td>${fmtUsd(r.fees)}</td>` +
+      `<td>${moneyCell(r.realized_pnl, true)}</td></tr>`
+    ).join("") || `<tr><td colspan="6" class="muted">no fills yet</td></tr>`;
+  }
 }
 
 // ---- summary dropdowns (loaded when opened, refreshed while open) ----
@@ -339,7 +444,7 @@ function scheduleSummaryRefresh() {
   if (summaryRefreshTimer) return;
   summaryRefreshTimer = setTimeout(() => {
     summaryRefreshTimer = null;
-    if (state.view === "summary") { loadSummary(); refreshOpenDrops(); }
+    if (state.view === "summary") { loadSummary(); loadShadow(); loadModelTaker(); refreshOpenDrops(); }
   }, 800);
 }
 
@@ -879,7 +984,7 @@ function scheduleFillsRefresh() {
 }
 
 function refreshActiveView() {
-  if (state.view === "summary") { loadSummary(); refreshOpenDrops(); }
+  if (state.view === "summary") { loadSummary(); loadShadow(); loadModelTaker(); refreshOpenDrops(); }
   else if (state.view === "controls") { loadOverview(); drawEquityChart(); }
   else if (state.view === "series") loadSeries();
   else if (state.view === "live") loadWindows();
@@ -956,6 +1061,9 @@ function onWsMessage(msg) {
     case "model":
       if (state.view === "live") scheduleLiveRefresh();
       if (state.view === "summary") scheduleSummaryRefresh();
+      break;
+    case "shadow":
+      if (state.view === "summary") { loadShadow(); loadModelTaker(); }
       break;
     case "resync":
       loadAll();

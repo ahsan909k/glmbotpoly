@@ -33,7 +33,9 @@ mod error;
 mod handle;
 mod health;
 mod live_markout;
+mod model_taker;
 mod server;
+mod shadow;
 mod state;
 mod ui;
 mod ws;
@@ -44,6 +46,8 @@ pub use command::{
 };
 pub use error::DashboardError;
 pub use handle::DashboardHandle;
+pub use model_taker::ModelTakerTick;
 pub use server::{router, serve, serve_with_listener};
+pub use shadow::ShadowTick;
 pub use state::ParamsView;
 pub use ws::{BreakerEvent, WsUpdate};

@@ -21,16 +21,34 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use core_types::{Dollars, Event, RiskEvent, Series, TimestampMs};
+use core_types::{
+    Dollars, Event, OrderId, RiskEvent, Series, TimestampMs, WindowLifecycle,
+};
 use venue_api::{VenueEvent, VenuePort};
 
 use super::core::{RiskCore, RiskOutput};
 use super::guard::GuardedPort;
 use super::params::RiskParams;
 use super::state::{GateState, GuardObservation, RiskStateSnapshot};
+use crate::arbitration::FireLedger;
 use crate::late_window::LateWindowTaker;
+use crate::model_taker::{ModelPrediction, ModelTakeOutcome, ModelTaker};
 use crate::quote_manager::{QuoteManager, RestingView};
 use crate::taker::MomentumTaker;
+
+/// Which owned strategy placed an order — the driver a fill is attributed to
+/// (CLAUDE.md §10 PnL-by-driver). Resolved from the strategies' own order sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FillDriver {
+    /// The maker-core quote manager (`qm:` orders).
+    MakerCore,
+    /// The momentum taker (`mt:` orders).
+    Momentum,
+    /// The late-window taker (`lw:` orders).
+    Late,
+    /// The champion-model taker (`md:` orders).
+    Model,
+}
 
 /// The single gateway between every strategy and the venue port.
 pub struct RiskManager {
@@ -40,6 +58,9 @@ pub struct RiskManager {
     quoter: QuoteManager,
     momentum: MomentumTaker,
     late: LateWindowTaker,
+    model: ModelTaker,
+    /// The cross-taker fire ledger (momentum vs model arbitration, §8).
+    arbiter: FireLedger,
     /// Breaker events to publish on the bus, drained by the orchestrator.
     published: Vec<Event>,
 }
@@ -73,6 +94,11 @@ impl RiskManager {
         let quoter = QuoteManager::new(params.quote_manager, params.quote, params.normalizer);
         let momentum = MomentumTaker::new(params.momentum, params.normalizer);
         let late = LateWindowTaker::new(params.late_window, params.normalizer);
+        let model = ModelTaker::new(params.model, params.normalizer);
+        let arbiter = FireLedger::new(
+            params.arbitration_window_ms,
+            params.series_precedence.clone(),
+        );
         Self {
             params,
             core,
@@ -80,6 +106,8 @@ impl RiskManager {
             quoter,
             momentum,
             late,
+            model,
+            arbiter,
             published: Vec::new(),
         }
     }
@@ -126,6 +154,48 @@ impl RiskManager {
     #[must_use]
     pub fn late_standing_down(&self) -> bool {
         self.late.is_standing_down()
+    }
+
+    /// Whether the owned model taker is currently standing down (delegated).
+    #[must_use]
+    pub fn model_standing_down(&self) -> bool {
+        self.model.is_standing_down()
+    }
+
+    /// The owned model taker's take count (delegated inspection).
+    #[must_use]
+    pub fn model_take_count(&self) -> u64 {
+        self.model.take_count()
+    }
+
+    /// The owned model taker's realized spend across all windows (delegated).
+    #[must_use]
+    pub fn model_realized_spent(&self) -> Dollars {
+        self.model.realized_spent()
+    }
+
+    /// The owned model taker's committed-in-flight spend across all windows.
+    #[must_use]
+    pub fn model_effective_spent(&self) -> Dollars {
+        self.model.effective_spent()
+    }
+
+    /// Which owned strategy placed `order_id`, for per-driver fill attribution
+    /// (§10). Queried at fill time, while the order is still owned by its
+    /// strategy (before its terminal update evicts it). `None` if unrecognized.
+    #[must_use]
+    pub fn driver_of(&self, order_id: &OrderId) -> Option<FillDriver> {
+        if self.model.owns(order_id) {
+            Some(FillDriver::Model)
+        } else if self.momentum.owns(order_id) {
+            Some(FillDriver::Momentum)
+        } else if self.late.owns(order_id) {
+            Some(FillDriver::Late)
+        } else if self.quoter.owns(order_id) {
+            Some(FillDriver::MakerCore)
+        } else {
+            None
+        }
     }
 
     /// The owned quote manager's resting-order view (delegated inspection).
@@ -216,6 +286,37 @@ impl RiskManager {
         if self.params.late_window_enabled {
             self.late.on_venue_event(ve, now);
         }
+        if self.params.model_enabled {
+            self.model.on_venue_event(ve, now);
+        }
+    }
+
+    /// Delivers one shadow prediction to the owned model taker — the single path
+    /// through which the model can fire (a FAK, gated by the interposed
+    /// [`GuardedPort`]). The orchestrator calls this when it drains the shadow
+    /// prediction stream; it returns the decision outcome for journaling.
+    ///
+    /// This deliberately does **not** run the observation/fold cycle the other
+    /// entry points run: the interposed guard enforces §5/§11 (global halt /
+    /// per-window halt / open-notional) on the FAK, and the model taker's own
+    /// `standing_down` (set from the forwarded `Event::Risk`) blocks it under a
+    /// breaker — so no separate fold is needed here.
+    pub async fn on_model_prediction<P: VenuePort>(
+        &mut self,
+        pred: &ModelPrediction,
+        port: &P,
+        now: TimestampMs,
+    ) -> Option<ModelTakeOutcome> {
+        if !self.params.model_enabled {
+            return None;
+        }
+        let guard = GuardedPort::new(port, Arc::clone(&self.shared), now);
+        let resting = self.quoter.resting_view();
+        let out = self
+            .model
+            .on_prediction(pred, &guard, now, &mut self.arbiter, resting)
+            .await;
+        Some(out)
     }
 
     /// The periodic tick: runs the time-based breaker recomputes (the 500 ms
@@ -275,6 +376,13 @@ impl RiskManager {
     }
 
     /// Forwards one event to each enabled strategy through a fresh guard.
+    ///
+    /// The resting view (`self.quoter`, immutable) and the fire ledger
+    /// (`self.arbiter`, mutable) are threaded into the takers for §7 self-match
+    /// prevention and §8 momentum-vs-model arbitration. These are **disjoint
+    /// fields** of `self` (the guard only clones `self.shared`), so the borrow
+    /// checker admits the immutable `resting` borrow alongside the mutable taker
+    /// and arbiter borrows in one call.
     async fn forward_bus_event<P: VenuePort>(&mut self, ev: &Event, port: &P, now: TimestampMs) {
         if self.params.quoter_enabled {
             let guard = GuardedPort::new(port, Arc::clone(&self.shared), now);
@@ -282,11 +390,29 @@ impl RiskManager {
         }
         if self.params.momentum_enabled {
             let guard = GuardedPort::new(port, Arc::clone(&self.shared), now);
-            self.momentum.on_event(ev, &guard, now).await;
+            let resting = self.quoter.resting_view();
+            self.momentum
+                .on_event(ev, &guard, now, &mut self.arbiter, resting)
+                .await;
         }
         if self.params.late_window_enabled {
             let guard = GuardedPort::new(port, Arc::clone(&self.shared), now);
-            self.late.on_event(ev, &guard, now).await;
+            let resting = self.quoter.resting_view();
+            self.late.on_event(ev, &guard, now, resting).await;
+        }
+        if self.params.model_enabled {
+            // Sync state refresh only — the model fires on a prediction, never a
+            // bus event. It holds no venue port here.
+            self.model.on_bus_event(ev);
+        }
+        // Bound the arbiter's per-window ledger for a 24/7 session.
+        if let Event::Window { market, lifecycle } = ev
+            && matches!(
+                lifecycle,
+                WindowLifecycle::Closed | WindowLifecycle::Resolved { .. }
+            )
+        {
+            self.arbiter.drop_window(market.window);
         }
     }
 

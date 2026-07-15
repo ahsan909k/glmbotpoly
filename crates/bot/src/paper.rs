@@ -64,8 +64,10 @@ pub fn paper_params(config: &AppConfig) -> PaperParams {
             mean_ms: p.cancel_latency.mean_ms,
             jitter_ms: p.cancel_latency.jitter_ms,
         },
+        venue_taker_delay_ms: p.venue_taker_delay_ms,
         default_fee_rate: p.default_fee_rate,
         maker_rebate_share: p.maker_rebate_share,
+        taker_rebate_enabled: p.taker_rebate_enabled,
         event_channel_capacity: 1024,
         // Seed the latency jitter from the clock so runs differ; determinism
         // is unimportant for a live smoke.

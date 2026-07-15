@@ -70,6 +70,47 @@ pub struct PositionDto {
     pub net: Decimal,
 }
 
+/// The simulated **Taker Fee Rebate Program** projection (CLAUDE.md §7). This is
+/// **report-only** — never part of paper cash/equity. The tier is set by 30-day
+/// rolling weighted volume; the rebate is `tier% × taker fees`.
+#[derive(Debug, Clone, Serialize)]
+pub struct TakerRebateDto {
+    /// Rolling 30-day taker weighted volume that sets the tier.
+    pub wv_30d: Dollars,
+    /// Current tier name (`"None"`, `"Bronze"`, … `"Obsidian"`).
+    pub tier: String,
+    /// Current rebate fraction (the tier's %).
+    pub rebate_pct: Decimal,
+    /// Simulated rebate accrued below the $1 floor.
+    pub accrued: Dollars,
+    /// Simulated rebate past the $1 floor (cumulative).
+    pub credited: Dollars,
+    /// Projected rebate/day = `tier% × last completed day's taker fees`.
+    pub projected_per_day: Dollars,
+    /// The next tier up (`null` at the top tier).
+    pub next_tier: Option<String>,
+    /// Additional 30-day wV needed to reach the next tier (`0` at the top).
+    pub wv_to_next_tier: Dollars,
+}
+
+impl From<&PaperLedgerSnapshot> for TakerRebateDto {
+    fn from(l: &PaperLedgerSnapshot) -> Self {
+        Self {
+            wv_30d: l.taker_wv_30d,
+            tier: l.taker_tier.to_owned(),
+            rebate_pct: l.taker_rebate_pct,
+            accrued: l.taker_rebate_accrued,
+            credited: l.taker_rebate_credited,
+            // Estimate the daily run-rate from the last completed day's taker fees.
+            projected_per_day: Dollars::new(
+                l.taker_rebate_pct * l.last_day_taker_fees.as_decimal(),
+            ),
+            next_tier: l.taker_next_tier.map(str::to_owned),
+            wv_to_next_tier: l.taker_wv_to_next,
+        }
+    }
+}
+
 /// The richer paper-ledger view with its income lines.
 #[derive(Debug, Clone, Serialize)]
 pub struct LedgerDto {
@@ -83,6 +124,8 @@ pub struct LedgerDto {
     pub rebate_accrued: Dollars,
     /// Maker rebate credited to cash.
     pub rebate_credited: Dollars,
+    /// Simulated taker-rebate projection (report-only).
+    pub taker_rebate: TakerRebateDto,
 }
 
 impl From<&PaperLedgerSnapshot> for LedgerDto {
@@ -100,6 +143,7 @@ impl From<&PaperLedgerSnapshot> for LedgerDto {
             fees_paid: l.fees_paid,
             rebate_accrued: l.rebate_accrued,
             rebate_credited: l.rebate_credited,
+            taker_rebate: TakerRebateDto::from(l),
         }
     }
 }
@@ -656,6 +700,168 @@ pub struct ParamsDto {
     pub entries: Vec<ParamEntryDto>,
 }
 
+// ---- shadow tile (observation-only) ----------------------------------------
+
+/// Per-series shadow prediction summary.
+#[derive(Debug, Clone, Serialize)]
+pub struct ShadowSeriesDto {
+    /// Series key, e.g. `"BTC-5m"`.
+    pub series: String,
+    /// Predictions in the last 60 s (≈ predictions/min).
+    pub per_min: usize,
+    /// Most recent model probability of Up.
+    pub last_p_up: Option<f64>,
+    /// Finite features on the last prediction (of 24).
+    pub last_finite: u32,
+    /// Last prediction time (ms).
+    pub last_ts_ms: i64,
+}
+
+/// The "Shadow" tile: per-series rates + model identity + the staleness flag.
+#[derive(Debug, Clone, Serialize)]
+pub struct ShadowDto {
+    /// Whether the shadow observer has produced any prediction.
+    pub active: bool,
+    /// Short model sha.
+    pub model_short_sha: String,
+    /// Model training-data end (ms).
+    pub trained_through_ms: i64,
+    /// Staleness threshold (days).
+    pub staleness_alert_days: i64,
+    /// Whether the deployed model is stale ("refit due").
+    pub model_stale: bool,
+    /// Per-series rows, sorted by series key.
+    pub series: Vec<ShadowSeriesDto>,
+}
+
+/// Builds the shadow tile from the observation state.
+#[must_use]
+pub(crate) fn shadow(data: &DashboardData) -> ShadowDto {
+    let now = data.last_now;
+    let now_ms = now.as_millis();
+    let mut series: Vec<ShadowSeriesDto> = data
+        .shadow
+        .by_series
+        .iter()
+        .map(|(s, st)| ShadowSeriesDto {
+            series: s.to_string(),
+            per_min: st.per_min(now_ms),
+            last_p_up: (st.last_ts != 0).then_some(st.last_p_up),
+            last_finite: st.last_finite,
+            last_ts_ms: st.last_ts,
+        })
+        .collect();
+    series.sort_by(|a, b| a.series.cmp(&b.series));
+    ShadowDto {
+        active: data.shadow.active,
+        model_short_sha: data.shadow.short_sha.clone(),
+        trained_through_ms: data.shadow.trained_through_ms,
+        staleness_alert_days: data.shadow.staleness_alert_days,
+        model_stale: data.shadow.is_stale(now),
+        series,
+    }
+}
+
+// ---- model-taker tile (§10) ------------------------------------------------
+
+/// Per-series model-taker fires summary.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelTakerSeriesDto {
+    /// Series key, e.g. `"BTC-5m"`.
+    pub series: String,
+    /// Fires in the last 60 s (≈ fires/min).
+    pub fires_per_min: usize,
+    /// Cumulative fires since start.
+    pub fires_total: u64,
+    /// Cumulative suppressions since start.
+    pub suppressed_total: u64,
+    /// Most recent model `p_up`.
+    pub last_p_up: Option<f64>,
+    /// Last decision reason (`"fired"` or the suppression cause).
+    pub last_reason: String,
+    /// Last decision time (ms).
+    pub last_ts_ms: i64,
+}
+
+/// One `(series, driver)` PnL attribution row.
+#[derive(Debug, Clone, Serialize)]
+pub struct DriverPnlDto {
+    /// Series key.
+    pub series: String,
+    /// Driver: `"maker-core"` | `"momentum"` | `"late"` | `"model"`.
+    pub driver: String,
+    /// Fill count attributed to this driver.
+    pub fills: u64,
+    /// Taker notional (`Σ price·size`), zero for maker-core (Decimal string).
+    pub taker_notional: String,
+    /// Fees paid (Decimal string).
+    pub fees: String,
+    /// Realized PnL, marked to each window's outcome (Decimal string).
+    pub realized_pnl: String,
+}
+
+/// The "Model taker" tile: per-series fires + PnL split by driver.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelTakerDto {
+    /// Whether any model-taker decision has arrived.
+    pub active: bool,
+    /// Per-series fire rows, sorted by series key.
+    pub series: Vec<ModelTakerSeriesDto>,
+    /// PnL-by-driver rows, sorted by (series, driver).
+    pub pnl_by_driver: Vec<DriverPnlDto>,
+}
+
+fn driver_label(d: engine::FillDriver) -> &'static str {
+    match d {
+        engine::FillDriver::MakerCore => "maker-core",
+        engine::FillDriver::Momentum => "momentum",
+        engine::FillDriver::Late => "late",
+        engine::FillDriver::Model => "model",
+    }
+}
+
+/// Builds the model-taker tile from the fires + driver-PnL state.
+#[must_use]
+pub(crate) fn model_taker(data: &DashboardData) -> ModelTakerDto {
+    let now_ms = data.last_now.as_millis();
+    let mut series: Vec<ModelTakerSeriesDto> = data
+        .model_taker
+        .by_series
+        .iter()
+        .map(|(s, st)| ModelTakerSeriesDto {
+            series: s.to_string(),
+            fires_per_min: st.fires_per_min(now_ms),
+            fires_total: st.fires_total,
+            suppressed_total: st.suppressed_total,
+            last_p_up: (st.last_ts != 0).then_some(st.last_p_up),
+            last_reason: st.last_reason.clone(),
+            last_ts_ms: st.last_ts,
+        })
+        .collect();
+    series.sort_by(|a, b| a.series.cmp(&b.series));
+
+    let mut pnl_by_driver: Vec<DriverPnlDto> = data
+        .driver_pnl
+        .totals
+        .iter()
+        .map(|((s, d), t)| DriverPnlDto {
+            series: s.to_string(),
+            driver: driver_label(*d).to_owned(),
+            fills: t.fills,
+            taker_notional: t.taker_notional.to_string(),
+            fees: t.fees.to_string(),
+            realized_pnl: t.realized_pnl.to_string(),
+        })
+        .collect();
+    pnl_by_driver.sort_by(|a, b| a.series.cmp(&b.series).then_with(|| a.driver.cmp(&b.driver)));
+
+    ModelTakerDto {
+        active: data.model_taker.active,
+        series,
+        pnl_by_driver,
+    }
+}
+
 /// Builds the parameters view.
 #[must_use]
 pub(crate) fn params(data: &DashboardData) -> ParamsDto {
@@ -701,7 +907,8 @@ pub(crate) fn sort_columns() -> Vec<SortColumnDto> {
 
 // ---- resolved windows (the "recent resolved windows" dropdown) -------------
 
-/// One settled window split into the two dashboard buckets.
+/// One settled window split into the two dashboard buckets, plus the per-position
+/// settlement (shares held per side and the proceeds the winning side paid out).
 #[derive(Debug, Clone, Serialize)]
 pub struct ResolvedWindowDto {
     /// Window key (`Series@open_ms`).
@@ -716,11 +923,17 @@ pub struct ResolvedWindowDto {
     pub stuck_leg_pnl: Dollars,
     /// The realized ledger PnL (the two buckets sum to this).
     pub realized_pnl: Dollars,
-    /// Pairs completed (held matched + merged).
+    /// Pairs completed (held matched + merged), in pairs.
     pub pairs_completed: Size,
-    /// Stranded (unmatched) shares at close.
+    /// Stranded (unmatched) shares at close, in shares.
     pub stranded_shares: Decimal,
-    /// Settlement time (unix millis).
+    /// Up-side shares held at settlement.
+    pub up_shares: Size,
+    /// Down-side shares held at settlement.
+    pub down_shares: Size,
+    /// Settlement proceeds: `$1` per winning share, `$0` per losing share.
+    pub proceeds: Dollars,
+    /// Settlement time (unix millis) — the resolution *event* time, not window close.
     pub ts_ms: i64,
 }
 
@@ -739,9 +952,10 @@ pub(crate) fn resolved_windows(
         .settlements
         .iter()
         .rev()
-        .filter(|s| series.is_none_or(|f| s.window.series == f))
+        .filter(|sw| series.is_none_or(|f| sw.summary.window.series == f))
         .take(limit)
-        .map(|s| {
+        .map(|sw| {
+            let s = &sw.summary;
             let a = WindowAttribution::from_summary(
                 s,
                 mode,
@@ -751,6 +965,11 @@ pub(crate) fn resolved_windows(
                 0,
                 Dollars::ZERO,
             );
+            // Proceeds: the winning side's shares each pay $1, the losing side $0.
+            let winning_shares = match s.outcome {
+                Outcome::Up => s.up.shares,
+                Outcome::Down => s.down.shares,
+            };
             ResolvedWindowDto {
                 window: s.window.to_string(),
                 series: s.window.series,
@@ -760,7 +979,10 @@ pub(crate) fn resolved_windows(
                 realized_pnl: pz(a.realized_pnl),
                 pairs_completed: a.pairs_completed(),
                 stranded_shares: a.stranded_shares,
-                ts_ms: s.ts.as_millis(),
+                up_shares: s.up.shares,
+                down_shares: s.down.shares,
+                proceeds: Dollars::new(winning_shares.as_decimal()),
+                ts_ms: sw.resolved_at.as_millis(),
             }
         })
         .collect()
@@ -795,6 +1017,33 @@ pub struct HeadlineDto {
     pub windows_traded: u32,
 }
 
+/// The three-card account identity: **Cash + Open positions = Equity**. Open
+/// positions are valued at cost basis and exclude settled windows by
+/// construction (settled windows drop out of `inventory` at resolution), so this
+/// is an exact identity, and for a fully-settled history Open positions is `$0`
+/// and Equity collapses to Cash.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountDto {
+    /// Cash (wallet collateral total). `None` until the first wallet sample.
+    pub cash: Option<Dollars>,
+    /// Cost basis of open positions in unresolved windows (`$0` when flat).
+    pub open_positions: Dollars,
+    /// Equity = Cash + Open positions. `None` until the first wallet sample.
+    pub equity: Option<Dollars>,
+    /// Windows closed but not yet resolved (settlement still pending).
+    pub awaiting_resolution: usize,
+}
+
+/// Builds the three-card account identity for a mode.
+fn account(data: &DashboardData, mode: Mode) -> AccountDto {
+    AccountDto {
+        cash: data.mode(mode).wallet.as_ref().map(|w| w.collateral_total),
+        open_positions: data.open_positions_cost(mode),
+        equity: data.equity(mode),
+        awaiting_resolution: data.awaiting_resolution(),
+    }
+}
+
 /// The computed status sentence + its reasoning (the tooltip text).
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusDto {
@@ -813,11 +1062,17 @@ pub struct ExplainerDto {
     pub completed_pair_pnl: Dollars,
     /// Bucket 2 — profit/loss on legs that filled one side only (incl. taker fees).
     pub stuck_leg_pnl: Dollars,
-    /// The realized total the two buckets sum to (the ledger figure).
+    /// The realized total the two buckets sum to **exactly** (the ledger figure);
+    /// `completed_pair_pnl + stuck_leg_pnl == total_pnl`.
     pub total_pnl: Dollars,
-    /// Pairs the strategy completed (both sides filled).
+    /// The full economic total: `total_pnl + rebate_estimate`. This is the figure
+    /// the account's equity moves by, so `completed_pair_pnl + stuck_leg_pnl +
+    /// rebate_estimate == comprehensive_pnl`.
+    pub comprehensive_pnl: Dollars,
+    /// Pairs the strategy completed (both sides filled), counted in **pairs**.
     pub pairs_completed: Size,
-    /// Unmatched shares left stranded at window close.
+    /// Unmatched **shares** left stranded at window close (one side of a
+    /// would-be pair — a "leg" — that never got its cheap match).
     pub legs_stranded: Decimal,
     /// Average cost to complete a pair (`avg_up + avg_down`), `None` with none.
     pub avg_pair_cost: Option<Decimal>,
@@ -864,12 +1119,17 @@ pub struct SummaryDto {
     pub window: ComparisonWindow,
     /// At-a-glance health row.
     pub headline: HeadlineDto,
+    /// The three-card account identity (Cash + Open positions = Equity).
+    pub account: AccountDto,
     /// The computed status sentence.
     pub status: StatusDto,
     /// The two-bucket explainer.
     pub explainer: ExplainerDto,
     /// The live-activity strip.
     pub activity: ActivityDto,
+    /// The simulated taker-rebate projection (report-only), `None` until the first
+    /// paper-ledger sample.
+    pub taker_rebate: Option<TakerRebateDto>,
 }
 
 /// The raw additive sums across the selected series aggregates.
@@ -1074,16 +1334,20 @@ pub(crate) fn summary(
                 Mode::Paper => data.params.paper_capital,
                 Mode::Live => None,
             },
-            equity: ms.wallet.as_ref().map(|w| w.collateral_total),
+            // True equity = cash + open-position cost basis (the three-card
+            // total), not cash alone.
+            equity: data.equity(mode),
             today_pl: pz(today.net_pnl),
             win_rate,
             windows_traded: c.windows_traded,
         },
+        account: account(data, mode),
         status: compute_status(completed, stuck, c.windows_traded, min_sample, c.any_alarm),
         explainer: ExplainerDto {
             completed_pair_pnl: pz(completed),
             stuck_leg_pnl: pz(stuck),
             total_pnl: pz(c.net_pnl),
+            comprehensive_pnl: pz(c.net_pnl + c.estimated_rebate),
             pairs_completed: c.pairs_completed,
             legs_stranded: c.stranded_shares,
             avg_pair_cost,
@@ -1102,6 +1366,7 @@ pub(crate) fn summary(
             ttc_ok: median_ttc.is_none_or(|m| m <= ttc_target),
             ttr_ok: median_ttr.is_none_or(|m| m <= ttr_target),
         },
+        taker_rebate: ms.ledger.as_ref().map(TakerRebateDto::from),
     }
 }
 
@@ -1404,10 +1669,25 @@ mod tests {
             fees_paid: Dollars::new(dec!(1.25)),
             rebate_accrued: Dollars::new(dec!(0.30)),
             rebate_credited: Dollars::new(dec!(2)),
+            taker_rebate_accrued: Dollars::new(dec!(0.10)),
+            taker_rebate_credited: Dollars::new(dec!(0.50)),
+            taker_wv_30d: Dollars::new(dec!(250000)),
+            taker_tier: "Gold",
+            taker_rebate_pct: dec!(0.18),
+            taker_next_tier: Some("Platinum"),
+            taker_wv_to_next: Dollars::new(dec!(750000)),
+            last_day_taker_fees: Dollars::new(dec!(3)),
         };
         let json = serde_json::to_value(LedgerDto::from(&ledger)).unwrap();
         assert_eq!(json["positions"][0]["net"], "-5");
         assert_eq!(json["fees_paid"], "1.25");
+        // The report-only taker-rebate projection: Gold (18%), projected/day =
+        // 0.18 × last day's $3 taker fees = $0.54.
+        assert_eq!(json["taker_rebate"]["tier"], "Gold");
+        assert_eq!(json["taker_rebate"]["rebate_pct"], "0.18");
+        assert_eq!(json["taker_rebate"]["projected_per_day"], "0.54");
+        assert_eq!(json["taker_rebate"]["next_tier"], "Platinum");
+        assert_eq!(json["taker_rebate"]["wv_to_next_tier"], "750000");
     }
 
     #[test]
@@ -1558,6 +1838,14 @@ mod tests {
             s.explainer.total_pnl
         );
         assert_eq!(s.explainer.total_pnl, Dollars::new(dec!(3)));
+        // ...and the two buckets plus the estimated rebate reconcile to the
+        // comprehensive total the account equity actually moves by (§3 of the task).
+        assert_eq!(
+            s.explainer.completed_pair_pnl
+                + s.explainer.stuck_leg_pnl
+                + s.explainer.rebate_estimate,
+            s.explainer.comprehensive_pnl
+        );
         // 100 matched pairs completed.
         assert_eq!(s.explainer.pairs_completed, Size::new(dec!(100)).unwrap());
         assert_eq!(s.headline.win_rate, Some(1.0));
@@ -1565,5 +1853,151 @@ mod tests {
         // last-minute counts are 0, but a resting order remains.
         assert_eq!(s.activity.resting_now, 1);
         assert_eq!(s.activity.ttr_target_ms, 250); // default when unset
+    }
+
+    fn wallet(cash: Decimal) -> Wallet {
+        Wallet {
+            collateral_available: Dollars::new(cash),
+            collateral_total: Dollars::new(cash),
+            positions: vec![],
+        }
+    }
+
+    fn side(shares: Decimal, cost: Decimal) -> core_types::SideInventory {
+        core_types::SideInventory {
+            shares: Size::new(shares).unwrap(),
+            cost: Dollars::new(cost),
+        }
+    }
+
+    /// The three-card identity holds through a full settlement cycle: while a
+    /// position is open, `Cash + Open positions == Equity == starting capital`
+    /// (no PnL is recognized at cost basis); after the window resolves the
+    /// position drops out of Open by construction and Equity collapses to Cash,
+    /// which equals starting capital plus the realized PnL.
+    #[test]
+    fn account_three_card_identity_through_settlement() {
+        let wid = btc_5m_window(0);
+        let market = tests_support::market(wid);
+        let mut data = DashboardData::new(ts(0));
+        data.set_params(
+            ParamsView {
+                paper_capital: Some(Dollars::new(dec!(10000))),
+                entries: vec![],
+            },
+            ts(0),
+        );
+        data.project(
+            Mode::Paper,
+            &Event::Window {
+                market: Arc::clone(&market),
+                lifecycle: WindowLifecycle::Open,
+            },
+            ts(0),
+        );
+        // Bought 100 Up @ 0.48: cash 10000 − 48 = 9952, holding cost $48.
+        data.set_wallet(Mode::Paper, wallet(dec!(9952)), ts(1_000));
+        data.project(
+            Mode::Paper,
+            &Event::Inventory(Arc::new(InventorySnapshot::derive(
+                wid,
+                side(dec!(100), dec!(48)),
+                side(dec!(0), dec!(0)),
+                ts(1_000),
+            ))),
+            ts(1_000),
+        );
+
+        let a = account(&data, Mode::Paper);
+        assert_eq!(a.cash, Some(Dollars::new(dec!(9952))));
+        assert_eq!(a.open_positions, Dollars::new(dec!(48)));
+        // Cash + Open == Equity == starting (nothing realized yet).
+        assert_eq!(a.equity, Some(Dollars::new(dec!(10000))));
+        assert_eq!(
+            a.cash.unwrap() + a.open_positions,
+            a.equity.unwrap(),
+            "Cash + Open positions must equal Equity"
+        );
+        assert_eq!(a.awaiting_resolution, 0);
+
+        // The window closes but has not resolved yet → awaiting resolution.
+        data.project(
+            Mode::Paper,
+            &Event::Window {
+                market: Arc::clone(&market),
+                lifecycle: WindowLifecycle::Closed,
+            },
+            ts(299_000),
+        );
+        assert_eq!(account(&data, Mode::Paper).awaiting_resolution, 1);
+
+        // Resolve Up + settle: winning 100 Up pay $1 each → cash 9952 + 100.
+        data.project(
+            Mode::Paper,
+            &Event::Window {
+                market: Arc::clone(&market),
+                lifecycle: WindowLifecycle::Resolved {
+                    outcome: Outcome::Up,
+                },
+            },
+            ts(300_000),
+        );
+        let settle = core_types::SettlementSummary::close(
+            wid,
+            Outcome::Up,
+            side(dec!(100), dec!(48)),
+            side(dec!(0), dec!(0)),
+            Size::ZERO,
+            Dollars::ZERO,
+            Dollars::new(dec!(52)), // realized = 100 payout − 48 cost
+            ts(300_000),
+        );
+        data.project(
+            Mode::Paper,
+            &Event::Settlement(Arc::new(settle)),
+            ts(300_000),
+        );
+        data.set_wallet(Mode::Paper, wallet(dec!(10052)), ts(300_001));
+
+        let a = account(&data, Mode::Paper);
+        // Settled window dropped out of Open positions by construction.
+        assert_eq!(a.open_positions, Dollars::ZERO);
+        // Fully settled: Equity == Cash == starting + realized PnL.
+        assert_eq!(a.equity, Some(Dollars::new(dec!(10052))));
+        assert_eq!(a.cash.unwrap() + a.open_positions, a.equity.unwrap());
+        assert_eq!(a.awaiting_resolution, 0);
+    }
+
+    /// The resolved-windows feed reports the per-position settlement (shares per
+    /// side, proceeds paid) and stamps the resolution *event* time, not close.
+    #[test]
+    fn resolved_windows_reports_per_position_proceeds_at_event_time() {
+        let wid = btc_5m_window(0);
+        let mut data = DashboardData::new(ts(0));
+        let settle = core_types::SettlementSummary::close(
+            wid,
+            Outcome::Up,
+            side(dec!(100), dec!(48)),
+            side(dec!(40), dec!(22)),
+            Size::ZERO,
+            Dollars::ZERO,
+            Dollars::new(dec!(30)),
+            ts(300_000), // summary ts = window CLOSE
+        );
+        // Observed the resolution 45s after close.
+        data.project(
+            Mode::Paper,
+            &Event::Settlement(Arc::new(settle)),
+            ts(345_000),
+        );
+        let rows = resolved_windows(&data, Mode::Paper, None, 10);
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.up_shares, Size::new(dec!(100)).unwrap());
+        assert_eq!(r.down_shares, Size::new(dec!(40)).unwrap());
+        // Up won → 100 winning shares × $1 = $100 proceeds (Down pays $0).
+        assert_eq!(r.proceeds, Dollars::new(dec!(100)));
+        // Displayed at the resolution event time, not the window close time.
+        assert_eq!(r.ts_ms, 345_000);
     }
 }
