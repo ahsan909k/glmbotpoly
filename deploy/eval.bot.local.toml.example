@@ -23,6 +23,13 @@ depth_dir = "/var/lib/bot/data/depth"             # (unused when depth capture i
 retention_max_age_ms = 864000000                  # 10 days
 retention_max_total_bytes = 32212254720           # 30 GiB disk backstop (>= 128 MiB)
 
+[run]
+# Skip the boot-time journal replay: with a 1.3 GB+ journal it takes ~12 min and
+# rebuilds state that is currently DISCARDED (the paper wallet resets per session
+# regardless), so it is pure startup cost — and it would blow upgrade.sh's ARMED
+# poll and trigger an auto-rollback. Recording is unaffected.
+replay_journal_on_start = false
+
 [paper]
 starting_capital = 50000                          # $50k bankroll (both phases)
 # venue_taker_delay_ms stays 250 (Polymarket's, not ours — do NOT change).
