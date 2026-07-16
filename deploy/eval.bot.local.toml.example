@@ -88,5 +88,18 @@ soft_cap_excess_shares = 200
 hard_cap_excess_shares = 400
 taker_budget_per_window = 10              # [DAY-2] -> 100  (momentum + late, cumulative $)
 
+# Disable the 1h series (2026-07-16). The fair-value model is OUT-OF-SCOPE for 1h:
+# z = ln(S/K)/(sigma*sqrt(tau)) with tau up to 3600s amplifies any sigma error, and
+# 1h markets resolve on a Binance CANDLE, not Chainlink (the model's ground truth),
+# so the model's 1h p_up chronically diverges from the book (BTC-1h ~76% of the time
+# above the 0.10 bound). Because FairVsMid is a GLOBAL breaker, that OOD divergence
+# trips a sustained halt that stands down the WHOLE engine (incl. healthy M5/M15).
+# The plan already treats 1h conclusions as provisional (~96 windows/series), so the
+# eval runs the four M5/M15 series only. (Model taker/shadow are M5/M15-scoped too.)
+[engine.series.BTC-1h]
+enabled = false
+[engine.series.ETH-1h]
+enabled = false
+
 # Dashboard stays on loopback (default); reach it via the SSH tunnel:
 #   ssh -N -L 8080:localhost:8080 ubuntu@54.154.134.102

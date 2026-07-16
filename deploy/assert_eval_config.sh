@@ -71,5 +71,12 @@ if grep -qE '^[[:space:]]*(theta|precedence|series_precedence)' "$CFG"; then
   echo "FAIL  model-taker earned config / arbitration was overridden in bot.local (must stay the tested default)"; FAIL=1
 else echo "PASS  model-taker earned config + fortress arbitration left at the tested defaults"; fi
 
+# 1h series disabled (model is OOD for 1h -> would poison the global FairVsMid).
+if grep -qE '^\[engine\.series\.BTC-1h\]' "$CFG" && grep -qE '^\[engine\.series\.ETH-1h\]' "$CFG"; then
+  echo "PASS  BTC-1h + ETH-1h sections present (disabled: model OOD for 1h)"
+else
+  echo "FAIL  1h series NOT disabled — OOD 1h p_up will poison the global FairVsMid"; FAIL=1
+fi
+
 if [ "$FAIL" -eq 0 ]; then echo "=== ALL ASSERTIONS PASS — safe to swap ==="; else echo "=== ASSERTION FAILURES — DO NOT SWAP ==="; fi
 exit "$FAIL"
