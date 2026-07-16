@@ -47,10 +47,10 @@ for b in feed_stale ws_disconnect fair_vs_mid; do
     || fail "feed:$b<5/hr" "trips=$C rate=${RATE}/hr (annotate any Polymarket outage window)"
 done
 
-# 5. Makers resting on all 6 series
-N6=$(q "SELECT COUNT(*) FROM (SELECT series FROM orders WHERE state='open' AND ts_local_ms>=$T0 GROUP BY series);")
-{ [ "${N6:-0}" -eq 6 ]; } && pass makers-x6 "series_with_resting=$N6" \
-  || fail makers-x6 "series_with_resting=${N6:-0} (expected 6)"
+# 5. Makers resting on all 4 M5/M15 series (1h disabled 2026-07-16 — model OOD for 1h)
+N4=$(q "SELECT COUNT(*) FROM (SELECT series FROM orders WHERE state='open' AND ts_local_ms>=$T0 AND series NOT LIKE '%-1h' GROUP BY series);")
+{ [ "${N4:-0}" -eq 4 ]; } && pass makers-x4 "m5m15_series_with_resting=$N4" \
+  || fail makers-x4 "m5m15_series_with_resting=${N4:-0} (expected 4; 1h disabled)"
 
 # 6. Clip cap respected — no order/fill > 60 shares
 BIG=$(q "SELECT COUNT(*) FROM orders WHERE ts_local_ms>=$T0 AND CAST(original_size AS REAL) > 60.0;")
