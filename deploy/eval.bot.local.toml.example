@@ -54,6 +54,15 @@ feed_staleness_grace_ms = 1500 # eu-west-1 direct-Binance Mid path stalls p95 ~1
                               # (Reversed the strict-0; see the 2026-07-16 Decisions Log entry.)
 book_staleness_dwell_ms = 1500 # filter transient CLOB book Stale/Crossed churn during six-series
                               # rollovers; a SUSTAINED book outage past 1500 ms STILL trips FeedStale.
+# FairVsMid two-tier (2026-07-16, from the clean post-#42P01 episode measurement).
+# SLOW = sanity net for moderate persistent gaps; FAST = catastrophic gap caught fast.
+# Healthy lead-lag self-resolves: p99 episode duration 82s@0.10 / 54s@0.12 / 23s@0.15
+# (none <=12s -> rule fallback 0.10/23s). Healthy NEVER sustains >0.40 (the >0.40 tail
+# is isolated 1-second model spikes) -> fast bound 0.40/3s catches a broken fair in 3s.
+sanity_bound = 0.10                  # SLOW bound (fallback)
+sanity_bound_duration_ms = 23000     # SLOW dwell (fallback; healthy lead-lag mostly resolves under it)
+sanity_bound_fast = 0.40             # FAST bound (measured sustained ceiling 0.35 + margin; literal 2x-p99.9 = 0.64 was single-tick-inflated)
+sanity_bound_duration_fast_ms = 3000 # FAST dwell (catastrophic gap in seconds, not 23)
 
 [feeds]
 binance_depth_capture = false   # research depth capture stays on the Windows box (division of labor).

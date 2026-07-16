@@ -16,6 +16,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
+use rust_decimal::prelude::ToPrimitive;
+
 use analytics::{Analytics, AnalyticsParams, OrderActivity};
 use core_types::{
     Asset, BookHealth, BookSnapshot, BookUnreliableReason, BreakerKind, ConditionId, ControlEvent,
@@ -262,6 +264,23 @@ pub(crate) struct SharedView {
     /// Per-window model-fair history feeding the live 5s markout (shared — the
     /// feeds are identical for both modes). Dropped with its window on prune.
     pub(crate) fair_rings: BTreeMap<WindowId, FairRing>,
+    /// Per-window fair-vs-mid "divergence watch": time spent with |p_up − mid|
+    /// above the slow FairVsMid bound vs total observed time — a WARN-only
+    /// chronic-fair-sickness gauge (visible long before any halt fires). Folded
+    /// from `Event::Model` (which already carries p_up + the book mid). Dropped
+    /// with its window on prune.
+    pub(crate) divergence_watch: BTreeMap<WindowId, DivergenceWatch>,
+}
+
+/// Per-window accumulator for the fair-vs-mid divergence-watch WARN metric.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DivergenceWatch {
+    /// Milliseconds observed with |p_up − mid| above the slow bound.
+    pub(crate) above_ms: i64,
+    /// Total milliseconds observed (with both p_up and a book mid present).
+    pub(crate) total_ms: i64,
+    /// Timestamp of the last model sample folded (for the time delta).
+    pub(crate) last_ts: Option<TimestampMs>,
 }
 
 impl SharedView {
@@ -275,6 +294,7 @@ impl SharedView {
             book_unreliable: BTreeMap::new(),
             book_stale_events: BTreeMap::new(),
             fair_rings: BTreeMap::new(),
+            divergence_watch: BTreeMap::new(),
         }
     }
 
@@ -346,6 +366,8 @@ impl SharedView {
         let windows = &self.windows;
         self.fair_rings.retain(|wid, _| windows.contains_key(wid));
         self.model_by_window
+            .retain(|wid, _| windows.contains_key(wid));
+        self.divergence_watch
             .retain(|wid, _| windows.contains_key(wid));
     }
 }
@@ -447,6 +469,9 @@ pub(crate) struct DashboardData {
     pub(crate) model_taker: ModelTakerState,
     /// Feed-cadence + loop-health tile (fed by `set_feed_cadence`). Shared.
     pub(crate) feed_cadence: FeedCadence,
+    /// The slow FairVsMid bound in effect (from config), for the divergence-watch
+    /// WARN metric. Set once at boot via [`Self::set_sanity_bound`].
+    pub(crate) sanity_bound_slow: f64,
     pub(crate) server_started: TimestampMs,
     pub(crate) last_now: TimestampMs,
 }
@@ -462,9 +487,16 @@ impl DashboardData {
             shadow: ShadowState::default(),
             model_taker: ModelTakerState::default(),
             feed_cadence: FeedCadence::default(),
+            sanity_bound_slow: 0.10,
             server_started: now,
             last_now: now,
         }
+    }
+
+    /// Sets the slow FairVsMid bound used by the divergence-watch WARN metric
+    /// (called once at boot from config).
+    pub(crate) fn set_sanity_bound(&mut self, bound: f64) {
+        self.sanity_bound_slow = bound;
     }
 
     /// Stores the latest feed-cadence snapshot (shared market-data health).
@@ -657,6 +689,23 @@ impl DashboardData {
                             .get(&wid)
                             .and_then(|wv| wv.up_top)
                             .and_then(|t| t.mid());
+                        // Divergence-watch: accumulate time above the slow bound
+                        // (both p_up and a book mid must be present).
+                        if let Some(m_f64) = mid.and_then(|m| m.to_f64()) {
+                            let bound = self.sanity_bound_slow;
+                            let w = self.shared.divergence_watch.entry(wid).or_default();
+                            if let Some(prev) = w.last_ts {
+                                let dt = snap.ts.as_millis().saturating_sub(prev.as_millis());
+                                // Ignore gaps > 10 s (recording/feed gaps, not dwell time).
+                                if (0..=10_000).contains(&dt) {
+                                    w.total_ms += dt;
+                                    if (snap.p_up - m_f64).abs() > bound {
+                                        w.above_ms += dt;
+                                    }
+                                }
+                            }
+                            w.last_ts = Some(snap.ts);
+                        }
                         (Some(wid.to_string()), mid)
                     }
                     None => (None, None),

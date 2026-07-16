@@ -71,15 +71,23 @@ pub enum RiskOutput {
 }
 
 /// Per-window fair-vs-mid sanity accounting (the `FairVsMid` breaker input).
+///
+/// Two-tier: a moderate divergence must persist past the SLOW dwell (the sanity
+/// net — healthy lead-lag self-resolves before it), while a catastrophic
+/// divergence trips on the SHORT fast dwell (a basis-bug-class broken fair is
+/// caught in seconds, not the ~20 s a lead-lag gap can legitimately take).
 #[derive(Default)]
 struct WindowSanity {
     /// Latest model `p_up` for this window.
     last_p_up: Option<f64>,
     /// Latest Up-token book mid for this window.
     last_mid: Option<f64>,
-    /// When this window first breached the sanity bound (dwell anchor); `None`
-    /// while within bound.
-    breach_since: Option<TimestampMs>,
+    /// When this window first breached the SLOW (sanity-net) bound; `None` while
+    /// within it.
+    breach_since_slow: Option<TimestampMs>,
+    /// When this window first breached the FAST (catastrophic) bound; `None`
+    /// while within it.
+    breach_since_fast: Option<TimestampMs>,
 }
 
 /// The §11 breaker state machine (sans-IO).
@@ -90,8 +98,12 @@ pub(crate) struct RiskCore {
     book_staleness_dwell_ms: i64,
     daily_stop_loss: Dollars,
     max_open_notional: Dollars,
+    // FairVsMid two-tier: SLOW = sanity net (moderate gap, long dwell so healthy
+    // lead-lag self-resolves first); FAST = catastrophic gap, short dwell.
     sanity_bound: f64,
     sanity_bound_duration_ms: i64,
+    sanity_bound_fast: f64,
+    sanity_dwell_fast_ms: i64,
     error_max: u32,
     error_window_ms: i64,
     engine_restart_cooldown_ms: i64,
@@ -183,6 +195,8 @@ impl RiskCore {
             max_open_notional: params.max_open_notional,
             sanity_bound: params.sanity_bound,
             sanity_bound_duration_ms: params.sanity_bound_duration_ms,
+            sanity_bound_fast: params.sanity_bound_fast,
+            sanity_dwell_fast_ms: params.sanity_bound_duration_fast_ms,
             error_max: params.error_breaker_max_errors,
             error_window_ms: params.error_breaker_window_ms,
             engine_restart_cooldown_ms: params.engine_restart_cooldown_ms,
@@ -272,7 +286,10 @@ impl RiskCore {
             open_notional_cap: self.max_open_notional,
             daily_pnl: self.daily_realized,
             error_count: u32::try_from(self.infra_errors.len()).unwrap_or(u32::MAX),
-            sanity_breached: self.sanity.values().any(|s| s.breach_since.is_some()),
+            sanity_breached: self
+                .sanity
+                .values()
+                .any(|s| s.breach_since_slow.is_some() || s.breach_since_fast.is_some()),
             globally_halted: !self.tripped.is_empty(),
             shadow_tripped: self.shadow_tripped.clone(),
         }
@@ -674,24 +691,40 @@ impl RiskCore {
     }
 
     fn recompute_sanity(&mut self, now: TimestampMs, out: &mut Vec<RiskOutput>) {
-        // Per window: track each window's own dwell timer; the GLOBAL FairVsMid
-        // trips iff ANY window has diverged past the dwell, and clears only when
-        // NONE is over the dwell (a healthy sibling never clears a diverged one).
-        let bound = self.sanity_bound;
-        let dwell = self.sanity_bound_duration_ms;
+        // Per window, two independent dwell timers (SLOW sanity-net + FAST
+        // catastrophic). The GLOBAL FairVsMid trips iff ANY window is past
+        // EITHER tier's dwell, and clears only when NONE is (a healthy sibling
+        // never clears a diverged one — semantics unchanged, still global).
+        let bound_slow = self.sanity_bound;
+        let dwell_slow = self.sanity_bound_duration_ms;
+        let bound_fast = self.sanity_bound_fast;
+        let dwell_fast = self.sanity_dwell_fast_ms;
+        let elapsed = |since: TimestampMs| now.as_millis().saturating_sub(since.as_millis());
         let mut any_over_dwell = false;
         for s in self.sanity.values_mut() {
-            let diverged = match (s.last_p_up, s.last_mid) {
-                (Some(p), Some(m)) => (p - m).abs() > bound,
-                _ => false,
+            let div = match (s.last_p_up, s.last_mid) {
+                (Some(p), Some(m)) => Some((p - m).abs()),
+                _ => None,
             };
-            if diverged {
-                let since = *s.breach_since.get_or_insert(now);
-                if now.as_millis().saturating_sub(since.as_millis()) >= dwell {
-                    any_over_dwell = true;
+            // SLOW tier (moderate gap, long dwell).
+            match div {
+                Some(d) if d > bound_slow => {
+                    let since = *s.breach_since_slow.get_or_insert(now);
+                    if elapsed(since) >= dwell_slow {
+                        any_over_dwell = true;
+                    }
                 }
-            } else {
-                s.breach_since = None;
+                _ => s.breach_since_slow = None,
+            }
+            // FAST tier (catastrophic gap, short dwell) — independent timer.
+            match div {
+                Some(d) if d > bound_fast => {
+                    let since = *s.breach_since_fast.get_or_insert(now);
+                    if elapsed(since) >= dwell_fast {
+                        any_over_dwell = true;
+                    }
+                }
+                _ => s.breach_since_fast = None,
             }
         }
         if any_over_dwell {
@@ -1670,6 +1703,67 @@ mod tests {
         let out = c.on_event(&model(0.50, OPEN_MS + 3500), ts(OPEN_MS + 3500));
         assert_eq!(cleared_in(&out), vec![BreakerKind::FairVsMid]);
         assert!(!c.is_globally_halted());
+    }
+
+    fn two_tier_core(
+        bound_slow: f64,
+        dwell_slow: i64,
+        bound_fast: f64,
+        dwell_fast: i64,
+    ) -> RiskCore {
+        let mut caps = HashMap::new();
+        caps.insert(series(), Dollars::new(Decimal::from(25)));
+        let params = RiskParams {
+            sanity_bound: bound_slow,
+            sanity_bound_duration_ms: dwell_slow,
+            sanity_bound_fast: bound_fast,
+            sanity_bound_duration_fast_ms: dwell_fast,
+            ..RiskParams::default()
+        };
+        RiskCore::new(&params, caps)
+    }
+
+    #[test]
+    fn two_tier_fast_catches_catastrophic_fast_slow_waits_for_moderate() {
+        // Slow tier 0.10 / 23s (sanity net for lead-lag), fast 0.30 / 3s
+        // (catastrophic). A MODERATE gap (0.15, above slow, below fast) must wait
+        // the long slow dwell; a CATASTROPHIC gap (>0.30) trips on the short fast
+        // dwell — caught in seconds, not 23s.
+        let mut c = two_tier_core(0.10, 23_000, 0.30, 3_000);
+        open_window(&mut c);
+        // Moderate: mid ~0.50, p_up 0.65 ⇒ |div| 0.15 (in (0.10, 0.30]).
+        let _ = c.on_event(
+            &top_event(up_token(), dec!(0.49), dec!(0.51), OPEN_MS),
+            ts(OPEN_MS),
+        );
+        let _ = c.on_event(&model(0.65, OPEN_MS), ts(OPEN_MS));
+        // Past the 3s FAST dwell but under the 23s SLOW dwell → NOT tripped
+        // (moderate gaps do not use the fast tier).
+        assert!(c.on_tick(ts(OPEN_MS + 5_000)).is_empty());
+        assert!(!c.is_globally_halted(), "0.15 gap must wait the slow dwell");
+        // Crosses the slow dwell → trips.
+        let out = c.on_tick(ts(OPEN_MS + 23_000));
+        assert_eq!(tripped_in(&out), vec![BreakerKind::FairVsMid]);
+        // Recover.
+        let _ = c.on_event(&model(0.50, OPEN_MS + 24_000), ts(OPEN_MS + 24_000));
+
+        // Catastrophic: p_up 0.95 vs mid 0.50 ⇒ |div| 0.45 > 0.30 fast bound.
+        let mut c = two_tier_core(0.10, 23_000, 0.30, 3_000);
+        open_window(&mut c);
+        let _ = c.on_event(
+            &top_event(up_token(), dec!(0.49), dec!(0.51), OPEN_MS),
+            ts(OPEN_MS),
+        );
+        let _ = c.on_event(&model(0.95, OPEN_MS), ts(OPEN_MS));
+        // Under the 3s fast dwell → not yet.
+        assert!(c.on_tick(ts(OPEN_MS + 2_000)).is_empty());
+        // Past the 3s FAST dwell (well under the 23s slow dwell) → trips.
+        let out = c.on_tick(ts(OPEN_MS + 3_000));
+        assert_eq!(
+            tripped_in(&out),
+            vec![BreakerKind::FairVsMid],
+            "a catastrophic gap must trip on the short fast dwell, not wait 23s"
+        );
     }
 
     // ---- error rate ---------------------------------------------------------

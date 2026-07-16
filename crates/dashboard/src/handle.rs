@@ -200,6 +200,12 @@ impl DashboardHandle {
         self.lock().set_feed_cadence(cadence, now);
     }
 
+    /// Sets the slow FairVsMid bound for the divergence-watch WARN metric
+    /// (called once at boot from config).
+    pub fn set_sanity_bound(&self, bound: f64) {
+        self.lock().set_sanity_bound(bound);
+    }
+
     /// Pushes the current control-plane state snapshot (read by
     /// `GET /api/control/status`). The orchestrator calls this after each
     /// command and once at startup.

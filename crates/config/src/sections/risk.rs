@@ -34,11 +34,21 @@ pub struct RiskConfig {
     pub daily_stop_loss: Dollars,
     /// Global cap on open notional across all windows and series.
     pub max_open_notional: Dollars,
-    /// Stand-down threshold on |model fair − book mid| (probability space).
+    /// SLOW-tier stand-down threshold on |model fair − book mid| (probability
+    /// space) — the sanity net for moderate, persistent divergence.
     pub sanity_bound: f64,
-    /// How long the sanity bound must be continuously exceeded before quotes
-    /// are pulled.
+    /// SLOW-tier dwell: how long `sanity_bound` must be continuously exceeded
+    /// before `FairVsMid` trips. Set it above the healthy self-resolving-episode
+    /// p99 so normal lead-lag never trips it.
     pub sanity_bound_duration_ms: DurationMs,
+    /// FAST-tier bound: a CATASTROPHIC divergence (basis-bug-class broken fair),
+    /// caught in seconds. Must be ≥ `sanity_bound`; default equals it (fast tier
+    /// inert = the historical single-tier behavior). Set it above the healthy
+    /// magnitude p99.9 (a gap healthy operation never reaches).
+    pub sanity_bound_fast: f64,
+    /// FAST-tier dwell (short). Must be ≤ `sanity_bound_duration_ms`; default
+    /// equals it (inert).
+    pub sanity_bound_duration_fast_ms: DurationMs,
     /// API error count that trips the error-rate circuit breaker…
     pub error_breaker_max_errors: u32,
     /// …within this rolling window.
@@ -63,6 +73,8 @@ impl Default for RiskConfig {
             max_open_notional: Dollars::new(Decimal::from(1_000)),
             sanity_bound: 0.10,
             sanity_bound_duration_ms: DurationMs::from_millis(3_000),
+            sanity_bound_fast: 0.10,
+            sanity_bound_duration_fast_ms: DurationMs::from_millis(3_000),
             error_breaker_max_errors: 10,
             error_breaker_window_ms: DurationMs::from_millis(60_000),
             shadow_loss_stops: false,
@@ -109,6 +121,21 @@ impl RiskConfig {
             self.sanity_bound_duration_ms.as_millis() > 0,
             "risk.sanity_bound_duration_ms",
             "must be > 0",
+        );
+        v.require(
+            self.sanity_bound_fast.is_finite()
+                && self.sanity_bound_fast > 0.0
+                && self.sanity_bound_fast < 1.0
+                && self.sanity_bound_fast >= self.sanity_bound,
+            "risk.sanity_bound_fast",
+            "must be a probability-space distance in (0, 1) and >= sanity_bound (the fast tier is the catastrophic tier)",
+        );
+        v.require(
+            self.sanity_bound_duration_fast_ms.as_millis() > 0
+                && self.sanity_bound_duration_fast_ms.as_millis()
+                    <= self.sanity_bound_duration_ms.as_millis(),
+            "risk.sanity_bound_duration_fast_ms",
+            "must be > 0 and <= sanity_bound_duration_ms (the fast tier catches sooner)",
         );
         v.require(
             self.error_breaker_max_errors >= 1,
@@ -216,6 +243,57 @@ mod tests {
                 "book dwell {ok} should be accepted"
             );
         }
+    }
+
+    #[test]
+    fn fast_tier_below_slow_bound_rejected() {
+        // Fast (catastrophic) bound must be >= slow bound.
+        let cfg = RiskConfig {
+            sanity_bound: 0.12,
+            sanity_bound_fast: 0.10,
+            ..RiskConfig::default()
+        };
+        let mut v = Violations::default();
+        cfg.validate_into(&mut v);
+        assert!(
+            v.into_result()
+                .unwrap_err()
+                .iter()
+                .any(|x| x.key == "risk.sanity_bound_fast")
+        );
+    }
+
+    #[test]
+    fn fast_dwell_longer_than_slow_rejected() {
+        // Fast dwell must be <= slow dwell (it catches sooner).
+        let cfg = RiskConfig {
+            sanity_bound_duration_ms: DurationMs::from_millis(5_000),
+            sanity_bound_duration_fast_ms: DurationMs::from_millis(6_000),
+            ..RiskConfig::default()
+        };
+        let mut v = Violations::default();
+        cfg.validate_into(&mut v);
+        assert!(
+            v.into_result()
+                .unwrap_err()
+                .iter()
+                .any(|x| x.key == "risk.sanity_bound_duration_fast_ms")
+        );
+    }
+
+    #[test]
+    fn two_tier_eval_shape_accepted() {
+        // A realistic two-tier eval config: moderate slow tier + high/short fast.
+        let cfg = RiskConfig {
+            sanity_bound: 0.10,
+            sanity_bound_duration_ms: DurationMs::from_millis(23_000),
+            sanity_bound_fast: 0.30,
+            sanity_bound_duration_fast_ms: DurationMs::from_millis(3_000),
+            ..RiskConfig::default()
+        };
+        let mut v = Violations::default();
+        cfg.validate_into(&mut v);
+        assert!(v.into_result().is_ok());
     }
 
     #[test]

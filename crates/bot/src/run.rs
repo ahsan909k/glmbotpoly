@@ -288,6 +288,8 @@ pub(crate) fn risk_params(config: &AppConfig) -> RiskParams {
         max_open_notional: r.max_open_notional,
         sanity_bound: r.sanity_bound,
         sanity_bound_duration_ms: r.sanity_bound_duration_ms.as_millis(),
+        sanity_bound_fast: r.sanity_bound_fast,
+        sanity_bound_duration_fast_ms: r.sanity_bound_duration_fast_ms.as_millis(),
         error_breaker_max_errors: r.error_breaker_max_errors,
         error_breaker_window_ms: r.error_breaker_window_ms.as_millis(),
         engine_restart_cooldown_ms: RiskParams::default().engine_restart_cooldown_ms,
@@ -572,6 +574,7 @@ async fn run(
     let handle = DashboardHandle::new(WS_BROADCAST_CAP, wall_now()).with_request_sink(req_tx);
     handle.set_session(Mode::Paper, true, wall_now());
     handle.set_params(params_view(config), wall_now());
+    handle.set_sanity_bound(config.risk.sanity_bound);
     handle.set_control_state(control.snapshot(), wall_now());
 
     // Journal recorder.
@@ -1878,6 +1881,11 @@ mod tests {
         );
         assert_eq!(p.daily_stop_loss, c.risk.daily_stop_loss);
         assert_eq!(p.max_open_notional, c.risk.max_open_notional);
+        assert_eq!(p.sanity_bound_fast, c.risk.sanity_bound_fast);
+        assert_eq!(
+            p.sanity_bound_duration_fast_ms,
+            c.risk.sanity_bound_duration_fast_ms.as_millis()
+        );
         assert_eq!(p.error_breaker_max_errors, c.risk.error_breaker_max_errors);
         assert_eq!(p.quote.min_edge, c.engine.defaults.min_edge);
         assert_eq!(

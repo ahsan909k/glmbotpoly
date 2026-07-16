@@ -1004,6 +1004,19 @@ function renderRisk() {
         .join("")
     : "";
   $("book-health").innerHTML = bookNow + bookRate;
+  // WARN-only fair-vs-mid divergence watch: % time above the slow FairVsMid
+  // bound per window. Chronic fair-sickness surfaces before any halt.
+  const dw = r.divergence_watch || [];
+  $("divergence-watch").innerHTML = dw.length
+    ? dw
+        .filter((d) => d.observed_secs >= 30)
+        .sort((a, b) => b.above_slow_pct - a.above_slow_pct)
+        .map((d) => {
+          const cls = d.above_slow_pct >= 20 ? "bad" : d.above_slow_pct >= 5 ? "warn" : "ok";
+          return `<div class="health-item ${cls}"><span>${d.series}</span><span>${d.above_slow_pct.toFixed(1)}% &nbsp;(${d.observed_secs}s obs)</span></div>`;
+        })
+        .join("")
+    : `<div class="health-none">no divergence data yet</div>`;
 }
 
 // ============================================ STATUS STRIP (global, always on)

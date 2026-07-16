@@ -142,8 +142,10 @@ feed_staleness_grace_ms = 0      # 0 = strict §11 (VPS). Home-testing only: rai
 book_staleness_dwell_ms = 0      # 0 = strict §11. Raise (e.g. 1500) to filter transient CLOB book Stale/Crossed churn during six-series rollovers; a SUSTAINED outage past the dwell still trips FeedStale. Max 5000.
 daily_stop_loss = 200            # halt all trading until manual reset
 max_open_notional = 1000         # global cap across all windows
-sanity_bound = 0.10              # stand down when |fair - mid| exceeds this...
-sanity_bound_duration_ms = 3000  # ...for this long
+sanity_bound = 0.10              # SLOW tier: stand down when |fair - mid| exceeds this...
+sanity_bound_duration_ms = 3000  # ...for this long (raise above the healthy self-resolving-episode p99)
+sanity_bound_fast = 0.10         # FAST tier (catastrophic gap): default == slow bound = inert (single-tier). Must be >= sanity_bound.
+sanity_bound_duration_fast_ms = 3000  # FAST tier dwell (short); default == slow = inert. Must be <= sanity_bound_duration_ms.
 error_breaker_max_errors = 10    # API errors...
 error_breaker_window_ms = 60000  # ...within this window trip the breaker
 shadow_loss_stops = false        # PAPER-EVAL ONLY: true = DailyStop/WindowLoss compute but only RECORD (trading continues). Operational breakers stay hard. Keep false in real deployments.

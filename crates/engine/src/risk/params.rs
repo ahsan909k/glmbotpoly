@@ -67,11 +67,21 @@ pub struct RiskParams {
     pub daily_stop_loss: Dollars,
     /// Global cap on open notional across all windows (a pre-trade guard veto).
     pub max_open_notional: Dollars,
-    /// Stand-down threshold on `|model fair − book mid|` (probability space).
+    /// SLOW tier bound: stand-down threshold on `|model fair − book mid|`
+    /// (probability space) for the sanity-net tier. A moderate gap here must
+    /// persist past `sanity_bound_duration_ms` (chosen so healthy lead-lag
+    /// self-resolves first).
     pub sanity_bound: f64,
-    /// How long the sanity bound must be continuously exceeded before quotes
-    /// are pulled (`FairVsMid`).
+    /// SLOW tier dwell: how long the slow bound must be continuously exceeded
+    /// before `FairVsMid` trips.
     pub sanity_bound_duration_ms: i64,
+    /// FAST tier bound: a CATASTROPHIC divergence (a basis-bug-class broken
+    /// fair). Default equals the slow bound (fast tier inert = single-tier
+    /// behavior); the eval sets it well above the healthy magnitude p99.9.
+    pub sanity_bound_fast: f64,
+    /// FAST tier dwell (short — catch catastrophic breakage in seconds). Default
+    /// equals the slow dwell (inert).
+    pub sanity_bound_duration_fast_ms: i64,
     /// Infra error count within the rolling window that trips the error-rate
     /// breaker.
     pub error_breaker_max_errors: u32,
@@ -130,6 +140,10 @@ impl Default for RiskParams {
             max_open_notional: Dollars::new(Decimal::from(1_000)),
             sanity_bound: 0.10,
             sanity_bound_duration_ms: 3_000,
+            // Fast tier defaults inert (== slow) so a default deployment behaves
+            // as the historical single-tier §11 breaker; the eval sets them.
+            sanity_bound_fast: 0.10,
+            sanity_bound_duration_fast_ms: 3_000,
             error_breaker_max_errors: 10,
             error_breaker_window_ms: 60_000,
             engine_restart_cooldown_ms: 5_000,
@@ -168,6 +182,9 @@ mod tests {
         assert_eq!(p.max_open_notional, Dollars::new(Decimal::from(1_000)));
         assert!((p.sanity_bound - 0.10).abs() < f64::EPSILON);
         assert_eq!(p.sanity_bound_duration_ms, 3_000);
+        // Fast tier defaults inert (== slow) => single-tier behavior by default.
+        assert!((p.sanity_bound_fast - 0.10).abs() < f64::EPSILON);
+        assert_eq!(p.sanity_bound_duration_fast_ms, 3_000);
         assert_eq!(p.error_breaker_max_errors, 10);
         assert_eq!(p.error_breaker_window_ms, 60_000);
         assert!(!p.shadow_loss_stops, "shadow loss stops off by default");

@@ -637,8 +637,26 @@ pub struct RiskDto {
     /// filters. A high number here that is NOT tripping FeedStale is the dwell
     /// working as intended; a genuine sustained outage still trips.
     pub book_stale_per_hour: Vec<BookStaleRateDto>,
+    /// WARN-only fair-vs-mid divergence watch: per active window, the % of
+    /// observed time spent with |p_up − mid| above the slow FairVsMid bound.
+    /// Chronic fair-sickness (a window persistently high but self-resolving
+    /// before the dwell) shows here long before any halt fires.
+    pub divergence_watch: Vec<DivergenceWatchDto>,
     /// Per-asset model health.
     pub model_health: Vec<ModelHealthDto>,
+}
+
+/// One window's fair-vs-mid divergence-watch WARN metric.
+#[derive(Debug, Clone, Serialize)]
+pub struct DivergenceWatchDto {
+    /// Window key.
+    pub window: String,
+    /// Series key.
+    pub series: String,
+    /// % of observed time with |p_up − mid| above the slow bound.
+    pub above_slow_pct: f64,
+    /// Observed seconds backing the percentage (small = not yet meaningful).
+    pub observed_secs: i64,
 }
 
 /// One series' book-unreliable event rate over the trailing hour.
@@ -688,6 +706,18 @@ pub(crate) fn risk(data: &DashboardData, mode: Mode) -> RiskDto {
             .map(|(series, events_per_hour)| BookStaleRateDto {
                 series: series.to_string(),
                 events_per_hour,
+            })
+            .collect(),
+        divergence_watch: data
+            .shared
+            .divergence_watch
+            .iter()
+            .filter(|(_, w)| w.total_ms > 0)
+            .map(|(wid, w)| DivergenceWatchDto {
+                window: wid.to_string(),
+                series: wid.series.to_string(),
+                above_slow_pct: 100.0 * (w.above_ms as f64) / (w.total_ms as f64),
+                observed_secs: w.total_ms / 1000,
             })
             .collect(),
         model_health: data

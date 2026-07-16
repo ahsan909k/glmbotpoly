@@ -46,6 +46,10 @@ want max_open_notional                   5000  'max_open_notional (5000, HARD ba
 want starting_capital                    50000 'paper.starting_capital (50000 bankroll)'
 want feed_staleness_grace_ms             1500  'feed_staleness_grace_ms (1500; eu-west-1 Binance Mid p95 gap 1.4s — env-correct, see 2026-07-16 log)'
 want book_staleness_dwell_ms             1500  'book_staleness_dwell_ms (1500, filters transient rollover book churn)'
+want sanity_bound                        0.10  'FairVsMid SLOW bound (0.10)'
+want sanity_bound_duration_ms            23000 'FairVsMid SLOW dwell (23000; fallback per the clean episode measurement)'
+want sanity_bound_fast                   0.40  'FairVsMid FAST bound (0.40; healthy never sustains it -> catastrophic caught in 3s)'
+want sanity_bound_duration_fast_ms       3000  'FairVsMid FAST dwell (3000)'
 # Paper venue latency (Phase 1.4 VPS recalibration): placement + cancel both
 # mean_ms=24 / jitter_ms=8 (measured clob REST p50 23.5 ms; p95−p50 ≈ 8). Two
 # sections share the key names, so assert by count rather than `val` (head -1).
