@@ -31,10 +31,10 @@ ACTIVE=$(systemctl is-active bot 2>/dev/null)
 RSS=$(journalctl -u bot --since "@$((T0/1000))" 2>/dev/null \
       | grep -oE 'rss_kb=[0-9]+' | cut -d= -f2 | sort -n | tail -1)
 { [ -n "$RSS" ] && [ "$RSS" -lt 1500000 ]; } \
-  && pass rss<1.5GB "max_rss_kb=${RSS:-?}" || fail rss<1.5GB "max_rss_kb=${RSS:-none}"
+  && pass "rss<1.5GB" "max_rss_kb=${RSS:-?}" || fail "rss<1.5GB" "max_rss_kb=${RSS:-none}"
 
 # 3. CPU steal ~0
-STEAL=$(mpstat 1 3 2>/dev/null | awk '/Average/{print $NF}')
+STEAL=$(mpstat 1 3 2>/dev/null | awk '/Average/{print $(NF-3)}')   # %steal = 4th from last (…steal guest gnice idle)
 { [ -n "$STEAL" ] && awk "BEGIN{exit !($STEAL < 1.0)}"; } \
   && pass cpu-steal~0 "%steal=$STEAL" || fail cpu-steal~0 "%steal=${STEAL:-?}"
 
@@ -54,12 +54,12 @@ N4=$(q "SELECT COUNT(*) FROM (SELECT series FROM orders WHERE state='open' AND t
 
 # 6. Clip cap respected — no order/fill > 60 shares
 BIG=$(q "SELECT COUNT(*) FROM orders WHERE ts_local_ms>=$T0 AND CAST(original_size AS REAL) > 60.0;")
-{ [ "${BIG:-0}" -eq 0 ]; } && pass clip-cap<=60 "over60=$BIG" || fail clip-cap<=60 "over60=$BIG orders > 60 shares"
+{ [ "${BIG:-0}" -eq 0 ]; } && pass "clip-cap<=60" "over60=$BIG" || fail "clip-cap<=60" "over60=$BIG orders > 60 shares"
 
 # 7. Clock < 1 ms
 OFF=$(chronyc tracking 2>/dev/null | awk -F'[ ]+' '/System time/{print $4}')
 { [ -n "$OFF" ] && awk "BEGIN{exit !($OFF < 0.001)}"; } \
-  && pass clock<1ms "offset_s=$OFF" || fail clock<1ms "offset_s=${OFF:-?}"
+  && pass "clock<1ms" "offset_s=$OFF" || fail "clock<1ms" "offset_s=${OFF:-?}"
 
 # 8. S3 backup succeeded (last run exit 0)
 S3=$(systemctl show bot-s3-backup.service -p ExecMainStatus --value 2>/dev/null || echo '?')
@@ -78,9 +78,9 @@ P95=$(q "WITH d AS (
   SELECT ms FROM d WHERE ms IS NOT NULL AND ms>=0 ORDER BY ms
   LIMIT 1 OFFSET (SELECT CAST(0.95*COUNT(*) AS INT) FROM d WHERE ms IS NOT NULL AND ms>=0);")
 if [ -n "$P95" ]; then
-  { [ "$P95" -lt 250 ]; } && pass cancel-p95<250ms "p95=${P95}ms" || fail cancel-p95<250ms "p95=${P95}ms"
+  { [ "$P95" -lt 250 ]; } && pass "cancel-p95<250ms" "p95=${P95}ms" || fail "cancel-p95<250ms" "p95=${P95}ms"
 else
-  pass cancel-p95<250ms "no pending_cancel transitions (paper cancels Open->Canceled) — n/a"
+  pass "cancel-p95<250ms" "no pending_cancel transitions (paper cancels Open->Canceled) — n/a"
 fi
 
 # 11. Independence: after any window_loss trip, other series kept placing
@@ -95,10 +95,10 @@ pass independence "window_loss trips=$WL (offline proof: chaos.rs window_loss_ha
 LAG=$(journalctl -u bot --since "@$((T0/1000))" 2>/dev/null \
       | grep -oE 'decision_lag_p95_ms=[0-9]+' | cut -d= -f2 | sort -n | tail -1)
 if [ -n "$LAG" ]; then
-  { [ "$LAG" -lt 100 ]; } && pass loop-lag-p95<100ms "worst_p95_ms=$LAG" \
-    || fail loop-lag-p95<100ms "worst_p95_ms=$LAG (single-thread loop falling behind)"
+  { [ "$LAG" -lt 100 ]; } && pass "loop-lag-p95<100ms" "worst_p95_ms=$LAG" \
+    || fail "loop-lag-p95<100ms" "worst_p95_ms=$LAG (single-thread loop falling behind)"
 else
-  fail loop-lag-p95<100ms "no decision_lag_p95_ms in journal (metric not logged?)"
+  fail "loop-lag-p95<100ms" "no decision_lag_p95_ms in journal (metric not logged?)"
 fi
 
 # 13. Journal summary (durable, ts-bounded)
