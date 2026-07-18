@@ -519,7 +519,15 @@ pub fn execute(
     secrets: &Secrets,
     series: Option<Series>,
 ) -> anyhow::Result<()> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    // Multi-thread runtime (2 workers = the VPS's 2 vCPUs). The single-thread
+    // runtime saturated one core during market-hours event bursts (2026-07-18
+    // eval Day-1: loop-lag 0→100-200 ms, feed_stale 14→131/hr, one core ~100%
+    // while the 2nd sat idle) — the bus loop competed with the feed/venue/journal/
+    // dashboard tasks for one core. Multi-thread spreads those tasks off the bus
+    // loop's core. The hot path stays correct (spawned tasks are already `Send`;
+    // shared state is `Arc<Mutex>` snapshots held only briefly, never across await).
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .context("building tokio runtime")?;
