@@ -55,7 +55,7 @@ time = { workspace = true }
 # net + time so the current-thread runtime can enable the IO/timer drivers
 # reqwest needs; sync (channels) + signal (ctrl-c) + macros (select!) for the
 # scheduler smoke loop.
-tokio = { workspace = true, features = ["rt", "net", "time", "sync", "signal", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time", "sync", "signal", "macros"] }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
